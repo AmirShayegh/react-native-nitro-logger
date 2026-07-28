@@ -61,6 +61,38 @@ jobs:
       - name: Run the Swift suite
         run: swift test
 
+  # The vendored Android writer, on the JVM rather than on an emulator.
+  #
+  # The same bargain as `test-swift`: every syscall the writer needs is behind
+  # `PlatformIo`, so it imports nothing from `android.*` and its rotation,
+  # retention, purge fencing, byte reservation, short-write recovery and
+  # crash-tail trim all run here in seconds. `build-android` below proves the
+  # Nitro adapter compiles; this proves the writer is correct, and the two are
+  # not substitutes.
+  test-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Install JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Generate nitrogen code
+        run: yarn nitrogen
+
+      - name: Run the Kotlin suite
+        run: |
+          cd example/android
+          ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain
+
   build-library:
     runs-on: ubuntu-latest
 

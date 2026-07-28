@@ -1,0 +1,420 @@
+package com.margelo.nitro.nitrologger
+
+import java.io.File
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * One writer per file, no matter how many destinations point at it.
+ *
+ * Two streams appending to the same path from different threads interleave
+ * mid-record, and two rotation schedules racing over the same file archive each
+ * other's fresh output. The registry makes that impossible by construction:
+ * everything that resolves to the same file gets the same [LogFileWriter].
+ *
+ * **The key is the canonical path.** `logs/app.log`, `logs/../logs/app.log`,
+ * and a `logs` symlink into the real directory are the same file and must land
+ * on the same entry — comparing the strings the caller passed in would hand out
+ * two writers for one file, which is exactly the collision the registry exists
+ * to stop.
+ */
+class LogWriterRegistry {
+  companion object {
+    val shared = LogWriterRegistry()
+
+    /**
+     * How long an acquire will wait for a previous writer on the same path to
+     * finish shutting down before giving up.
+     */
+    const val CLOSE_WAIT_MS = 5_000L
+
+    /**
+     * Turns a caller-supplied path into the canonical file it names.
+     *
+     * The parent directory is created before resolution, because canonical
+     * resolution answers only for things that exist — resolving first would
+     * fall back to the literal string on a fresh install and hand out a key
+     * that stops matching the moment the directory appears.
+     */
+    @Throws(LogWriterException::class)
+    fun resolve(path: String, platform: PlatformIo): Resolved {
+      if (path.isEmpty()) {
+        throw LogWriterException(LogWriterException.Kind.OPEN_FAILED, "empty path")
+      }
+      // Collapse `.` and `..` lexically before anything looks at the parent.
+      // `logs/sub/../app.log` names a file in `logs`, but taken literally its
+      // parent is `logs/sub/..` — a directory that only exists if `sub` does,
+      // so creating it fails and the open dies on a path that was perfectly
+      // valid. iOS gets this from `standardizedFileURL`.
+      val requested = lexicallyNormalized(File(path).absoluteFile)
+      val name = requested.name
+      if (name.isEmpty() || name == "." || name == "..") {
+        throw LogWriterException(
+          LogWriterException.Kind.OPEN_FAILED,
+          "path does not name a file"
+        )
+      }
+      val directory = requested.parentFile
+        ?: throw LogWriterException(
+          LogWriterException.Kind.OPEN_FAILED,
+          "path has no directory"
+        )
+
+      if (!LogSecureFile.createDirectory(directory, platform) && !directory.isDirectory) {
+        throw LogWriterException(
+          LogWriterException.Kind.OPEN_FAILED,
+          "could not create the log directory"
+        )
+      }
+
+      val canonicalDirectory = try {
+        directory.canonicalFile
+      } catch (_: Exception) {
+        throw LogWriterException(
+          LogWriterException.Kind.OPEN_FAILED,
+          "could not resolve the log directory"
+        )
+      }
+
+      // The log file itself must not be a symlink, even though the directory
+      // above it was resolved through one deliberately.
+      val candidate = File(canonicalDirectory, name)
+      if (LogSecureFile.isSymbolicLink(candidate, platform)) {
+        throw LogWriterException(
+          LogWriterException.Kind.SYMLINK_ESCAPE,
+          "the log file is a symbolic link"
+        )
+      }
+
+      return Resolved(candidate, candidate.absolutePath)
+    }
+
+    /**
+     * Collapses `.` and `..` in an absolute path, textually.
+     *
+     * `Path.normalize()` would be the obvious call and was the original one, but
+     * `java.nio.file` arrived in API 26 and this library supports 24. A missing
+     * class there raises `NoClassDefFoundError` — an `Error`, which passes
+     * straight through `catch (Exception)` — so on an older device the failure
+     * would not have been a fallback but an unhandled throw out of `open()`.
+     *
+     * Purely lexical, like the original: it does not touch the filesystem, so
+     * `a/symlink/../b` collapses to `a/b` whether or not that is where the link
+     * pointed. That is the same trade `standardizedFileURL` makes on iOS, and it
+     * is safe here because the *directory* is canonicalised for real straight
+     * afterwards, and the leaf is `lstat`-checked.
+     */
+    private fun lexicallyNormalized(file: File): File {
+      val separator = File.separatorChar
+      val stack = ArrayList<String>()
+      for (part in file.absolutePath.split(separator)) {
+        when (part) {
+          "", "." -> Unit
+          ".." -> if (stack.isNotEmpty()) stack.removeAt(stack.size - 1)
+          else -> stack.add(part)
+        }
+      }
+      return File(separator + stack.joinToString(separator.toString()))
+    }
+
+    /** A registry with no shared state, so tests do not leak writers. */
+    fun isolated() = LogWriterRegistry()
+  }
+
+  data class Resolved(val file: File, val canonicalPath: String)
+
+  /**
+   * A lock with a condition, because acquisition sometimes has to *wait* — see
+   * [closing].
+   */
+  private val lock = ReentrantLock()
+  private val pathFreed = lock.newCondition()
+  private val writers = HashMap<String, LogFileWriter>()
+
+  /**
+   * Paths whose writer has been evicted but is still draining and closing.
+   *
+   * Eviction and close cannot be one atomic step: closing waits on the write
+   * executor, and holding the registry lock across that would stall every other
+   * file. But between the two, the map has no entry for the path — so an
+   * acquire arriving in that window would build a *second* writer while the
+   * first still has accepted batches queued, giving one file two executors and
+   * two rotation schedules. That is the exact collision this registry exists to
+   * prevent, so acquisition waits out the close instead.
+   *
+   * Counted rather than a set: it costs nothing and stops a stray double
+   * release from clearing a marker another close still needs.
+   */
+  private val closing = HashMap<String, Int>()
+  private var nextHandleId = 1L
+
+  /**
+   * Acquires a handle on the writer for [path], creating it if needed.
+   *
+   * Acquisition happens entirely under the lock, so two runtimes opening the
+   * same file concurrently cannot both construct a writer and have one silently
+   * replace the other.
+   */
+  @Throws(LogWriterException::class)
+  fun acquire(
+    path: String,
+    policy: LogRotationPolicy,
+    lineFramed: Boolean,
+    /**
+     * Required, with no default on purpose — see [LogFileWriter.open]. Falling
+     * back to [PlatformIo.Jvm] on Android would put `java.nio.file` back on the
+     * open path, where it does not exist below API 26.
+     */
+    platform: PlatformIo,
+    rawWrite: LogFileWriter.RawWrite? = null,
+    compressor: LogFileWriter.Compressor? = null,
+    clock: (() -> Long)? = null,
+    monotonic: (() -> Long)? = null
+  ): LogFileHandle {
+    val resolved = resolve(path, platform)
+
+    lock.withLock {
+      // Wait out a close still in progress on this path — but not forever. The
+      // claim is cleared by the writer's own executor rather than by whoever
+      // called close, so wedged storage means it may never clear at all.
+      // Failing the open is the fail-closed answer: one writer per file is the
+      // invariant worth keeping, and a caller that cannot have it should be
+      // told so rather than handed a second one.
+      var budget = CLOSE_WAIT_MS
+      while (closing.containsKey(resolved.canonicalPath)) {
+        if (budget <= 0) {
+          throw LogWriterException(
+            LogWriterException.Kind.STILL_CLOSING,
+            "a previous writer for this path is still closing"
+          )
+        }
+        val waited = try {
+          pathFreed.awaitNanos(TimeUnit.MILLISECONDS.toNanos(budget))
+        } catch (_: InterruptedException) {
+          // Same answer as running out of budget, and for the same reason: one
+          // writer per file is the invariant, and a caller that cannot be given
+          // it is told so rather than handed a second one.
+          Thread.currentThread().interrupt()
+          throw LogWriterException(
+            LogWriterException.Kind.STILL_CLOSING,
+            "interrupted while a previous writer for this path was closing"
+          )
+        }
+        budget = TimeUnit.NANOSECONDS.toMillis(waited)
+      }
+
+      val existing = writers[resolved.canonicalPath]
+      val writer: LogFileWriter
+      if (existing != null && !existing.isClosed) {
+        // A second destination on the same file must agree about how that file
+        // is written. Silently honouring the first caller's rotation policy
+        // would give the second one a file that behaves nothing like what it
+        // asked for, and silently honouring the last would change it under the
+        // first.
+        if (existing.policy != policy || existing.lineFramed != lineFramed) {
+          throw LogWriterException(
+            LogWriterException.Kind.CONFIG_CONFLICT,
+            "this file is already open with a different configuration"
+          )
+        }
+        writer = existing
+      } else {
+        writer = LogFileWriter.open(
+          file = resolved.file,
+          canonicalPath = resolved.canonicalPath,
+          policy = policy,
+          lineFramed = lineFramed,
+          platform = platform,
+          rawWrite = rawWrite,
+          compressor = compressor,
+          clock = clock,
+          monotonic = monotonic
+        )
+        writers[resolved.canonicalPath] = writer
+      }
+
+      writer.retain()
+      val id = nextHandleId
+      nextHandleId += 1
+      return LogFileHandle(id, writer, this)
+    }
+  }
+
+  /**
+   * Drops one handle's claim, closing and evicting the writer at zero.
+   */
+  internal fun release(writer: LogFileWriter, handleId: Long, deadlineMs: Double) {
+    val path = writer.canonicalPath
+
+    val shouldClose = lock.withLock {
+      val remaining = writer.releaseOne()
+      if (remaining > 0) return@withLock false
+      if (writers[path] === writer) writers.remove(path)
+      // Claim the path for the duration of the close. An acquire arriving now
+      // waits rather than building a rival writer over a file this one is still
+      // draining.
+      closing[path] = (closing[path] ?: 0) + 1
+      true
+    }
+    if (!shouldClose) return
+
+    // The claim is dropped by the writer's own executor, not when this call
+    // stops waiting. A close that hits its deadline leaves work still
+    // executing; releasing the path then would let a replacement writer open
+    // the same file underneath it.
+    writer.close(handleId, deadlineMs) { finishClosing(path) }
+  }
+
+  private fun finishClosing(path: String) {
+    lock.withLock {
+      val outstanding = closing[path] ?: 0
+      if (outstanding > 1) closing[path] = outstanding - 1 else closing.remove(path)
+      pathFreed.signalAll()
+    }
+  }
+
+  val liveWriterCountForTesting: Int get() = lock.withLock { writers.size }
+  val closingCountForTesting: Int get() = lock.withLock { closing.size }
+}
+
+/**
+ * One destination's claim on a writer.
+ *
+ * The generation is the fence. A purge bumps the writer's generation; a handle
+ * that has not rebound to the new one is refused with `staleGeneration` rather
+ * than being allowed to write pre-purge data into the fresh file.
+ */
+class LogFileHandle internal constructor(
+  val id: Long,
+  private val writer: LogFileWriter,
+  private val registry: LogWriterRegistry
+) {
+  private enum class State { ACTIVE, CLOSING, CLOSED }
+
+  private val lock = ReentrantLock()
+  private val purgeFinished = lock.newCondition()
+  private var generation = writer.currentGeneration
+  private var state = State.ACTIVE
+  /** A purge is running on this handle; close has to wait it out. */
+  private var purging = false
+
+  val filePath: String get() = writer.file.absolutePath
+
+  /**
+   * Whether this handle may still speak for the writer.
+   *
+   * Every entry point below is gated on it, and on ACTIVE specifically rather
+   * than "not yet CLOSED". A handle in CLOSING has already had its flush
+   * barrier enqueued by [close]; letting it submit more work, or report a
+   * status it will not be around to make true, is how a released destination
+   * ends up observing — or writing to — a writer that another handle now owns.
+   */
+  private val isLive: Boolean get() = lock.withLock { state == State.ACTIVE }
+
+  private fun inertStatus() = LogSinkStatus(0, 0, 0, 0)
+
+  fun appendBatch(batch: String, entryCount: Long): LogAppendResult = lock.withLock {
+    if (state != State.ACTIVE) {
+      return LogAppendResult(false, LogRejectReason.CLOSED, inertStatus())
+    }
+    writer.append(id, generation, batch, entryCount)
+  }
+
+  fun status(): LogSinkStatus {
+    if (!isLive) return inertStatus()
+    return writer.status(id)
+  }
+
+  fun flush(deadlineMs: Double): LogFlushOutcome {
+    // Not `durable = true`. A released handle flushed nothing, and saying
+    // otherwise invites the caller to treat its pending records as safe.
+    if (!isLive) return LogFlushOutcome(false, false, 0, inertStatus())
+    return writer.flush(id, deadlineMs)
+  }
+
+  fun logFilePaths(): List<String> {
+    if (!isLive) return emptyList()
+    return writer.logFilePaths()
+  }
+
+  /**
+   * Purges, then rebinds only if the writer really came back.
+   *
+   * `rebound` is a fact about THIS handle, not about the writer: if this handle
+   * is closing, or the purge did not end with a usable file, the caller must
+   * stay fenced even though the deletion itself may have been perfectly
+   * durable.
+   */
+  fun clearLogs(deadlineMs: Double): LogClearOutcome {
+    lock.lock()
+    if (state != State.ACTIVE || purging) {
+      lock.unlock()
+      return LogClearOutcome(0, listOf(filePath), durable = false)
+    }
+    purging = true
+    lock.unlock()
+
+    val result = try {
+      writer.clearLogs(deadlineMs)
+    } finally {
+      lock.withLock {
+        purging = false
+        purgeFinished.signalAll()
+      }
+    }
+
+    lock.withLock {
+      var outcome = result.first
+      if (state == State.ACTIVE && outcome.durable && outcome.rebound) {
+        generation = result.second
+      } else {
+        outcome = outcome.copy(rebound = false)
+      }
+      return outcome
+    }
+  }
+
+  /**
+   * Closes this handle, waiting out any purge still running on it.
+   *
+   * One budget across all three waits. Giving each the full deadline means a
+   * caller asking for 200 ms can wait 600.
+   */
+  fun close(deadlineMs: Double): LogFlushOutcome {
+    // Monotonic, not `currentTimeMillis`. This budget spans three waits, and a
+    // device clock that steps backward part-way through — an NTP correction, a
+    // user changing the date — would hand the flush and teardown far more than
+    // the caller asked for. On the crash path that is the difference between a
+    // bounded close and an ANR.
+    val expiry = monotonicMs() + LogFileWriter.clampDeadline(deadlineMs)
+
+    lock.lock()
+    if (state != State.ACTIVE) {
+      lock.unlock()
+      return LogFlushOutcome(false, false, 0, inertStatus())
+    }
+    state = State.CLOSING
+    while (purging) {
+      val left = maxOf(0L, expiry - monotonicMs())
+      if (left <= 0) break
+      try {
+        if (!purgeFinished.await(left, TimeUnit.MILLISECONDS)) break
+      } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        break
+      }
+    }
+    lock.unlock()
+
+    val outcome = writer.flush(id, remaining(expiry))
+    registry.release(writer, id, remaining(expiry))
+    lock.withLock { state = State.CLOSED }
+    return outcome
+  }
+
+  private fun remaining(expiry: Long): Double =
+    maxOf(0L, expiry - monotonicMs()).toDouble()
+
+  private fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
+}

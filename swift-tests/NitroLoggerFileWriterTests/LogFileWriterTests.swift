@@ -309,10 +309,27 @@ final class LogFileWriterTests: LogWriterTestCase {
       maxTotalLogBytes: .nan
     )
     XCTAssertEqual(nonsense.maxFileSizeBytes, 10_485_760, "NaN carries no intent — use the default")
-    XCTAssertEqual(nonsense.maxArchivedFilesCount, 0)
+    XCTAssertEqual(
+      nonsense.maxArchivedFilesCount, 5,
+      "a negative count is not an instruction to delete every archive"
+    )
     XCTAssertNil(nonsense.maxFileAgeSeconds)
     XCTAssertNil(nonsense.maxArchiveAgeSeconds)
     XCTAssertNil(nonsense.maxTotalLogBytes)
+  }
+
+  /// The distinction the retention limit has to make: zero is an instruction and
+  /// `NaN` is not.
+  ///
+  /// Both used to clamp to zero, which meant one malformed number from
+  /// JavaScript deleted every rotated file on the next sweep — the failure mode
+  /// the byte limits had always been careful to avoid.
+  func testAnExplicitZeroKeepsNoArchivesButNaNDoesNot() {
+    let none = LogRotationPolicy(maxArchivedFilesCount: 0)
+    XCTAssertEqual(none.maxArchivedFilesCount, 0, "zero is a real request to keep nothing")
+
+    let malformed = LogRotationPolicy(maxArchivedFilesCount: .nan)
+    XCTAssertEqual(malformed.maxArchivedFilesCount, 5, "NaN falls back rather than deleting")
   }
 
   /// `Infinity` means "never rotate". Folding it into the default would turn a

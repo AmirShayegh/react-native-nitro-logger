@@ -32,7 +32,7 @@ public struct LogRotationPolicy: Sendable, Equatable {
     maxTotalLogBytes: Double? = nil
   ) {
     self.maxFileSizeBytes = LogRotationPolicy.bytes(maxFileSizeBytes, fallback: 10_485_760)
-    self.maxArchivedFilesCount = LogRotationPolicy.count(maxArchivedFilesCount)
+    self.maxArchivedFilesCount = LogRotationPolicy.count(maxArchivedFilesCount, fallback: 5)
     self.maxFileAgeSeconds = LogRotationPolicy.seconds(maxFileAgeSeconds)
     self.compressArchives = compressArchives
     self.maxArchiveAgeSeconds = LogRotationPolicy.seconds(maxArchiveAgeSeconds)
@@ -54,8 +54,17 @@ public struct LogRotationPolicy: Sendable, Equatable {
     return UInt64(min(value, Double(byteCeiling)))
   }
 
-  private static func count(_ value: Double) -> Int {
-    if value.isNaN || value < 0 { return 0 }
+  /// Same rule as `bytes`, and for a sharper reason: this limit is what pruning
+  /// deletes down to.
+  ///
+  /// A literal zero is a real instruction — "keep no archives" — so it is
+  /// honoured. `NaN` and negatives are not instructions at all, and folding them
+  /// into zero would make one malformed number from JavaScript delete every
+  /// rotated file on the next sweep. They fall back to the default instead:
+  /// retaining five archives nobody asked for is recoverable, and deleting the
+  /// lot is not.
+  private static func count(_ value: Double, fallback: Int) -> Int {
+    if value.isNaN || value < 0 { return fallback }
     if value.isInfinite { return countCeiling }
     return Int(min(value, Double(countCeiling)))
   }
@@ -175,6 +184,10 @@ public final class LogWriter {
   /// Longest any deadline-bounded call will wait. Well short of the watchdog
   /// window a synchronous crash-path flush has to live inside.
   private static let MAX_DEADLINE_MS = 30_000
+  /// How long `logFilePaths()` will wait for the queue before answering with the
+  /// active path alone. Short: it takes no deadline of its own, and collecting
+  /// support logs is not worth blocking the JS thread over.
+  private static let pathsDeadlineMs = 2_000
 
   /// The raw write, injectable so short writes and hard failures can be tested
   /// without a real disk that misbehaves on demand. Production passes `nil`.
@@ -983,10 +996,40 @@ public final class LogWriter {
     return suffix.range(of: pattern, options: .regularExpression) != nil
   }
 
+  /// The active file and every archive, newest first — read **on the queue**.
+  ///
+  /// Rotation, compression, retention and purge all mutate these names, and all
+  /// of them run on the queue. Enumerating from the caller's thread would race
+  /// every one of them: the honest failure is handing back a `.gz` that is
+  /// mid-rename, or an archive that pruning removed a microsecond later, to a
+  /// caller whose whole purpose is to open those files.
+  ///
+  /// Bounded, because this is reachable from the JS thread and the queue may be
+  /// wedged on storage that has stopped answering. On timeout the active path is
+  /// returned alone: it is the one name this writer owns unconditionally and can
+  /// state without reading the directory, whereas a partial archive list would
+  /// be indistinguishable from a complete one.
   func logFilePaths() -> [String] {
     let directory = fileURL.deletingLastPathComponent()
-    var paths = [fileURL.path]
-    paths.append(contentsOf: Self.archives(in: directory, baseName: fileURL.lastPathComponent).map(\.url.path))
+    let baseName = fileURL.lastPathComponent
+
+    if DispatchQueue.getSpecific(key: queueKey) == true {
+      return [fileURL.path] + Self.archives(in: directory, baseName: baseName).map(\.url.path)
+    }
+
+    var snapshot: [String]?
+    let group = DispatchGroup()
+    group.enter()
+    queue.async {
+      snapshot = [self.fileURL.path]
+        + Self.archives(in: directory, baseName: baseName).map(\.url.path)
+      group.leave()
+    }
+    guard group.wait(timeout: .now() + .milliseconds(Self.pathsDeadlineMs)) != .timedOut,
+          let paths = snapshot
+    else {
+      return [fileURL.path]
+    }
     return paths
   }
 

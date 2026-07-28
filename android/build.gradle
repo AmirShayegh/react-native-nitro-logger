@@ -104,9 +104,21 @@ android {
     sourceCompatibility JavaVersion.VERSION_17
     targetCompatibility JavaVersion.VERSION_17
   }
+
+  testOptions {
+    unitTests {
+      // The writer imports nothing from `android.*` — every syscall it needs
+      // is behind `PlatformIo` — so its suite is plain JUnit on the JVM and
+      // needs neither a device nor Robolectric. This flag only covers the
+      // stray android.* symbol reached through a shared constant.
+      returnDefaultValues = true
+    }
+  }
 }
 
 dependencies {
   implementation "com.facebook.react:react-android"
   implementation project(":react-native-nitro-modules")
+
+  testImplementation "junit:junit:4.13.2"
 }
