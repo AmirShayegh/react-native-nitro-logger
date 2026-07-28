@@ -1,0 +1,33 @@
+{
+  "cxxNamespace": ["nitrologger"],
+  "ios": {
+    "iosModuleName": "NitroLogger"
+  },
+  "android": {
+    "androidNamespace": ["nitrologger"],
+    "androidCxxLibName": "nitrologger"
+  },
+  "autolinking": {
+    "FileSink": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridFileSink"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridFileSink"
+      }
+    },
+    "NativeConsoleSink": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridNativeConsoleSink"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridNativeConsoleSink"
+      }
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}
