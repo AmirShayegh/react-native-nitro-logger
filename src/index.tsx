@@ -27,6 +27,11 @@ export type { LogDestination } from './destinations/types';
 export { ConsoleDestination } from './destinations/ConsoleDestination';
 export type { LogFormatter } from './formatters/types';
 export { DefaultFormatter } from './formatters/DefaultFormatter';
+export { JsonLinesFormatter } from './formatters/JsonLinesFormatter';
+export type {
+  JsonTimestampStyle,
+  JsonLinesFormatterOptions,
+} from './formatters/JsonLinesFormatter';
 
 // ── Spike-era raw sink access ───────────────────────────────────────────────
 // Used by the example app's M0 harness; becomes internal once the
