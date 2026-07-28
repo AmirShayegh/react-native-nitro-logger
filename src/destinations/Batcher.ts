@@ -266,6 +266,20 @@ export class Batcher {
     return this.pendingBytes;
   }
 
+  /**
+   * Payload-free bitmask of what has stopped working underneath — rotation,
+   * gzip, prune, sidecar, protection.
+   *
+   * This mirrors the sink's own mask, which accumulates bits and drops them
+   * only when a durable purge baselines everything. That is deliberate: these
+   * are things an app wants to know happened *at all*, and a mask that cleared
+   * itself the moment the next batch succeeded would report nothing the one
+   * time it mattered.
+   */
+  degradation(): number {
+    return this.degraded;
+  }
+
   isFenced(): boolean {
     return this.fenced;
   }

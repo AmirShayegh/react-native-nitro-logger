@@ -144,13 +144,16 @@ class HybridFileSink : HybridFileSinkSpec() {
     arrayOf(f.absolutePath) // archives join this list in M8
   }
 
+  // `rebound` is false on every path, including success: this M0 stub closes
+  // the file to delete it and never reopens, so the destination must stay
+  // fenced. The real writer lands in M8.
   override fun clearLogs(deadlineMs: Double): ClearOutcome {
     close(deadlineMs)
-    val f = synchronized(stateLock) { file } ?: return ClearOutcome(0.0, emptyArray(), true)
+    val f = synchronized(stateLock) { file } ?: return ClearOutcome(0.0, emptyArray(), true, false)
     return if (f.delete() || !f.exists()) {
-      ClearOutcome(1.0, emptyArray(), true)
+      ClearOutcome(1.0, emptyArray(), true, false)
     } else {
-      ClearOutcome(0.0, arrayOf(f.absolutePath), false)
+      ClearOutcome(0.0, arrayOf(f.absolutePath), false, false)
     }
   }
 }

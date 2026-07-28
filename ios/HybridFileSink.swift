@@ -1,30 +1,34 @@
 import Foundation
 import NitroModules
 
-/// M0 spike implementation of the FileSink contract.
+/// The Nitro end of the file sink: marshalling, and nothing else.
 ///
-/// Proves the bridge shapes end-to-end (accept/reject with byte reservation,
-/// non-blocking status, deadline-bounded flush/close). M5 replaces the write
-/// path with the vendored LogFileWriter: path registry + generations,
-/// rotation/gzip/prune, secure-create on every artifact, fault recovery.
+/// Every decision — batching, backpressure, drop accounting, loss notices —
+/// lives in TypeScript, and every byte that touches the disk lives in
+/// `LogWriter`. What is left here is converting `Double` to `Int`, one enum to
+/// another, and holding exactly one `LogFileHandle`.
+///
+/// That split is the point, not an accident of it: `LogWriter` imports nothing
+/// from Nitro, so rotation, recovery, the registry, and every injected fault run
+/// under XCTest in about a second instead of by hand on a simulator. Anything
+/// that grows logic in this file has been put in the wrong place.
 final class HybridFileSink: HybridFileSinkSpec {
-  /// Hard payload cap: bytes stay reserved from acceptance until the write
-  /// completes, so in-flight batches count against the bound.
-  private static let hardCapBytes = 1_048_576
+  private let lock = NSLock()
+  private var handle: LogFileHandle?
 
-  private let queue = DispatchQueue(label: "com.nitrologger.filesink")
-  /// Guards counters + handle swap only — never held across I/O, so
-  /// getStatus() stays responsive while the writer is stalled on disk.
-  private let stateLock = NSLock()
-  private var reservedBytes = 0
-  private var lostBytes = 0
-  private var lostEntries = 0
-  private var closed = true
-  private var fileURL: URL?
-  private var handle: FileHandle?
-  /// Whether the producer guarantees one `\n`-terminated record per batch
-  /// line. M5's startup scan trims a torn trailing record only when true.
-  private var lineFramed = false
+  /// The native finalizer, which is the whole reason the refcount is native.
+  ///
+  /// An abrupt runtime teardown never runs JavaScript, so a JS `dispose()` is
+  /// not a guarantee — but this deinit is. Releasing here hands the descriptor
+  /// and the registry slot back even when nothing on the JS side got to run.
+  deinit {
+    lock.lock()
+    let live = handle
+    handle = nil
+    lock.unlock()
+    // Zero deadline: a teardown deinit must not wait on a wedged disk.
+    _ = live?.close(deadlineMs: 0)
+  }
 
   var defaultLogDirectory: String {
     let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
@@ -33,155 +37,174 @@ final class HybridFileSink: HybridFileSinkSpec {
   }
 
   func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws {
-    _ = rotation // consumed from M5; numeric clamping happens there too
-    // Absent means absent: without a declared one-record-per-line contract
-    // the startup scan must not trim a trailing record, because it cannot
-    // tell a torn one from an intentional newline.
-    self.lineFramed = lineFramed ?? false
-    let url = URL(fileURLWithPath: path)
-    let fm = FileManager.default
-    // Type-specific modes: directories need search permission, files do not.
-    try fm.createDirectory(
-      at: url.deletingLastPathComponent(),
-      withIntermediateDirectories: true,
-      attributes: [.posixPermissions: 0o700]
-    )
-    if !fm.fileExists(atPath: url.path) {
-      guard fm.createFile(atPath: url.path, contents: nil,
-                          attributes: [.posixPermissions: 0o600]) else {
-        throw RuntimeError.error(withMessage: "FileSink: could not create \(url.path)")
-      }
+    lock.lock()
+    let alreadyOpen = handle != nil
+    lock.unlock()
+    guard !alreadyOpen else {
+      throw RuntimeError.error(withMessage: "FileSink: already open")
     }
-    guard let h = try? FileHandle(forWritingTo: url) else {
-      throw RuntimeError.error(withMessage: "FileSink: could not open \(url.path)")
+
+    let acquired: LogFileHandle
+    do {
+      acquired = try LogWriterRegistry.shared.acquire(
+        path: path,
+        policy: Self.policy(from: rotation),
+        // Absent means absent. Without a declared one-record-per-line contract
+        // the startup scan must not trim a trailing record, because it cannot
+        // tell a torn one from an intentional newline.
+        lineFramed: lineFramed ?? false
+      )
+    } catch LogWriterError.configConflict {
+      throw RuntimeError.error(
+        withMessage: "FileSink: another destination already opened this file with a different configuration")
+    } catch LogWriterError.symlinkEscape {
+      throw RuntimeError.error(withMessage: "FileSink: the log path is a symbolic link")
+    } catch LogWriterError.stillClosing {
+      // Distinct from the others because it is the one worth retrying: a
+      // previous destination on this file has not finished shutting down, and
+      // opening a second writer alongside it is exactly what must not happen.
+      throw RuntimeError.error(
+        withMessage: "FileSink: the previous destination for this file is still closing")
+    } catch {
+      // Deliberately payload-free. An `errno` description or a path is exactly
+      // the kind of string that carries a username, and this message crosses
+      // into JavaScript where something will eventually log it.
+      throw RuntimeError.error(withMessage: "FileSink: could not open the log file")
     }
-    h.seekToEndOfFile()
-    stateLock.lock()
-    fileURL = url
-    handle = h
-    closed = false
-    stateLock.unlock()
+
+    lock.lock()
+    handle = acquired
+    lock.unlock()
   }
 
   func appendBatch(batch: String, entryCount: Double) throws -> AppendResult {
-    let bytes = batch.utf8.count
-    let entries = max(0, Int(entryCount))
-
-    stateLock.lock()
-    guard !closed, let h = handle else {
-      let s = snapshotLocked()
-      stateLock.unlock()
+    guard let handle = current() else {
       return AppendResult(accepted: false, rejectReason: .closed,
-                          queuedBytes: s.queuedBytes, lostBytes: s.lostBytes,
-                          lostEntries: s.lostEntries, degraded: s.degraded)
+                          queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
     }
-    guard reservedBytes + bytes <= Self.hardCapBytes else {
-      let s = snapshotLocked()
-      stateLock.unlock()
-      return AppendResult(accepted: false, rejectReason: .full,
-                          queuedBytes: s.queuedBytes, lostBytes: s.lostBytes,
-                          lostEntries: s.lostEntries, degraded: s.degraded)
+    // Refused rather than rounded: an unchecked cast of NaN or 1e30 traps, and
+    // a count that does not survive the round trip cannot be trusted to
+    // describe the batch it arrived with.
+    guard entryCount.isFinite, let count = Int(exactly: entryCount) else {
+      return Self.appendResult(
+        LogAppendResult(accepted: false, rejectReason: .failed, status: handle.status()))
     }
-    reservedBytes += bytes
-    let accepted = snapshotLocked()
-    stateLock.unlock()
-
-    let data = Data(batch.utf8)
-    queue.async { [weak self] in
-      guard let self else { return }
-      do {
-        try h.write(contentsOf: data)
-        self.stateLock.lock()
-        self.reservedBytes -= bytes
-        self.stateLock.unlock()
-      } catch {
-        // Batch is the atomic loss unit: the whole reservation becomes loss.
-        self.stateLock.lock()
-        self.reservedBytes -= bytes
-        self.lostBytes += bytes
-        self.lostEntries += entries
-        self.stateLock.unlock()
-      }
-    }
-
-    return AppendResult(accepted: true, rejectReason: nil,
-                        queuedBytes: accepted.queuedBytes, lostBytes: accepted.lostBytes,
-                        lostEntries: accepted.lostEntries, degraded: accepted.degraded)
+    return Self.appendResult(handle.appendBatch(batch, entryCount: count))
   }
 
   func getStatus() throws -> SinkStatus {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    return snapshotLocked()
+    guard let handle = current() else {
+      return SinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+    }
+    return Self.status(handle.status())
   }
 
   func flush(deadlineMs: Double) throws -> FlushOutcome {
-    let group = DispatchGroup()
-    group.enter()
-    queue.async { [weak self] in
-      defer { group.leave() }
-      guard let self else { return }
-      self.stateLock.lock()
-      let h = self.handle
-      self.stateLock.unlock()
-      try? h?.synchronize()
+    guard let handle = current() else {
+      // Nothing was ever accepted through this sink, so "every accepted byte
+      // reached storage" holds vacuously. Reporting otherwise would have the
+      // JavaScript side retry a flush that can never have anything to do.
+      return Self.emptyOutcome()
     }
-    let timedOut = group.wait(
-      timeout: .now() + .milliseconds(Int(max(0, deadlineMs)))
-    ) == .timedOut
-
-    stateLock.lock()
-    let s = snapshotLocked()
-    let pending = reservedBytes
-    stateLock.unlock()
-    return FlushOutcome(durable: !timedOut && pending == 0, timedOut: timedOut,
-                        pendingBytes: Double(pending), queuedBytes: s.queuedBytes,
-                        lostBytes: s.lostBytes, lostEntries: s.lostEntries,
-                        degraded: s.degraded)
+    return Self.flushOutcome(handle.flush(deadlineMs: deadlineMs))
   }
 
   func close(deadlineMs: Double) throws -> FlushOutcome {
-    stateLock.lock()
-    closed = true
-    stateLock.unlock()
-    let outcome = try flush(deadlineMs: deadlineMs)
-    stateLock.lock()
-    let h = handle
+    lock.lock()
+    let live = handle
     handle = nil
-    stateLock.unlock()
-    try? h?.close()
-    return outcome
+    lock.unlock()
+
+    guard let live else { return Self.emptyOutcome() }
+    return Self.flushOutcome(live.close(deadlineMs: deadlineMs))
   }
 
   func getLogFilePaths() throws -> [String] {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    guard let url = fileURL else { return [] }
-    return [url.path] // archives join this list in M5
+    current()?.logFilePaths() ?? []
   }
 
   func clearLogs(deadlineMs: Double) throws -> ClearOutcome {
-    // Spike: single current file. M5 extends the deletion set to the full
-    // artifact scheme (sidecars, archives, gzip temporaries, staging) and
-    // moves this under the registry lock with a generation bump.
-    _ = try close(deadlineMs: deadlineMs)
-    stateLock.lock()
-    let url = fileURL
-    stateLock.unlock()
-    guard let url else {
-      return ClearOutcome(deletedCount: 0, failedPaths: [], durable: true)
+    guard let handle = current() else {
+      // Nothing was ever opened, so there is nothing left behind — but there is
+      // also nothing to rebind onto, and saying otherwise would have the JS
+      // destination resume against a sink it never opened.
+      return ClearOutcome(deletedCount: 0, failedPaths: [], durable: true, rebound: false)
     }
-    do {
-      try FileManager.default.removeItem(at: url)
-      return ClearOutcome(deletedCount: 1, failedPaths: [], durable: true)
-    } catch {
-      return ClearOutcome(deletedCount: 0, failedPaths: [url.path], durable: false)
-    }
+    let outcome = handle.clearLogs(deadlineMs: deadlineMs)
+    return ClearOutcome(
+      deletedCount: Double(outcome.deletedCount),
+      failedPaths: outcome.failedPaths,
+      durable: outcome.durable,
+      rebound: outcome.rebound
+    )
   }
 
-  /// Callers must hold stateLock.
-  private func snapshotLocked() -> SinkStatus {
-    SinkStatus(queuedBytes: Double(reservedBytes), lostBytes: Double(lostBytes),
-               lostEntries: Double(lostEntries), degraded: 0)
+  private func current() -> LogFileHandle? {
+    lock.lock()
+    defer { lock.unlock() }
+    return handle
+  }
+
+  // MARK: - Marshalling
+
+  /// Numbers arrive as `Double` because that is what JavaScript has. The
+  /// clamping lives in `LogRotationPolicy.init`, which is also where the Kotlin
+  /// side's equivalent has to agree with it.
+  private static func policy(from config: RotationConfig?) -> LogRotationPolicy {
+    guard let config else { return LogRotationPolicy() }
+    return LogRotationPolicy(
+      maxFileSizeBytes: config.maxFileSizeBytes,
+      maxArchivedFilesCount: config.maxArchivedFilesCount,
+      maxFileAgeSeconds: config.maxFileAgeSeconds,
+      compressArchives: config.compressArchives,
+      maxArchiveAgeSeconds: config.maxArchiveAgeSeconds,
+      maxTotalLogBytes: config.maxTotalLogBytes
+    )
+  }
+
+  private static func status(_ status: LogSinkStatus) -> SinkStatus {
+    SinkStatus(
+      queuedBytes: Double(status.queuedBytes),
+      lostBytes: Double(status.lostBytes),
+      lostEntries: Double(status.lostEntries),
+      degraded: Double(status.degraded)
+    )
+  }
+
+  private static func appendResult(_ result: LogAppendResult) -> AppendResult {
+    AppendResult(
+      accepted: result.accepted,
+      rejectReason: result.rejectReason.map(reason),
+      queuedBytes: Double(result.status.queuedBytes),
+      lostBytes: Double(result.status.lostBytes),
+      lostEntries: Double(result.status.lostEntries),
+      degraded: Double(result.status.degraded)
+    )
+  }
+
+  private static func flushOutcome(_ outcome: LogFlushOutcome) -> FlushOutcome {
+    FlushOutcome(
+      durable: outcome.durable,
+      timedOut: outcome.timedOut,
+      pendingBytes: Double(outcome.pendingBytes),
+      queuedBytes: Double(outcome.status.queuedBytes),
+      lostBytes: Double(outcome.status.lostBytes),
+      lostEntries: Double(outcome.status.lostEntries),
+      degraded: Double(outcome.status.degraded)
+    )
+  }
+
+  private static func emptyOutcome() -> FlushOutcome {
+    FlushOutcome(durable: true, timedOut: false, pendingBytes: 0,
+                 queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+  }
+
+  private static func reason(_ reason: LogRejectReason) -> RejectReason {
+    switch reason {
+    case .full: return .full
+    case .staleGeneration: return .stalegeneration
+    case .closed: return .closed
+    case .failed: return .failed
+    }
   }
 }

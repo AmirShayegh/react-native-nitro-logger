@@ -31,13 +31,19 @@ export interface FileSinkLike {
    * Delete every artifact and bump the writer generation, fencing every
    * handle on it.
    *
-   * On `durable: true` the CALLING handle is rebound to the new generation by
-   * this call — no second `open` follows, and none would be accepted, since
-   * re-opening a live writer is a config conflict. That is why the JS side
-   * only lifts its own fence afterwards. A `clearLogs` that bumped the
-   * generation without rebinding its caller would leave the destination
+   * On `durable && rebound` the CALLING handle is rebound to the new
+   * generation by this call — no second `open` follows, and none would be
+   * accepted, since re-opening a live writer is a config conflict. That is why
+   * the JS side only lifts its own fence afterwards. A `clearLogs` that bumped
+   * the generation without rebinding its caller would leave the destination
    * writing into a stale handle, discarding every record it was handed and
    * disabling itself on the first rejection.
+   *
+   * The two flags are separate because they are separate facts. `durable`
+   * answers the compliance question — the artifacts are gone — and a purge can
+   * answer it truthfully and still fail to reopen, on a directory that has
+   * become unwritable or a volume that filled. Only the second flag says there
+   * is somewhere to write.
    *
    * On anything else the caller stays fenced along with everyone else, so a
    * deletion still in flight can never race a fresh write.
@@ -69,6 +75,14 @@ export interface FileDestinationOptions {
 export interface PurgeOutcome {
   /** Every artifact is gone. False on any survivor or a blown deadline. */
   readonly durable: boolean;
+  /**
+   * The destination is writable again, and writing has resumed.
+   *
+   * False means the deletion may well have succeeded — check `durable` — but
+   * the sink did not come back with a usable file, or did not say so. Either
+   * way this destination stays disabled until a retry.
+   */
+  readonly rebound: boolean;
   readonly deletedCount: number;
   readonly failedPaths: readonly string[];
   /** Buffered records thrown away, plus losses that will now go unreported. */
@@ -210,6 +224,22 @@ export class FileDestination implements LogDestination {
   }
 
   /**
+   * What has stopped working underneath, as a payload-free bitmask —
+   * rotation, gzip, prune, sidecar, protection.
+   *
+   * The mask exists because the alternative is a message, and a message built
+   * from an `errno` string or a path is exactly the kind of thing that carries
+   * a username into a log file. Bits carry no payload, so an app can surface
+   * "log rotation is failing" to support without surfacing anything else.
+   *
+   * Non-zero does not mean records are being lost — a failed compression or a
+   * failed prune costs disk, not data. Check {@link unreportedLoss} for that.
+   */
+  degradation(): number {
+    return this.batcher.degradation();
+  }
+
+  /**
    * Delete every log artifact, then rebind.
    *
    * The ordering is the point. This handle is fenced first, so nothing can be
@@ -235,6 +265,9 @@ export class FileDestination implements LogDestination {
     } catch {
       return {
         durable: false,
+        // The call threw, so nothing is known about the sink's state and the
+        // fence set above stays up. Reporting a rebind here would lift it.
+        rebound: false,
         deletedCount: 0,
         failedPaths: [],
         discardedEntries: discarded.entries,
@@ -242,16 +275,29 @@ export class FileDestination implements LogDestination {
       };
     }
 
-    if (outcome.durable) {
-      // `clearLogs` rebound this handle to the new generation as part of the
-      // deletion — see FileSinkLike. All that is left here is to lift the JS
-      // fence and start the loss cursors over against the fresh counters.
+    // Both facts, not just the first. `durable` says the artifacts are gone;
+    // `rebound` says the sink has a usable file again. Lifting the fence on
+    // `durable` alone resumes writing into a handle the sink never rebound —
+    // every record accepted, rejected as `staleGeneration`, and dropped. The
+    // deletion is still complete and still reported as such; the destination
+    // just stays disabled until an explicit retry gets a live file back.
+    //
+    // `=== true`, not `!== false`. An absent field is not a promise, and the
+    // sink most likely to omit it is one that predates it — including a native
+    // build that deletes by closing and never reopens at all. A JS bundle can
+    // be updated over the air without the binary underneath it changing, so
+    // "old native, new JS" is a real pairing, and reading silence as success
+    // there rebuilds exactly the silent post-purge loss this flag exists to
+    // stop. Staying fenced until a retry is the failure that announces itself.
+    const resumed = outcome.durable && outcome.rebound === true;
+    if (resumed) {
       this.fenced = this.disposed;
       this.batcher.rebind();
     }
 
     return {
       durable: outcome.durable,
+      rebound: resumed,
       deletedCount: count(outcome.deletedCount),
       failedPaths: Array.isArray(outcome.failedPaths)
         ? outcome.failedPaths

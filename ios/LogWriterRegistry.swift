@@ -1,0 +1,444 @@
+import Foundation
+
+/// One writer per file, no matter how many destinations point at it.
+///
+/// Two `FileHandle`s appending to the same path from different queues interleave
+/// mid-record, and two rotation schedules racing over the same file archive each
+/// other's fresh output. The registry makes that impossible by construction:
+/// everything that resolves to the same file gets the same `LogWriter`.
+///
+/// **The key is the realpath-resolved path.** `logs/app.log`,
+/// `logs/../logs/app.log`, and a `logs` symlink into the real directory are the
+/// same file and must land on the same entry — comparing the strings the caller
+/// passed in would hand out two writers for one file, which is exactly the
+/// collision the registry exists to stop.
+public final class LogWriterRegistry {
+  public static let shared = LogWriterRegistry()
+
+  /// A condition rather than a plain lock, because acquisition sometimes has to
+  /// *wait* — see `closing` below.
+  private let condition = NSCondition()
+  private var writers: [String: LogWriter] = [:]
+  /// Paths whose writer has been evicted but is still draining and closing.
+  ///
+  /// Eviction and close cannot be one atomic step: closing waits on the write
+  /// queue, and holding the registry lock across that would stall every other
+  /// file. But between the two, the map has no entry for the path — so an
+  /// acquire arriving in that window would build a *second* writer while the
+  /// first still has accepted batches queued, giving one file two queues and
+  /// two rotation schedules. That is the exact collision this registry exists
+  /// to prevent, so acquisition waits out the close instead.
+  ///
+  /// Counted rather than a set: it costs nothing and stops a stray double
+  /// release from clearing a marker another close still needs.
+  private var closing: [String: Int] = [:]
+  private var nextHandleID: UInt64 = 1
+
+  /// How long an acquire will wait for a previous writer on the same path to
+  /// finish shutting down before giving up.
+  static let closeWaitSeconds: TimeInterval = 5
+
+  init() {}
+
+  /// Acquires a handle on the writer for `path`, creating it if needed.
+  ///
+  /// Acquisition happens entirely under the lock, so two runtimes opening the
+  /// same file concurrently cannot both construct a writer and have one silently
+  /// replace the other. Construction does touch the filesystem while the lock is
+  /// held; it happens once per file and only on the open path, which is the
+  /// cheaper trade than a second writer existing for even an instant.
+  public func acquire(
+    path: String,
+    policy: LogRotationPolicy,
+    lineFramed: Bool,
+    rawWrite: LogWriter.RawWrite? = nil,
+    compressor: LogWriter.Compressor? = nil
+  ) throws -> LogFileHandle {
+    let resolved = try LogWriterRegistry.resolve(path: path)
+
+    condition.lock()
+    defer { condition.unlock() }
+
+    // Wait out a close still in progress on this path — but not forever. The
+    // claim is now cleared by the writer's own queue rather than by whoever
+    // called close, so a wedged disk means it may never clear at all. Failing
+    // the open is the fail-closed answer: one writer per file is the invariant
+    // worth keeping, and a caller that cannot have it should be told so rather
+    // than handed a second one.
+    let waitUntil = Date().addingTimeInterval(Self.closeWaitSeconds)
+    while closing[resolved.canonicalPath] != nil {
+      if !condition.wait(until: waitUntil) {
+        throw LogWriterError.stillClosing
+      }
+    }
+
+    let writer: LogWriter
+    if let existing = writers[resolved.canonicalPath], !existing.isClosed {
+      // A second destination on the same file must agree about how that file is
+      // written. Silently honouring the first caller's rotation policy would
+      // give the second one a file that behaves nothing like what it asked for,
+      // and silently honouring the last would change it under the first.
+      guard existing.policy == policy, existing.lineFramed == lineFramed else {
+        throw LogWriterError.configConflict
+      }
+      writer = existing
+    } else {
+      writer = try LogWriter(
+        fileURL: resolved.url,
+        canonicalPath: resolved.canonicalPath,
+        policy: policy,
+        lineFramed: lineFramed,
+        rawWrite: rawWrite,
+        compressor: compressor
+      )
+      writers[resolved.canonicalPath] = writer
+    }
+
+    writer.retain()
+    let id = nextHandleID
+    nextHandleID &+= 1
+    return LogFileHandle(id: id, writer: writer, registry: self)
+  }
+
+  /// Drops one handle's claim, closing and evicting the writer at zero.
+  ///
+  /// Called from `LogFileHandle.deinit` as well as from an explicit dispose, so
+  /// a runtime torn down without running JavaScript finalizers still gives the
+  /// file descriptor back.
+  func release(_ writer: LogWriter, handleID: UInt64, deadlineMs: Double) {
+    let path = writer.canonicalPath
+
+    condition.lock()
+    let remaining = writer.releaseOne()
+    let shouldClose = remaining <= 0
+    if shouldClose {
+      if writers[path] === writer { writers.removeValue(forKey: path) }
+      // Claim the path for the duration of the close. An acquire arriving now
+      // waits rather than building a rival writer over a file this one is
+      // still draining.
+      closing[path, default: 0] += 1
+    }
+    condition.unlock()
+
+    guard shouldClose else { return }
+
+    // The claim is dropped by the writer's own queue, in `onTerminated`, not
+    // when this call stops waiting. A close that hits its deadline leaves work
+    // still executing on that queue; releasing the path then would let a
+    // replacement writer open the same file underneath it.
+    _ = writer.close(handleID: handleID, deadlineMs: deadlineMs) { [weak self] in
+      self?.finishClosing(path)
+    }
+  }
+
+  private func finishClosing(_ path: String) {
+    condition.lock()
+    if let outstanding = closing[path], outstanding > 1 {
+      closing[path] = outstanding - 1
+    } else {
+      closing.removeValue(forKey: path)
+    }
+    condition.broadcast()
+    condition.unlock()
+  }
+
+  struct Resolved {
+    let url: URL
+    let canonicalPath: String
+  }
+
+  /// Turns a caller-supplied path into the canonical file it names.
+  ///
+  /// The parent directory is created before resolution, because `realpath`
+  /// answers only for things that exist — resolving first would fall back to
+  /// the literal string on a fresh install and hand out a key that stops
+  /// matching the moment the directory appears.
+  static func resolve(path: String) throws -> Resolved {
+    guard !path.isEmpty else { throw LogWriterError.openFailed("empty path") }
+    let url = URL(fileURLWithPath: path).standardizedFileURL
+    let directory = url.deletingLastPathComponent()
+    let name = url.lastPathComponent
+    guard !name.isEmpty, name != "." , name != ".." else {
+      throw LogWriterError.openFailed("path does not name a file")
+    }
+
+    try LogSecureFile.createDirectory(at: directory)
+
+    guard let canonicalDirectory = realpath(directory.path, nil) else {
+      throw LogWriterError.openFailed("could not resolve the log directory")
+    }
+    defer { free(canonicalDirectory) }
+    let directoryPath = String(cString: canonicalDirectory)
+
+    // The log file itself must not be a symlink. Following one would write the
+    // app's log wherever the link points — a path the caller never named and
+    // the purge would never clean — and would let two different registry keys
+    // resolve to the same inode.
+    let candidate = URL(fileURLWithPath: directoryPath).appendingPathComponent(name)
+    var info = stat()
+    if lstat(candidate.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFLNK {
+      throw LogWriterError.symlinkEscape
+    }
+
+    return Resolved(url: candidate, canonicalPath: candidate.path)
+  }
+
+  // MARK: - Test support
+
+  /// A registry with no shared state, so tests do not leak writers into each
+  /// other through the singleton.
+  static func isolated() -> LogWriterRegistry { LogWriterRegistry() }
+
+  var liveWriterCountForTesting: Int {
+    condition.lock()
+    defer { condition.unlock() }
+    return writers.count
+  }
+
+  var closingCountForTesting: Int {
+    condition.lock()
+    defer { condition.unlock() }
+    return closing.count
+  }
+}
+
+/// One JavaScript destination's claim on a writer.
+///
+/// Owns the identity that loss is attributed to and the generation that fences
+/// it after a purge. The Nitro hybrid object holds exactly one of these, so the
+/// native finalizer running is enough to release the claim — no JavaScript has
+/// to execute for the descriptor to come back.
+public final class LogFileHandle {
+  let id: UInt64
+  private let writer: LogWriter
+  private weak var registry: LogWriterRegistry?
+  /// A three-state lifecycle rather than a `released` flag.
+  ///
+  /// The middle state is the one that matters: `close` flushes before it lets
+  /// go, and with only a boolean the handle stayed fully usable throughout that
+  /// flush — new appends and even a purge could start while shutdown was
+  /// already under way. Entering `closing` first shuts the door before any of
+  /// the waiting begins.
+  private enum State { case active, closing, released }
+
+  /// A condition rather than a plain lock, because a purge must be waited *out*
+  /// rather than waited *behind*.
+  ///
+  /// A purge can legitimately run for its full deadline — tens of seconds on a
+  /// slow volume. Holding this lock for that whole span would make every other
+  /// entry point inherit that wait, and `close`, which has a deadline of its
+  /// own to keep, would blow straight through it. So the purge marks itself
+  /// with `purging` and drops the lock; anyone who genuinely cannot proceed
+  /// alongside it waits on the condition under their own bound.
+  private let condition = NSCondition()
+  private var generation: UInt64
+  private var state: State = .active
+  /// Set for the duration of `clearLogs`, so `close` can tell "a deletion is in
+  /// flight" from "the handle is idle" without holding the lock across it.
+  private var purging = false
+
+  init(id: UInt64, writer: LogWriter, registry: LogWriterRegistry) {
+    self.id = id
+    self.writer = writer
+    self.registry = registry
+    self.generation = writer.currentGeneration
+  }
+
+  deinit {
+    // Zero deadline: a deinit may be running during runtime teardown, where
+    // blocking on a wedged disk is a hang the user sees as a frozen app. The
+    // descriptor is closed either way.
+    releaseNow(deadlineMs: 0)
+  }
+
+  public var filePath: String { writer.fileURL.path }
+
+  /// The generation to write under, or `nil` once this handle is released.
+  ///
+  /// Releasing drops this handle's claim, but the writer itself lives on while
+  /// any other handle holds it — so nothing about the writer stops a released
+  /// handle from still working. Every operation checks here instead. The one
+  /// that matters most is `clearLogs`: without this, a destination that was
+  /// disposed minutes ago could delete the files that live destinations are
+  /// writing to.
+  private func liveGeneration() -> UInt64? {
+    condition.lock()
+    defer { condition.unlock() }
+    return state == .active ? generation : nil
+  }
+
+  /// Reserves and enqueues a batch, **with the handle lock held across the
+  /// call**.
+  ///
+  /// Reading the generation and then releasing the lock before appending leaves
+  /// a window where `close` shuts the door, flushes, and returns `durable` — and
+  /// only then does the append it never saw reach the writer and get accepted.
+  /// Those records are outside the barrier that just promised everything was on
+  /// disk. Holding the lock closes the window at no cost: `writer.append` only
+  /// reserves bytes and enqueues, never touches the disk, and never reaches back
+  /// for this lock.
+  public func appendBatch(_ batch: String, entryCount: Int) -> LogAppendResult {
+    condition.lock()
+    defer { condition.unlock() }
+
+    guard state == .active else {
+      return LogAppendResult(
+        accepted: false,
+        rejectReason: .closed,
+        status: LogSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+      )
+    }
+    return writer.append(
+      handleID: id, handleGeneration: generation, batch: batch, entryCount: entryCount
+    )
+  }
+
+  public func status() -> LogSinkStatus {
+    guard liveGeneration() != nil else {
+      return LogSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+    }
+    return writer.status(handleID: id)
+  }
+
+  public func flush(deadlineMs: Double) -> LogFlushOutcome {
+    guard liveGeneration() != nil else {
+      // Not `durable: true`. A released handle did not flush anything, and
+      // saying otherwise invites a caller to treat its records as safe.
+      return LogFlushOutcome(
+        durable: false, timedOut: false, pendingBytes: 0,
+        status: LogSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+      )
+    }
+    return writer.flush(handleID: id, deadlineMs: deadlineMs)
+  }
+
+  public func logFilePaths() -> [String] {
+    guard liveGeneration() != nil else { return [] }
+    return writer.logFilePaths()
+  }
+
+  /// Deletes every artifact, then rebinds this handle **only if the purge was
+  /// complete**.
+  ///
+  /// Rebinding on a partial deletion is the failure the ordering exists to
+  /// prevent: writes would resume into a directory where deletion is still
+  /// pending or has failed, and the records that landed there would be the ones
+  /// the purge was supposed to guarantee were gone. Staying fenced costs new
+  /// logs until an explicit retry; rebinding early costs the guarantee.
+  ///
+  /// The purge marks itself and drops the lock rather than holding it for the
+  /// whole deletion. It is bounded by its own deadline, but that bound can be
+  /// tens of seconds, and every other entry point — `close` above all, which
+  /// has a deadline it has promised to keep — would otherwise inherit it. The
+  /// generation fence, not this lock, is what keeps concurrent appends off a
+  /// directory being deleted: the writer bumps it before the first `unlink`, so
+  /// anything still holding the old one is refused as stale.
+  public func clearLogs(deadlineMs: Double) -> LogClearOutcome {
+    condition.lock()
+    // A handle on its way out must not be able to delete files that live
+    // destinations are writing to; and a second concurrent purge on this handle
+    // would race the rebind below with nothing to arbitrate the two.
+    guard state == .active, !purging else {
+      condition.unlock()
+      return LogClearOutcome(deletedCount: 0, failedPaths: [], durable: false)
+    }
+    purging = true
+    condition.unlock()
+
+    let result = writer.clearLogs(deadlineMs: deadlineMs)
+
+    condition.lock()
+    defer { condition.unlock() }
+    purging = false
+    // Broadcast unconditionally: a `close` may be waiting this purge out under
+    // its own deadline, and it has to learn the deletion finished whether or
+    // not the deletion succeeded.
+    condition.broadcast()
+
+    // Rebind only onto a writer that came back with a usable descriptor, and
+    // only if this handle is still open. Deletion succeeding and the writer
+    // being usable again are separate facts; adopting the new generation
+    // without the second means accepting records into a writer that has nowhere
+    // to put them, and adopting it after a `close` slipped in reopens a door
+    // that was deliberately shut.
+    //
+    // Bind to the generation THIS purge established — never to whatever is
+    // current by now. Another purge may have moved the fence on since, and
+    // adopting its generation would authorise writes against a deletion still
+    // in flight. Binding to a superseded generation is safe: the next append is
+    // simply refused as stale, which is what a fenced handle should get.
+    var outcome = result.outcome
+    if state == .active, outcome.durable, outcome.rebound {
+      generation = result.generation
+    } else {
+      // `rebound` is a fact about THIS handle, not about the writer, and the
+      // two come apart exactly when a `close` gives up waiting for this purge:
+      // the writer really did get a fresh descriptor, and this handle really is
+      // never going to adopt it. Passing the writer's answer up would tell the
+      // caller to resume a destination that has already been shut.
+      outcome.rebound = false
+    }
+    return outcome
+  }
+
+  /// Shuts the handle and gives the writer back, inside **one** budget.
+  ///
+  /// Closing is three waits — out an in-flight purge, through the flush, then
+  /// through the writer's own teardown — and a caller that asked for 200 ms
+  /// meant 200 ms for the lot. Handing each step the full figure turns a
+  /// deadline into a multiple of itself, which on the JS side is a dispose that
+  /// blocks the runtime for three times as long as it promised.
+  public func close(deadlineMs: Double) -> LogFlushOutcome {
+    let expiry = Date().addingTimeInterval(Double(LogWriter.clampDeadline(deadlineMs)) / 1000)
+
+    // Shut the door before doing any waiting: everything below can take the
+    // whole budget, and nothing new should be able to start during it.
+    condition.lock()
+    guard state == .active else {
+      condition.unlock()
+      return LogFlushOutcome(
+        durable: false, timedOut: false, pendingBytes: 0,
+        status: LogSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+      )
+    }
+    state = .closing
+
+    // Let an in-flight deletion finish before tearing the writer down. Waiting
+    // is worth something: a purge interrupted by the close barrier still
+    // deletes, it just cannot reopen, so the fresh file is missing until the
+    // next acquire. Waiting past the budget is worth nothing.
+    while purging {
+      if !condition.wait(until: expiry) { break }
+    }
+    condition.unlock()
+
+    let outcome = writer.flush(handleID: id, deadlineMs: Self.remaining(until: expiry))
+    releaseNow(deadlineMs: Self.remaining(until: expiry))
+    return outcome
+  }
+
+  /// Milliseconds left, floored at zero — which the writer reads as "do not
+  /// wait", not as "wait forever".
+  private static func remaining(until expiry: Date) -> Double {
+    max(0, expiry.timeIntervalSinceNow * 1000)
+  }
+
+  private func releaseNow(deadlineMs: Double) {
+    condition.lock()
+    if state == .released {
+      condition.unlock()
+      return
+    }
+    state = .released
+    condition.broadcast()
+    condition.unlock()
+    registry?.release(writer, handleID: id, deadlineMs: deadlineMs)
+  }
+
+  var writerForTesting: LogWriter { writer }
+  var generationForTesting: UInt64 {
+    condition.lock()
+    defer { condition.unlock() }
+    return generation
+  }
+}

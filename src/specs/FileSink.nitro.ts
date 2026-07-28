@@ -69,6 +69,21 @@ export interface ClearOutcome {
   failedPaths: string[];
   /** False when any artifact survived or the deadline elapsed. */
   durable: boolean;
+  /**
+   * Whether the writer came back with a usable file afterwards.
+   *
+   * Separate from `durable` because they are separate facts and the caller
+   * needs both. A purge can delete everything it was asked to — `durable` —
+   * and still fail to reopen, on a directory that has become unwritable or a
+   * volume that filled. Resuming on `durable` alone hands records to a writer
+   * with nowhere to put them: every one is accepted, then rejected as
+   * `staleGeneration`, then dropped.
+   *
+   * Resume only when both are true. `durable && !rebound` means the deletion
+   * is genuinely complete — which is what a compliance caller asked — but the
+   * destination must stay fenced until an explicit retry gets a live file back.
+   */
+  rebound: boolean;
 }
 
 /**

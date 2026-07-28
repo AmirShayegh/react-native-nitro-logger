@@ -31,6 +31,35 @@ jobs:
       - name: Typecheck files
         run: yarn typecheck
 
+  test-js:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Run the TypeScript suite
+        run: yarn test
+
+  # The vendored iOS writer, under XCTest rather than on a simulator.
+  #
+  # `Package.swift` builds it without the Nitro adapter precisely so this job
+  # can exist: rotation, retention, purge fencing, secure-create, short-write
+  # recovery, and the 10k burst all run here in a couple of seconds. The
+  # simulator build below proves the bridge compiles; this proves the writer is
+  # correct, and the two are not substitutes.
+  test-swift:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Run the Swift suite
+        run: swift test
 
   build-library:
     runs-on: ubuntu-latest
@@ -58,8 +87,16 @@ jobs:
       - name: Regenerate nitrogen code
         run: yarn nitrogen
 
-      - name: Verify committed bindings match the specs
-        run: git diff --exit-code nitrogen/
+      # `nitrogen/` is gitignored, so scoping this to that directory asserted
+      # nothing and passed vacuously. Checking the whole tree is the real test:
+      # generation must not touch anything tracked, and if the bindings are
+      # ever committed this starts catching spec drift without further edits.
+      #
+      # What actually catches a stale binding today is compilation — the iOS
+      # and Android jobs both regenerate before they build, which is how a
+      # hand-written adapter that drifted from a changed spec gets found.
+      - name: Verify regeneration touches nothing tracked
+        run: git diff --exit-code
 
   build-android:
     runs-on: ubuntu-latest

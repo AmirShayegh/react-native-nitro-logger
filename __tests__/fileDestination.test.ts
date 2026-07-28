@@ -7,6 +7,7 @@ import { utf8Length } from '../src/utf8';
 import type { LogEntry } from '../src/types';
 import type { LogFormatter } from '../src/formatters/types';
 import { MemoryWriter } from './helpers/MemoryFileSink';
+import type { ClearOutcome } from '../src/specs/FileSink.nitro';
 
 const at = Date.UTC(2026, 6, 27, 12, 15, 30, 842);
 
@@ -143,6 +144,61 @@ describe('FileDestination — writing', () => {
       subsystem: 'logger',
       metadata: { droppedEntries: 1 },
     });
+  });
+});
+
+describe('FileDestination — degradation reporting', () => {
+  test('a healthy sink reports nothing wrong', () => {
+    const { destination } = build();
+    destination.write(entry({ message: 'fine' }));
+    destination.flush(1000);
+    expect(destination.degradation()).toBe(0);
+  });
+
+  test('the sink bitmask reaches the caller', () => {
+    const { destination, writer } = build();
+    // Rotation | gzip, in the sink's payload-free encoding.
+    writer.degraded = 0b011;
+    destination.write(entry({ message: 'still fine' }));
+    destination.flush(1000);
+
+    expect(destination.degradation()).toBe(0b011);
+  });
+
+  test('degradation is not loss', () => {
+    const { destination, writer } = build();
+    writer.degraded = 0b100;
+    destination.write(entry({ message: 'landed anyway' }));
+    destination.flush(1000);
+
+    // A failed compression or prune costs disk, not data — the two questions
+    // have to be answerable separately.
+    expect(destination.degradation()).toBe(0b100);
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
+    expect(writer.lines()).toHaveLength(1);
+  });
+
+  test('a poll picks it up even with nothing to write', () => {
+    const { destination, writer } = build();
+    destination.flush(1000);
+    expect(destination.degradation()).toBe(0);
+
+    writer.degraded = 0b10000;
+    destination.flush(1000);
+    expect(destination.degradation()).toBe(0b10000);
+  });
+
+  test('a durable purge clears it', () => {
+    const { destination, writer } = build();
+    writer.degraded = 0b011;
+    destination.write(entry({ message: 'x' }));
+    destination.flush(1000);
+    expect(destination.degradation()).toBe(0b011);
+
+    // A purge baselines the sink's counters, degradation included.
+    writer.degraded = 0;
+    expect(destination.purge(1000).durable).toBe(true);
+    expect(destination.degradation()).toBe(0);
   });
 });
 
@@ -335,7 +391,71 @@ describe('FileDestination — purge', () => {
     };
     const outcome = destination.purge(1000);
     expect(outcome.durable).toBe(false);
+    expect(outcome.rebound).toBe(false);
     expect(destination.isEnabled).toBe(false);
+  });
+
+  // A complete deletion with no file to write to afterwards is the case that
+  // reads as success and behaves as data loss: resuming on `durable` alone
+  // hands every record to a sink that accepts it, refuses it as stale, and
+  // drops it — silently, because the purge said it worked.
+  test('a complete deletion the sink could not reopen keeps the handle fenced', () => {
+    const { destination, writer } = build();
+    writer.reopenFails = true;
+    destination.write(entry({ message: 'before' }));
+
+    const outcome = destination.purge(1000);
+
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+    expect(outcome.failedPaths).toHaveLength(0);
+    expect(destination.isEnabled).toBe(false);
+  });
+
+  // A JS bundle can be updated over the air without the native binary under it
+  // changing, so "new JS, old native" is a real pairing — and the sink most
+  // likely to omit `rebound` is one that predates it, including a build that
+  // deletes by closing and never reopens at all. Reading silence as success
+  // there rebuilds the very loss the flag exists to stop.
+  test('a sink that does not report rebound at all is not assumed to have rebound', () => {
+    const { destination, sink } = build();
+    // Deliberately missing `rebound` — the cast has to go through `unknown`
+    // precisely because the current spec makes the field mandatory. This is a
+    // stand-in for a binary compiled before it existed.
+    sink.clearLogs = () =>
+      ({
+        deletedCount: 3,
+        failedPaths: [],
+        durable: true,
+      }) as unknown as ClearOutcome;
+
+    const outcome = destination.purge(1000);
+
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+  });
+
+  test('records written after an unrebound purge are held, not silently lost', () => {
+    const { destination, writer } = build();
+    writer.reopenFails = true;
+    expect(destination.purge(1000).rebound).toBe(false);
+
+    destination.write(entry({ message: 'after' }));
+    destination.flush(1000);
+    expect(records(writer)).toHaveLength(0);
+
+    // And an explicit retry, once there is somewhere to write again, is what
+    // brings the destination back.
+    writer.reopenFails = false;
+    const retry = destination.purge(1000);
+    expect(retry.durable).toBe(true);
+    expect(retry.rebound).toBe(true);
+    expect(destination.isEnabled).toBe(true);
+
+    destination.write(entry({ message: 'later' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toEqual(['later']);
   });
 });
 

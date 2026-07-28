@@ -42,6 +42,12 @@ export class MemoryWriter {
   writeFails = false;
   /** Deletion cannot complete. */
   clearFails = false;
+  /**
+   * Deletion completes, but the writer cannot open a file afterwards — an
+   * unwritable directory, a volume that filled. The distinct half of the purge
+   * contract: everything really is gone, and there is still nowhere to write.
+   */
+  reopenFails = false;
   /** Payload-free degradation bitmask handed back in every result. */
   degraded = 0;
 
@@ -244,13 +250,17 @@ export class MemoryFileSink implements FileSinkLike {
     this.clearCalls += 1;
     const deleted = this.writer.file.length;
     const durable = this.writer.purge();
-    // The invoking handle rebinds only on durable success; on failure it
-    // stays behind the bumped generation along with every other handle.
-    if (durable) this.generation = this.writer.generation;
+    // Deletion succeeding and the writer being usable again are separate
+    // facts, and the native sink reports them separately. The invoking handle
+    // rebinds only when both hold; otherwise it stays behind the bumped
+    // generation along with every other handle.
+    const rebound = durable && !this.writer.reopenFails;
+    if (rebound) this.generation = this.writer.generation;
     return {
       deletedCount: durable ? deleted : 0,
       failedPaths: durable ? [] : [this.openedPath ?? ''],
       durable,
+      rebound,
     };
   }
 
