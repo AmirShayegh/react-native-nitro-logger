@@ -16,6 +16,7 @@
   "files": [
     "src",
     "lib",
+    "docs",
     "eslint-plugin",
     "android",
     "ios",
@@ -26,6 +27,7 @@
     "react-native.config.js",
     "!ios/build",
     "!android/build",
+    "!android/src/test",
     "!android/gradle",
     "!android/gradlew",
     "!android/gradlew.bat",
@@ -42,7 +44,9 @@
     "prepare": "bob build",
     "nitrogen": "nitrogen",
     "typecheck": "tsc",
-    "lint": "eslint \"**/*.{js,ts,tsx}\""
+    "lint": "eslint \"**/*.{js,ts,tsx}\"",
+    "changeset": "changeset",
+    "release": "changeset publish"
   },
   "keywords": [
     "react-native",
@@ -63,6 +67,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "devDependencies": {
+    "@changesets/cli": "^2.31.1",
     "@eslint/compat": "^2.1.0",
     "@eslint/eslintrc": "^3.3.5",
     "@eslint/js": "^10.0.1",
@@ -88,10 +93,10 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
+    "eslint": ">=9.0.0",
     "react": "*",
-    "react-native": "*",
-    "react-native-nitro-modules": "^0.36.3",
-    "eslint": ">=9.0.0"
+    "react-native": ">=0.78.0",
+    "react-native-nitro-modules": "^0.36.3"
   },
   "workspaces": [
     "example"

@@ -63,16 +63,24 @@ class HybridFileSink : HybridFileSinkSpec() {
     val live = handle ?: return AppendResult(
       false, RejectReason.CLOSED, 0.0, 0.0, 0.0, 0.0
     )
-    val result = live.appendBatch(batch, entryCount.toLong())
-    return AppendResult(
-      result.accepted,
-      result.rejectReason?.let { wireReason(it) },
-      result.status.queuedBytes.toDouble(),
-      result.status.lostBytes.toDouble(),
-      result.status.lostEntries.toDouble(),
-      result.status.degraded.toDouble()
-    )
+    // Refused rather than coerced, matching `Int(exactly:)` on iOS. A count
+    // that does not survive the round trip cannot be trusted to describe the
+    // batch it arrived with. See [BridgeNumber.exactLong].
+    val exact = BridgeNumber.exactLong(entryCount)
+      ?: return wireResult(
+        LogAppendResult(false, LogRejectReason.FAILED, live.status())
+      )
+    return wireResult(live.appendBatch(batch, exact))
   }
+
+  private fun wireResult(result: LogAppendResult): AppendResult = AppendResult(
+    result.accepted,
+    result.rejectReason?.let { wireReason(it) },
+    result.status.queuedBytes.toDouble(),
+    result.status.lostBytes.toDouble(),
+    result.status.lostEntries.toDouble(),
+    result.status.degraded.toDouble()
+  )
 
   private fun wireReason(reason: LogRejectReason): RejectReason = when (reason) {
     LogRejectReason.FULL -> RejectReason.FULL

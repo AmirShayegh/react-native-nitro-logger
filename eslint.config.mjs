@@ -24,6 +24,16 @@ export default defineConfig([
     },
   },
   {
-    ignores: ['node_modules/', 'lib/'],
+    // Build output, not source. `android/build` in particular holds Gradle's
+    // generated HTML test report, whose bundled JS is a few hundred prettier
+    // violations that appear the moment anyone runs the Kotlin suite.
+    ignores: [
+      'node_modules/',
+      'lib/',
+      'android/build/',
+      'example/android/build/',
+      'example/android/app/build/',
+      'nitrogen/',
+    ],
   },
 ]);

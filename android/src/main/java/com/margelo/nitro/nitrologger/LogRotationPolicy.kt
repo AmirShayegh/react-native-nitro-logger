@@ -125,6 +125,41 @@ data class LogAppendResult(
   val status: LogSinkStatus
 )
 
+/**
+ * Numbers arriving from JavaScript, which reach Kotlin as [Double].
+ *
+ * This lives here rather than in the Nitro adapter so the JUnit suite can
+ * reach it: the adapter needs a device, and this is the part worth testing.
+ */
+object BridgeNumber {
+  /**
+   * [value] as an exact [Long], or null if it was never one.
+   *
+   * `Double.toLong()` saturates and truncates rather than failing, so every
+   * check has to happen before the conversion. NaN would become 0 — which then
+   * passes the writer's own checks whenever the batch is empty too — each
+   * infinity would become a bound, and 2.5 would become 2, an accepted batch
+   * carrying a count nobody sent. iOS refuses all of these via `Int(exactly:)`;
+   * this is the same refusal.
+   */
+  fun exactLong(value: Double): Long? {
+    if (!value.isFinite()) return null
+    if (value != Math.floor(value)) return null
+    // Integral is not sufficient: 1e19 has no fractional part and still does
+    // not fit, and `toLong()` would clamp it to Long.MAX_VALUE.
+    //
+    // The two bounds are deliberately not symmetric, because the two constants
+    // are not. Long.MIN_VALUE is -2^63, exactly representable as a Double, so
+    // it converts and the comparison is inclusive. Long.MAX_VALUE is 2^63 - 1,
+    // which is NOT representable — `Long.MAX_VALUE.toDouble()` rounds UP to
+    // 2^63. An inclusive upper bound would therefore admit 2^63 itself and let
+    // `toLong()` saturate it to 2^63 - 1: a silently different number, which is
+    // the precise failure this function exists to prevent. Hence `>=`.
+    if (value < Long.MIN_VALUE.toDouble() || value >= Long.MAX_VALUE.toDouble()) return null
+    return value.toLong()
+  }
+}
+
 data class LogFlushOutcome(
   val durable: Boolean,
   val timedOut: Boolean,
