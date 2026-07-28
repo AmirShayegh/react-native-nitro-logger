@@ -96,7 +96,12 @@ describe('ScopedLogger', () => {
       },
     };
     expect(() => scope.info('m', hostile)).not.toThrow();
-    expect(dest.entries[0]!.metadata).toEqual({ user: 'u1', ok: 'yes' });
+    // The unreadable key is counted rather than silently vanishing.
+    expect(dest.entries[0]!.metadata).toEqual({
+      user: 'u1',
+      ok: 'yes',
+      droppedMetadataCount: 1,
+    });
   });
 
   test('hostile metadata cannot crash child-scope construction', () => {

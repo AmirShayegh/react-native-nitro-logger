@@ -116,7 +116,7 @@ describe('Logger pipeline', () => {
     expect(second.messages).toEqual(['goes to the replacement']);
   });
 
-  test('non-primitive metadata values are dropped (M1 seam)', () => {
+  test('non-primitive metadata values are dropped and counted', () => {
     const logger = makeLogger();
     const dest = new TestDestination();
     logger.addDestination(dest);
@@ -129,7 +129,13 @@ describe('Logger pipeline', () => {
       fn: () => 'leak',
       inf: Infinity,
     });
-    expect(dest.entries[0]!.metadata).toEqual({ ok: 'yes', count: 3 });
+    // Privacy resolution lives in redaction.test.ts; this asserts only that
+    // the pipeline routes metadata through it.
+    expect(dest.entries[0]!.metadata).toEqual({
+      ok: 'yes',
+      count: 3,
+      droppedMetadataCount: 3,
+    });
   });
 
   test('flush isolates per-destination failures', () => {
@@ -243,7 +249,11 @@ describe('Logger pipeline', () => {
       },
     };
     expect(() => logger.info('m', hostile)).not.toThrow();
-    expect(dest.entries[0]!.metadata).toEqual({ ok: 'yes' });
+    // The failed read is counted rather than silently vanishing.
+    expect(dest.entries[0]!.metadata).toEqual({
+      ok: 'yes',
+      droppedMetadataCount: 1,
+    });
   });
 
   test('re-adding an already registered instance is a no-op, not a dispose', () => {

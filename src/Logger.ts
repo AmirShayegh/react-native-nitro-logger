@@ -1,21 +1,25 @@
-import type {
-  LazyMessage,
-  LogEntry,
-  LogLevel,
-  LogMetadata,
-  RedactedMetadata,
-} from './types';
+import type { LazyMessage, LogEntry, LogLevel, LogMetadata } from './types';
 import type { LogDestination } from './destinations/types';
+import type { PrivacyDefault, PrivacySettings } from './privacy';
 import { ConsoleDestination } from './destinations/ConsoleDestination';
 import { resolveSubsystemLevel } from './config';
 import { levelAtLeast } from './levels';
-import { safeSnapshotMetadata } from './metadata';
+import {
+  buildCatalog,
+  normalizePrivacyDefault,
+  redactMetadata,
+} from './privacy';
 import { ScopedLogger } from './ScopedLogger';
 
 export interface LogOptions {
   level?: LogLevel;
   subsystem?: string;
   metadata?: LogMetadata;
+  /** Scope defaults, outranked by `metadata` on any key they share. Kept a
+   * separate field rather than pre-merged: redaction settles precedence per
+   * key and validates the winner before reading it, which a merge would
+   * defeat by reading everything first. `ScopedLogger` sets this. */
+  scopeMetadata?: LogMetadata;
   correlation?: string;
 }
 
@@ -59,6 +63,86 @@ export class Logger {
   /** Consecutive write-failure counts per destination label. */
   private readonly failureCounts = new Map<string, number>();
   private readonly disabledLabels = new Set<string>();
+
+  // Privacy state. Every transition tightens; nothing here can be loosened
+  // at runtime, so a compromised or careless call site cannot turn redaction
+  // off in a shipped build.
+  private privacyDefaultValue: PrivacyDefault = 'public';
+  private privacyDefaultLocked = false;
+  private redactAll = false;
+  private keyCatalog: ReadonlySet<string> | undefined;
+
+  // ── Privacy ─────────────────────────────────────────────────────────────
+
+  /**
+   * Choose how bare (unmarked) metadata values are treated.
+   *
+   * `'public'` — the OSS default — renders them. `'private'` redacts every
+   * bare value outside dev builds unless wrapped in `pub()`, so a forgotten
+   * wrapper hides data instead of leaking it. Apps handling PHI set
+   * `'private'` in their entry point.
+   *
+   * First call wins; later calls may only tighten (`'public'` → `'private'`).
+   * A request to loosen is ignored, not obeyed. Anything that is not exactly
+   * `'public'` or `'private'` — a JS caller, JSON config, an `any` — resolves
+   * to `'private'`: ambiguity must never resolve toward disclosure.
+   *
+   * `'private'` also makes the metadata key catalog mandatory — see
+   * {@link metadataKeyCatalog}.
+   */
+  privacyDefault(value: PrivacyDefault): this {
+    const normalized = normalizePrivacyDefault(value);
+    if (!this.privacyDefaultLocked) {
+      this.privacyDefaultValue = normalized;
+      this.privacyDefaultLocked = true;
+    } else if (normalized === 'private') {
+      this.privacyDefaultValue = 'private';
+    }
+    return this;
+  }
+
+  /** Redact every metadata value from here on, marked or not, dev or not.
+   * One-way: there is no call that undoes it. */
+  redactAllMetadata(): this {
+    this.redactAll = true;
+    return this;
+  }
+
+  /**
+   * Restrict metadata to an approved set of keys; anything else is dropped
+   * and counted. Rejecting computed keys is not enough on its own — a
+   * literal key like `patient123` is still PHI — so the catalog checks exact
+   * membership at runtime.
+   *
+   * Tighten-only: repeat calls intersect with the existing catalog rather
+   * than replacing it. Mandatory under a `'private'` privacy default, where
+   * an unconfigured catalog approves nothing and all metadata drops.
+   *
+   * Input is not trusted: a non-iterable, a throwing iterator, a non-string
+   * or malformed entry, or an over-long iterable all yield an empty catalog
+   * rather than an exception or a hung JS thread.
+   */
+  metadataKeyCatalog(keys: Iterable<string>): this {
+    const incoming = buildCatalog(keys);
+    if (this.keyCatalog === undefined) {
+      this.keyCatalog = incoming;
+    } else {
+      const intersection = new Set<string>();
+      for (const key of this.keyCatalog) {
+        if (incoming.has(key)) intersection.add(key);
+      }
+      this.keyCatalog = intersection;
+    }
+    return this;
+  }
+
+  private privacySettings(): PrivacySettings {
+    return {
+      privacyDefault: this.privacyDefaultValue,
+      redactAll: this.redactAll,
+      keyCatalog: this.keyCatalog,
+    };
+  }
 
   // ── Fluent configuration ────────────────────────────────────────────────
 
@@ -276,7 +360,11 @@ export class Logger {
       timestamp: Date.now(),
       level,
       message: text,
-      metadata: prepareMetadata(options?.metadata),
+      metadata: redactMetadata(
+        options?.scopeMetadata,
+        options?.metadata,
+        this.privacySettings()
+      ),
       correlation: options?.correlation,
       subsystem,
     });
@@ -305,23 +393,10 @@ export class Logger {
     }
   }
 
-  // ── Test support ────────────────────────────────────────────────────────
-
-  /** @internal */
-  resetForTesting(): void {
-    for (const { destination } of this.registrations) {
-      try {
-        destination.dispose();
-      } catch {
-        // ignore
-      }
-    }
-    this.globalMinimum = 'debug';
-    this.subsystemLevels.clear();
-    this.registrations = defaultRegistrations();
-    this.failureCounts.clear();
-    this.disabledLabels.clear();
-  }
+  // Deliberately no reset/reconfigure hook. Such a method would be a public
+  // runtime path to loosen every privacy control on the `Log` singleton, and
+  // an `@internal` tag does not remove a method from a JS build. Tests
+  // construct their own `new Logger()` instead.
 }
 
 function defaultRegistrations(): Registration[] {
@@ -336,38 +411,6 @@ function warnFixed(message: string): void {
   } catch {
     // nothing left to report to
   }
-}
-
-/**
- * Redaction seam. M1: pass metadata through, copying only primitive values —
- * objects/arrays/functions are dropped (payload-free). Enumeration and reads
- * are guarded (Proxy traps / throwing getters must not crash the app), the
- * copy has a null prototype (so a `__proto__` key is stored as data rather
- * than routed through `Object.prototype`'s setter), and the result is frozen
- * before fan-out. M2 replaces the filtering with privacy-default resolution,
- * wrapper validation, and key checks.
- */
-function prepareMetadata(
-  metadata: LogMetadata | undefined
-): RedactedMetadata | undefined {
-  const snapshot = safeSnapshotMetadata(metadata);
-  if (!snapshot) return undefined;
-  const result: Record<string, string | number | boolean> = Object.create(null);
-  let count = 0;
-  for (const key of Object.keys(snapshot)) {
-    const value = snapshot[key];
-    const kind = typeof value;
-    if (
-      kind === 'string' ||
-      kind === 'boolean' ||
-      (kind === 'number' && Number.isFinite(value as number))
-    ) {
-      result[key] = value as string | number | boolean;
-      count += 1;
-    }
-    // else: dropped silently in M1; M2 adds the fixed count-only diagnostic
-  }
-  return count > 0 ? Object.freeze(result) : undefined;
 }
 
 /** Global shorthand, mirroring SwiftLogger's `Log`. */

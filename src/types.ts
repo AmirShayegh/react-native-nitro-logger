@@ -1,3 +1,7 @@
+import type { PrivateValue, PublicValue } from './privacy';
+
+export type { PrivateValue, PublicValue };
+
 /** Severity levels, least to most severe. `todo` marks incomplete work and
  * sorts highest so it always surfaces (SwiftLogger parity). */
 export type LogLevel =
@@ -8,18 +12,19 @@ export type LogLevel =
  * filtered out or no destination is eligible. */
 export type LazyMessage = string | (() => string);
 
-/** Metadata values. M2 widens this with PrivateValue/PublicValue privacy
- * markers; everything else in the pipeline is typed against the
- * post-redaction shape below and will not change. */
-export type LogValue = string | number | boolean;
+/** The only value shapes the pipeline can render. */
+export type LogPrimitive = string | number | boolean;
+
+/** Metadata values: a bare primitive, whose visibility follows the privacy
+ * default, or one explicitly marked with `pub()` / `priv()`. */
+export type LogValue = LogPrimitive | PublicValue | PrivateValue;
 
 export type LogMetadata = Record<string, LogValue>;
 
 /** Metadata after redaction — what formatters and destinations see. Privacy
- * markers are unrepresentable here by construction. */
-export type RedactedMetadata = Readonly<
-  Record<string, string | number | boolean>
->;
+ * markers are unrepresentable here by construction: every value has already
+ * been resolved to a primitive or replaced by a placeholder. */
+export type RedactedMetadata = Readonly<Record<string, LogPrimitive>>;
 
 /** A single log event, post-redaction. Readonly and frozen at runtime: one
  * entry fans out to every destination, so no destination may mutate what its

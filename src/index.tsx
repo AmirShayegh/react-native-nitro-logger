@@ -9,11 +9,20 @@ export { ScopedLogger } from './ScopedLogger';
 export type {
   LogLevel,
   LazyMessage,
+  LogPrimitive,
   LogValue,
   LogMetadata,
   RedactedMetadata,
   LogEntry,
 } from './types';
+export { pub, priv } from './privacy';
+export {
+  METADATA_KEY_PATTERN_SOURCE,
+  DROPPED_COUNT_KEY,
+  MAX_CATALOG_SIZE,
+  UNREADABLE_VALUE,
+} from './privacy';
+export type { PublicValue, PrivateValue, PrivacyDefault } from './privacy';
 export type { LogDestination } from './destinations/types';
 export { ConsoleDestination } from './destinations/ConsoleDestination';
 export type { LogFormatter } from './formatters/types';

@@ -29,21 +29,6 @@ export class ScopedLogger {
     this.metadata = snapshot ? Object.freeze(snapshot) : undefined;
   }
 
-  private merged(callSite?: LogMetadata): LogMetadata | undefined {
-    // Call-site metadata is untrusted like any caller object — snapshot it
-    // with guarded reads before merging. Both sides are then frozen or fresh
-    // null-prototype objects, so the merge itself cannot throw or route a
-    // `__proto__` key through a prototype setter.
-    const site = safeSnapshotMetadata(callSite);
-    if (!this.metadata) return site;
-    if (!site) return this.metadata;
-    return Object.assign(
-      Object.create(null) as LogMetadata,
-      this.metadata,
-      site
-    );
-  }
-
   log(
     message: LazyMessage,
     level: LogLevel = 'info',
@@ -52,7 +37,12 @@ export class ScopedLogger {
     this.logger.logMessage(message, {
       level,
       subsystem: this.subsystem,
-      metadata: this.merged(metadata),
+      // Handed over unmerged: redaction settles precedence per key and
+      // validates the winner BEFORE reading it, so a getter behind a
+      // rejected key — or one the call site overrode — never runs. Merging
+      // here would read every value first and defeat that.
+      scopeMetadata: this.metadata,
+      metadata,
       correlation: this.correlation,
     });
   }
@@ -82,17 +72,23 @@ export class ScopedLogger {
   }
 
   /** Child scope: inherits this scope's subsystem unless overridden, merges
-   * metadata (child keys win). */
+   * metadata (child keys win). The merge happens at construction, like any
+   * scope snapshot — both sides are materialized here so later mutation of
+   * the caller's object cannot change what the child reports. */
   scoped(
     correlation: string,
     subsystem?: string,
     metadata?: LogMetadata
   ): ScopedLogger {
+    const child = safeSnapshotMetadata(metadata);
+    const merged = this.metadata
+      ? Object.assign(Object.create(null) as LogMetadata, this.metadata, child)
+      : child;
     return new ScopedLogger(
       this.logger,
       correlation,
       subsystem ?? this.subsystem,
-      this.merged(metadata)
+      merged
     );
   }
 }
