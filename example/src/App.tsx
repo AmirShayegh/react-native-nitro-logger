@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Text,
   View,
@@ -70,6 +70,14 @@ export default function App() {
       log(`ERROR: ${String(e)}`);
     }
   }, [fileSink, consoleSink, logPath, log]);
+
+  // Auto-run once on mount so CI/CLI verification can assert bytes on disk
+  // without UI interaction; the buttons remain for manual re-runs.
+  useEffect(() => {
+    runSpike();
+    // eslint-disable-next-line no-console
+    console.log('NITRO_SPIKE_RAN', logPath);
+  }, [runSpike, logPath]);
 
   const runClear = useCallback(() => {
     try {
