@@ -3,25 +3,35 @@ import { Text, View, StyleSheet, Pressable, ScrollView } from 'react-native';
 import {
   Log,
   FileDestination,
+  NativeConsoleDestination,
   JsonLinesFormatter,
   createFileSink,
+  createNativeConsoleSink,
   pub,
   priv,
 } from 'react-native-nitro-logger';
 
 /**
- * M5 device harness: the real pipeline, not the raw sink.
+ * Device harness: the real pipeline, not the raw sinks.
  *
- * `Log` → `FileDestination` → `Batcher` → Nitro → `LogWriter`. The XCTest
- * suite proves the writer's rules on macOS in a second; what only a device can
+ * `Log` → `FileDestination` → `Batcher` → Nitro → `LogWriter`, and
+ * `Log` → `NativeConsoleDestination` → Nitro → os_log alongside it. The XCTest
+ * suite proves both natives' rules on macOS in a second; what only a device can
  * answer is whether the same code works through Hermes and the bridge, against
- * the real `Library/Logs` directory, under iOS data protection.
+ * the real `Library/Logs` directory, under iOS data protection, and into the
+ * unified log where Console can actually see it.
  *
  * Everything runs on mount and prints one greppable result line, so the pass
  * can be driven from the command line instead of by tapping.
  */
 
-const SENTINEL = 'NITRO_M5';
+const SENTINEL = 'NITRO_M6';
+
+/// Greppable from the shell:
+///   xcrun simctl spawn <udid> log show --last 2m \
+///     --predicate 'subsystem == "nitrologger.example.harness"'
+/// which is the only way to prove the os_log leg from outside the app.
+const OSLOG_SUBSYSTEM = 'nitrologger.example.harness';
 
 /// Small enough that a few hundred records rotate several times, so archives,
 /// compression, and pruning all actually happen during a run.
@@ -54,6 +64,14 @@ export default function App() {
     });
   }, []);
 
+  // Not named `console`: that would shadow the global this file logs through.
+  const osLog = useMemo(() => {
+    return new NativeConsoleDestination(createNativeConsoleSink(), {
+      subsystem: OSLOG_SUBSYSTEM,
+      category: 'harness',
+    });
+  }, []);
+
   const run = useCallback(() => {
     const collected: Step[] = [];
     const record = (name: string, ok: boolean, detail: string) => {
@@ -68,7 +86,7 @@ export default function App() {
       //    build `priv()` renders as a placeholder; here it reveals, which is
       //    the difference the release-bundle CI job exists to check.
       Log.info('harness started', {
-        run: pub('m5'),
+        run: pub(SENTINEL),
         device: priv('simulator'),
         rotationBytes: ROTATION.maxFileSizeBytes,
       });
@@ -129,6 +147,31 @@ export default function App() {
       );
 
       record('paths', true, paths.slice(0, 3).join('\n'));
+
+      // 6. The os_log leg. Nothing here can be read back from JavaScript — the
+      //    unified log is write-only from inside the app — so the assertion is
+      //    that the destination accepted and delivered everything, and the
+      //    proof that it arrived comes from `log show` outside the process.
+      Log.addDestination(osLog);
+      for (const level of [
+        'verbose',
+        'debug',
+        'info',
+        'warning',
+        'error',
+        'todo',
+      ] as const) {
+        Log[level](`${SENTINEL} os_log level probe`, { level: pub(level) });
+      }
+      // Longer than one os_log entry will store, so the native chunker runs on
+      // a real line rather than only under XCTest.
+      Log.info(`${SENTINEL} long line ${'x'.repeat(4000)}`);
+      osLog.flush();
+      record(
+        'os_log',
+        osLog.isEnabled && osLog.dropped() === 0,
+        `subsystem=${OSLOG_SUBSYSTEM} enabled=${osLog.isEnabled} dropped=${osLog.dropped()}`
+      );
     } catch (e) {
       record('EXCEPTION', false, String(e));
     }
@@ -165,7 +208,7 @@ export default function App() {
     } catch (e) {
       console.log(`${SENTINEL} could not record the verdict: ${String(e)}`);
     }
-  }, [destination]);
+  }, [destination, osLog]);
 
   useEffect(() => {
     if (started.current) return;
@@ -175,7 +218,7 @@ export default function App() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>nitro-logger · M5 device harness</Text>
+      <Text style={styles.title}>nitro-logger · device harness</Text>
       <Text style={[styles.verdict, verdict.startsWith('PASS') && styles.pass]}>
         {verdict}
       </Text>

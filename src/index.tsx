@@ -31,6 +31,11 @@ export type {
   FileSinkLike,
   PurgeOutcome,
 } from './destinations/FileDestination';
+export { NativeConsoleDestination } from './destinations/NativeConsoleDestination';
+export type {
+  NativeConsoleDestinationOptions,
+  NativeConsoleSinkLike,
+} from './destinations/NativeConsoleDestination';
 export { Batcher } from './destinations/Batcher';
 export type {
   BatchTarget,

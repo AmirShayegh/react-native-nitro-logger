@@ -1,13 +1,16 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
-/// Exists so the vendored writer can be unit-tested.
+/// Exists so the vendored native code can be unit-tested.
 ///
-/// `LogFileWriter` and friends deliberately import nothing from Nitro — the
-/// bridge adapter lives in `HybridFileSink.swift`, which this package does not
-/// build. That split is what lets rotation, recovery, the registry, and every
-/// injected fault run under XCTest in a second rather than on a simulator by
-/// hand.
+/// `LogFileWriter`, `NativeConsoleWriter` and friends deliberately import
+/// nothing from Nitro — each bridge adapter lives in its own `Hybrid*.swift`,
+/// which this package does not build. That split is what lets rotation,
+/// recovery, the registry, the os_log level map and every injected fault run
+/// under XCTest in a second rather than on a simulator by hand.
+///
+/// The target keeps its original name because every test file imports it; it
+/// covers more than the file writer now.
 ///
 /// Tests sit outside `ios/` because the podspec globs `ios/**/*.swift` into the
 /// consuming app. Anything under there ships.
@@ -32,6 +35,7 @@ let package = Package(
         "LogWriterRegistry.swift",
         "LogSecureFile.swift",
         "Gzip.swift",
+        "NativeConsoleWriter.swift",
       ]
     ),
     .testTarget(
