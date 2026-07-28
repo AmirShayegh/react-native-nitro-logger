@@ -32,6 +32,10 @@ class HybridFileSink : HybridFileSinkSpec() {
   private var file: File? = null
   private var stream: FileOutputStream? = null
 
+  /** Whether the producer guarantees one `\n`-terminated record per batch
+   * line. M8's startup scan trims a torn trailing record only when true. */
+  private var lineFramed = false
+
   override val defaultLogDirectory: String
     get() {
       val context = NitroModules.applicationContext
@@ -40,8 +44,12 @@ class HybridFileSink : HybridFileSinkSpec() {
       return File(base, "logs").absolutePath
     }
 
-  override fun open(path: String, rotation: RotationConfig?) {
+  override fun open(path: String, rotation: RotationConfig?, lineFramed: Boolean?) {
     // rotation consumed from M8; numeric clamping happens there too
+    // Absent means absent: without a declared one-record-per-line contract
+    // the startup scan must not trim a trailing record, because it cannot
+    // tell a torn one from an intentional newline.
+    this.lineFramed = lineFramed ?: false
     val target = File(path)
     target.parentFile?.mkdirs()
     val out = FileOutputStream(target, /* append = */ true)

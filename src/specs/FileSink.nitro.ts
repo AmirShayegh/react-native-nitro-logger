@@ -86,8 +86,18 @@ export interface FileSink extends HybridObject<{
 }> {
   readonly defaultLogDirectory: string;
 
-  /** Throws on open failure OR on config conflict with an existing writer. */
-  open(path: string, rotation?: RotationConfig): void;
+  /**
+   * Throws on open failure OR on config conflict with an existing writer.
+   *
+   * `lineFramed` declares that every batch handed to `appendBatch` contains
+   * whole records terminated by `\n`, with no raw newline inside a record.
+   * Only then may the startup scan trim an incomplete trailing record: with
+   * opaque multi-line text a writer cannot tell a torn record from an
+   * intentional one, and trimming would destroy good data. Absent — the
+   * default for a custom formatter that does not declare `framing: 'line'` —
+   * the file is left exactly as the crash left it and recovery is reduced.
+   */
+  open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
 
   /**
    * Enqueue only — never performs I/O inline. Atomic accept/reject BEFORE

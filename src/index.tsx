@@ -25,6 +25,21 @@ export {
 export type { PublicValue, PrivateValue, PrivacyDefault } from './privacy';
 export type { LogDestination } from './destinations/types';
 export { ConsoleDestination } from './destinations/ConsoleDestination';
+export { FileDestination } from './destinations/FileDestination';
+export type {
+  FileDestinationOptions,
+  FileSinkLike,
+  PurgeOutcome,
+} from './destinations/FileDestination';
+export { Batcher } from './destinations/Batcher';
+export type {
+  BatchTarget,
+  BatchFlushOutcome,
+  BatcherOptions,
+  FenceReason,
+  LossCounts,
+} from './destinations/Batcher';
+export { utf8Length } from './utf8';
 export type { LogFormatter } from './formatters/types';
 export { DefaultFormatter } from './formatters/DefaultFormatter';
 export { JsonLinesFormatter } from './formatters/JsonLinesFormatter';

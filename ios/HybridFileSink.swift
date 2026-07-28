@@ -22,6 +22,9 @@ final class HybridFileSink: HybridFileSinkSpec {
   private var closed = true
   private var fileURL: URL?
   private var handle: FileHandle?
+  /// Whether the producer guarantees one `\n`-terminated record per batch
+  /// line. M5's startup scan trims a torn trailing record only when true.
+  private var lineFramed = false
 
   var defaultLogDirectory: String {
     let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
@@ -29,8 +32,12 @@ final class HybridFileSink: HybridFileSinkSpec {
     return base.appendingPathComponent("Logs").path
   }
 
-  func open(path: String, rotation: RotationConfig?) throws {
+  func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws {
     _ = rotation // consumed from M5; numeric clamping happens there too
+    // Absent means absent: without a declared one-record-per-line contract
+    // the startup scan must not trim a trailing record, because it cannot
+    // tell a torn one from an intentional newline.
+    self.lineFramed = lineFramed ?? false
     let url = URL(fileURLWithPath: path)
     let fm = FileManager.default
     // Type-specific modes: directories need search permission, files do not.
