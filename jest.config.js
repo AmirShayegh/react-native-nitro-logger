@@ -3,7 +3,7 @@
 module.exports = {
   testEnvironment: 'node',
   rootDir: '.',
-  testMatch: ['<rootDir>/__tests__/**/*.test.ts'],
+  testMatch: ['<rootDir>/__tests__/**/*.test.{ts,js}'],
   transform: {
     '^.+\\.(js|jsx|ts|tsx)$': 'babel-jest',
   },

@@ -164,6 +164,30 @@ describe('metadata keys', () => {
     expect(md(dest)).toEqual({ [DROPPED_COUNT_KEY]: 1 });
   });
 
+  // The two halves of the claim the eslint-plugin README makes about what
+  // survives a call site the lint rules could not see. Redaction covers
+  // metadata VALUES; a KEY is stopped only by the catalog, and whether one is
+  // required depends on the profile.
+  test("under 'private', no catalog drops everything rather than passing keys", () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger.privacyDefault('private');
+    logger.info('m', { patient123: 'Jane Doe', sessionState: 'active' });
+    expect(JSON.stringify(md(dest))).not.toContain('Jane');
+    expect(JSON.stringify(md(dest))).not.toContain('patient');
+    expect(md(dest)).toEqual({ [DROPPED_COUNT_KEY]: 2 });
+  });
+
+  test("under 'public', no catalog keeps any regex-valid key", () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    // The OSS default. `patient123` satisfies the key pattern, so nothing in
+    // the runtime stops it — which is why the plugin's key rule matters and
+    // why the README tells anyone logging sensitive data to set a catalog.
+    logger.info('m', { patient123: 'x' });
+    expect(md(dest)).toEqual({ patient123: 'x' });
+  });
+
   test('repeat catalog calls intersect rather than replace', () => {
     setDev(false);
     const { logger, dest } = makeLogger();
