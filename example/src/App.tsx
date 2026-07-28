@@ -75,7 +75,6 @@ export default function App() {
   // without UI interaction; the buttons remain for manual re-runs.
   useEffect(() => {
     runSpike();
-    // eslint-disable-next-line no-console
     console.log('NITRO_SPIKE_RAN', logPath);
   }, [runSpike, logPath]);
 

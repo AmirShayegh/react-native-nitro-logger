@@ -1,11 +1,27 @@
-// M0 spike surface: raw access to the two native sinks, enough to prove the
-// bridge contract end-to-end on both platforms. The real public API (Log
-// singleton, scoped loggers, privacy, batching) replaces this in M1+ and the
-// sinks become internal.
 import { NitroModules } from 'react-native-nitro-modules';
 import type { FileSink } from './specs/FileSink.nitro';
 import type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
 
+// ── Public API ──────────────────────────────────────────────────────────────
+export { Log, Logger } from './Logger';
+export type { LogOptions } from './Logger';
+export { ScopedLogger } from './ScopedLogger';
+export type {
+  LogLevel,
+  LazyMessage,
+  LogValue,
+  LogMetadata,
+  RedactedMetadata,
+  LogEntry,
+} from './types';
+export type { LogDestination } from './destinations/types';
+export { ConsoleDestination } from './destinations/ConsoleDestination';
+export type { LogFormatter } from './formatters/types';
+export { DefaultFormatter } from './formatters/DefaultFormatter';
+
+// ── Spike-era raw sink access ───────────────────────────────────────────────
+// Used by the example app's M0 harness; becomes internal once the
+// FileDestination (M4/M5) and NativeConsoleDestination (M6) wrap these.
 export type {
   FileSink,
   RotationConfig,
