@@ -36,6 +36,34 @@ export type {
   NativeConsoleDestinationOptions,
   NativeConsoleSinkLike,
 } from './destinations/NativeConsoleDestination';
+export { installErrorHandler } from './integrations/errorHandler';
+export {
+  ERROR_METADATA_KEYS,
+  UNCAUGHT_ERROR_MESSAGE,
+} from './integrations/errorHandler';
+export type {
+  ErrorHandlerOptions,
+  ErrorUtilsLike,
+  Uninstall,
+} from './integrations/errorHandler';
+export { flushOnBackground } from './integrations/appState';
+export type {
+  FlushOnBackgroundOptions,
+  AppStateLike,
+} from './integrations/appState';
+export {
+  sanitizeError,
+  DEFAULT_BUNDLE_NAMES,
+  DEFAULT_MAX_FRAMES,
+  REDACTED_FRAME,
+  REDACTED_MESSAGE,
+  UNKNOWN_ERROR_NAME,
+  NON_ERROR_THROWN,
+} from './integrations/sanitizeError';
+export type {
+  SanitizedError,
+  SanitizeErrorOptions,
+} from './integrations/sanitizeError';
 export { Batcher } from './destinations/Batcher';
 export type {
   BatchTarget,

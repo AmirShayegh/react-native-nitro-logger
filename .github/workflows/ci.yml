@@ -74,6 +74,74 @@ jobs:
       - name: Build package
         run: yarn prepare
 
+      # Every `__DEV__` in the built library is a place redaction can be turned
+      # off. The set is meant to be small and unchanging; this fails if it grows
+      # without anyone deciding it should, and — just as importantly — if an
+      # allowlisted gate disappears, which would quietly make the release-bundle
+      # job below prove nothing.
+      - name: Inventory the dev-only branches
+        run: ./scripts/check-dev-branches.sh
+
+  # Proves the reveal branches are not in shipped JavaScript.
+  #
+  # `__DEV__` gating is the design; this is the check that it is also the
+  # reality. A refactor that moved a reveal behind a runtime flag, or a bundler
+  # configured without the substitution, would leave the branch in the release
+  # bundle and nothing else in the build would notice.
+  privacy-release-bundle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Bundle with --dev false and check for reveal sentinels
+        run: ./scripts/check-release-bundle.sh
+
+  # Backs the "iOS ≥ 0.78" compatibility claim with an actual run.
+  #
+  # `build-ios` builds the example, which tracks the newest React Native — so it
+  # says nothing about the bottom of the supported range, which is where the
+  # claim is either true or false. This installs a `yarn pack` tarball into a
+  # pristine 0.78 app, builds it Release, launches it on a simulator, and reads
+  # the verdict back out of the app container. Packing rather than linking means
+  # the `files` list is under test too.
+  #
+  # Not on the critical path for most changes, but it is the only job that would
+  # notice a podspec, a React header, or a Nitro binding that stopped working on
+  # the oldest version anyone is told to expect.
+  min-rn-ios:
+    # Xcode 16, not the 26 the example builds with, and not `macos-latest`.
+    #
+    # React Native 0.78 pins `fmt 11.0.2` through RCT-Folly, and clang from
+    # Xcode 26 rejects its `format-inl.h`. That is upstream and unrelated to
+    # this library — but it also is not a combination any consumer is in. An
+    # app on 0.78 builds with the toolchain 0.78 shipped against, so that is
+    # what the compatibility claim is verified on. Raising the floor above 0.78
+    # is what would let this job move to a newer runner.
+    runs-on: macos-15
+
+    env:
+      XCODE_VERSION: '16.4'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Use the Xcode the minimum React Native supports
+        uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Build, launch and exercise on the minimum React Native
+        run: ./scripts/check-min-rn-ios.sh
+
   nitrogen-diff:
     runs-on: ubuntu-latest
 

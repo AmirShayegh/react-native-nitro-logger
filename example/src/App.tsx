@@ -7,6 +7,9 @@ import {
   JsonLinesFormatter,
   createFileSink,
   createNativeConsoleSink,
+  installErrorHandler,
+  flushOnBackground,
+  UNCAUGHT_ERROR_MESSAGE,
   pub,
   priv,
 } from 'react-native-nitro-logger';
@@ -32,6 +35,16 @@ const SENTINEL = 'NITRO_M6';
 ///     --predicate 'subsystem == "nitrologger.example.harness"'
 /// which is the only way to prove the os_log leg from outside the app.
 const OSLOG_SUBSYSTEM = 'nitrologger.example.harness';
+
+/// Written through `priv()`. In a release bundle this string must NOT appear
+/// in the log file — `<private>` must appear where it would have been. The
+/// app cannot check that itself, so `scripts/check-release-bundle.sh` does.
+const PRIVACY_SENTINEL = 'NITRO_PRIVACY_SENTINEL_9f3a';
+
+/// Thrown through the real `ErrorUtils` hook. Neither this string nor the
+/// custom class name carrying it may appear anywhere in the log file — in a
+/// dev build either, since the sanitiser strips both regardless of `__DEV__`.
+const ERROR_SENTINEL = 'NITRO_ERROR_SENTINEL_7c21';
 
 /// Small enough that a few hundred records rotate several times, so archives,
 /// compression, and pruning all actually happen during a run.
@@ -148,7 +161,53 @@ export default function App() {
 
       record('paths', true, paths.slice(0, 3).join('\n'));
 
-      // 6. The os_log leg. Nothing here can be read back from JavaScript — the
+      // 6. The privacy boundary, checked from outside.
+      //
+      //    This one is not asserted here, because the app cannot read back
+      //    what it rendered. It writes a distinctive payload through `priv()`
+      //    and CI greps the resulting file: in a release bundle the sentinel
+      //    must be absent and `<private>` must be there instead. That is the
+      //    only form of proof that survives being wrong about `__DEV__`.
+      Log.info('privacy probe', {
+        probe: priv(PRIVACY_SENTINEL),
+        marker: pub('privacy-probe'),
+      });
+      destination.flush(5000);
+      record('privacy probe', true, `wrote ${PRIVACY_SENTINEL} through priv()`);
+
+      // 7. The uncaught-error path, driven through the real global hook.
+      //
+      //    Non-fatal, so the app survives to report on it. The point is that
+      //    the entry lands and that nothing from the error is in it: the
+      //    custom class name, the message, and the frame filenames are all
+      //    things the sanitiser has to strip. CI greps for the sentinel below
+      //    the same way it does for the privacy one.
+      const uninstallErrors = installErrorHandler({ subsystem: 'harness' });
+      const before = destination.getLogFilePaths().length;
+      class HarnessPatientError extends Error {}
+      const synthetic = new HarnessPatientError(
+        `synthetic failure for ${ERROR_SENTINEL}`
+      );
+      synthetic.name = 'HarnessPatientError';
+      const hook = (
+        globalThis as { ErrorUtils?: { reportError?(e: unknown): void } }
+      ).ErrorUtils;
+      hook?.reportError?.(synthetic);
+      destination.flush(5000);
+      uninstallErrors();
+      record(
+        'uncaught error',
+        typeof hook?.reportError === 'function' && before > 0,
+        `reported through ErrorUtils as "${UNCAUGHT_ERROR_MESSAGE}"`
+      );
+
+      // 8. The backgrounding flush. Installing and removing it is the whole
+      //    surface — the transition itself only happens when iOS says so.
+      const uninstallBackground = flushOnBackground();
+      uninstallBackground();
+      record('background flush', true, 'installed and removed cleanly');
+
+      // 9. The os_log leg. Nothing here can be read back from JavaScript — the
       //    unified log is write-only from inside the app — so the assertion is
       //    that the destination accepted and delivered everything, and the
       //    proof that it arrived comes from `log show` outside the process.
