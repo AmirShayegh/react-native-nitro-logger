@@ -1,5 +1,30 @@
 # react-native-nitro-logger
 
+## 0.1.1
+
+### Patch Changes
+
+- Documentation only; no runtime behaviour changed.
+
+  The 0.1.0 README and `docs/PARITY.md` cited the SwiftLogger repository at a URL
+  that 404s, so every reference backing the `JsonLinesFormatter` parity claim
+  pointed at nothing. The citation is corrected and repinned to the specific
+  SwiftLogger commit the comparison is actually against — the version it named
+  before predates the formatter it claimed parity with.
+
+  - **`docs/API.md`** is new and documents all 69 exports, including several that
+    were reachable but undocumented: `sanitizeError` and its constants, `Batcher`,
+    `utf8Length`, and the Nitro call-result types a `FileSinkLike` implementation
+    has to construct.
+  - **The native console sink is documented.** `NativeConsoleDestination` and
+    `createNativeConsoleSink` appeared nowhere, though the package advertises
+    system-console sinks in its first sentence.
+  - **`CHANGELOG.md` now ships.** It was missing from `files`, so it never reached
+    the 0.1.0 tarball. The README's contributing links are absolute, since those
+    files do not ship and the relative links died inside `node_modules`.
+  - **`keywords`** covers logging, privacy, os_log and logcat rather than only the
+    platform names.
+
 ## 0.1.0
 
 ### Minor Changes

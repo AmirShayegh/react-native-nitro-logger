@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-logger",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Structured, privacy-tiered logging for React Native — TS core with a native Nitro file/os_log sink",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
