@@ -1,9 +1,16 @@
 # Parity with SwiftLogger
 
-This package is a port of [SwiftLogger](https://github.com/amirshayegh/logger).
-Where the two can produce the same bytes, they do — `JsonLinesFormatter` is
-asserted byte-identical to `JSONLogFormatter` over a generated corpus in
-`__tests__/jsonLinesFormatter.test.ts`. Where they cannot, this file says why.
+This package is a port of [SwiftLogger][swiftlogger], and the comparison
+throughout is against commit [`670e183`][swiftlogger-rev] — "byte-identical"
+means nothing without saying identical to what. A commit rather than a release
+tag on purpose: the newest tag, 2.3.0, predates `JSONLogFormatter` entirely, so
+citing it would name a version that cannot support the claim being made. Where
+the two can produce the same bytes, they do:
+`JsonLinesFormatter` is asserted byte-identical to [`JSONLogFormatter`][formatter]
+over a generated corpus in [`__tests__/jsonLinesFormatter.test.ts`][goldens].
+That test is not in the npm tarball — `files` excludes `__tests__` — so
+checking the claim rather than taking it means reading it in the repository.
+Where the two cannot produce the same bytes, this file says why.
 
 Nothing here is aspirational. Every "identical" row is covered by a golden;
 every difference is either enforced by a test or unreachable through the
@@ -328,3 +335,13 @@ not a combination any consumer is in, since an app on 0.78 builds with the
 toolchain 0.78 shipped against. The cost of keeping the floor at 0.78 is that
 this job is pinned to a runner image GitHub will eventually retire — raising
 the floor is what would let it move.
+
+[swiftlogger]: https://github.com/AmirShayegh/SwiftLogger
+[goldens]: https://github.com/AmirShayegh/react-native-nitro-logger/blob/main/__tests__/jsonLinesFormatter.test.ts
+
+<!-- Pinned to a commit, not to `main` and not to a tag. A link to a moving
+     branch would quietly stop being evidence the next time that formatter
+     changes, and the newest tag does not contain the file at all. -->
+
+[swiftlogger-rev]: https://github.com/AmirShayegh/SwiftLogger/commit/670e183e585ffade915bbedb9dd51be517c9f4c6
+[formatter]: https://github.com/AmirShayegh/SwiftLogger/blob/670e183e585ffade915bbedb9dd51be517c9f4c6/Sources/Logger/LogFormatter.swift

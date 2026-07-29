@@ -31,6 +31,18 @@ jobs:
       - name: Typecheck files
         run: yarn typecheck
 
+      # Every ```ts block in the shipped docs, compiled against this tree.
+      # A sample is the first thing a reader copies, so a renamed export should
+      # break the documentation at the same moment it breaks the code rather
+      # than whenever someone next reads it.
+      #
+      # The companion link check is deliberately not here: it makes real
+      # network requests, and a rate-limited runner would turn unrelated pull
+      # requests red. It runs before publishing instead — see
+      # scripts/check-doc-links.sh.
+      - name: Typecheck the documentation samples
+        run: yarn check-docs
+
   test-js:
     runs-on: ubuntu-latest
 

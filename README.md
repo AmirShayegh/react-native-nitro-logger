@@ -74,10 +74,12 @@ import { Log, pub, priv } from 'react-native-nitro-logger';
 Log.privacyDefault('private');
 Log.metadataKeyCatalog(['requestId', 'statusCode', 'durationMs']);
 
-Log.info('request finished', {
-  requestId: pub(id),   // rendered
-  statusCode: 200,      // redacted — unwrapped, and the default is private
-});
+function onRequestFinished(id: string) {
+  Log.info('request finished', {
+    requestId: pub(id), // rendered
+    statusCode: 200,    // redacted — unwrapped, and the default is private
+  });
+}
 ```
 
 **In a release build** (`__DEV__` false):
@@ -153,6 +155,57 @@ a promise that the directory is left empty.
 It clears the **file sink's** artifacts and nothing else. Anything already
 handed to `os_log` or `logcat` is outside this library's reach.
 
+## Logging to os_log and logcat
+
+`NativeConsoleDestination` writes into the platform log stream — os_log on iOS,
+logcat on Android — so your JavaScript lines interleave with native ones in
+Console.app, Xcode, and `adb logcat`.
+
+```ts
+import {
+  Log,
+  NativeConsoleDestination,
+  createNativeConsoleSink,
+} from 'react-native-nitro-logger';
+
+Log.addDestination(
+  new NativeConsoleDestination(createNativeConsoleSink(), {
+    subsystem: 'com.example.app',
+    category: 'network',
+  })
+);
+```
+
+Unlike `ConsoleDestination`, this one batches: a drain crosses the bridge once
+with two parallel primitive arrays rather than once per entry.
+
+**It is best-effort by design, and that is the important thing to know about
+it.** There is no backpressure and no loss accounting against a disk, because
+os_log accepts what it is given and never blocks. What it *does* account for is
+its own buffer — `dropped()` returns the entries lost at the ceiling or to a
+sink that threw, because a diagnostic channel that quietly loses records is
+worse than one that admits it. After three consecutive native failures the
+destination reports `isEnabled === false` and the logger stops formatting for
+it, so a dead sink stops costing render work as well as bridge calls.
+
+The durable copy is `FileDestination`'s. Nothing here is a system of record,
+which is what makes best-effort the right posture.
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `subsystem` | the bundle's, chosen natively | Reverse-DNS, as os_log expects. Empty is legal and produces a logger nobody can find. |
+| `category` | `'log'` | Becomes the logcat tag on Android. |
+| `formatter` | `DefaultFormatter` | os_log wants a line, not a JSON record. |
+| `label` | `'native-console'` | Registration key for `removeDestination`. |
+| `minimumLevel` | inherited | Per-destination floor. |
+| `batchSize` | `64` | Entries per bridge crossing. |
+| `flushIntervalMs` | `100` | Idle coalescing window. |
+| `maxPendingEntries` | `1000` | Buffer ceiling; oldest survive, newest are dropped. |
+
+Long lines are split rather than silently cut off — the two platforms have
+genuinely different limits, and [docs/PARITY.md](docs/PARITY.md) records both
+the chunk sizes and why the split boundary differs between them.
+
 ## Crash handling and backgrounding
 
 ```ts
@@ -173,7 +226,8 @@ return idempotent uninstall handles.
 `JsonLinesFormatter` is the default for files — one JSON object per line, with
 a framing guarantee the native crash-tail recovery depends on. It is asserted
 byte-identical to [SwiftLogger][swiftlogger]'s `JSONLogFormatter` over a
-generated corpus.
+generated corpus, against the specific revision
+[docs/PARITY.md](docs/PARITY.md) pins.
 
 ```json
 {"timestamp":"2026-07-28T10:15:00.123Z","level":"INFO","message":"app started"}
@@ -196,19 +250,24 @@ where the two native writers genuinely differ.
 
 ## Documentation
 
+- [docs/API.md](docs/API.md) — every export, grouped by what it is for
 - [docs/PRIVACY.md](docs/PRIVACY.md) — the privacy contract and compliance boundary
 - [docs/PARITY.md](docs/PARITY.md) — parity with SwiftLogger, and between the two native writers
 - [eslint-plugin/README.md](eslint-plugin/README.md) — what the lint rules protect, and what they do not
 
 ## Contributing
 
-- [Development workflow](CONTRIBUTING.md#development-workflow)
-- [Sending a pull request](CONTRIBUTING.md#sending-a-pull-request)
-- [Code of conduct](CODE_OF_CONDUCT.md)
+Absolute links, because these files are not in the npm tarball — they are
+repository documents, and a relative link to them dies for anyone reading this
+README inside `node_modules`.
+
+- [Development workflow](https://github.com/AmirShayegh/react-native-nitro-logger/blob/main/CONTRIBUTING.md#development-workflow)
+- [Sending a pull request](https://github.com/AmirShayegh/react-native-nitro-logger/blob/main/CONTRIBUTING.md#sending-a-pull-request)
+- [Code of conduct](https://github.com/AmirShayegh/react-native-nitro-logger/blob/main/CODE_OF_CONDUCT.md)
 
 ## License
 
 MIT
 
 [nitro]: https://nitro.margelo.com/
-[swiftlogger]: https://github.com/amirshayegh/logger
+[swiftlogger]: https://github.com/AmirShayegh/SwiftLogger

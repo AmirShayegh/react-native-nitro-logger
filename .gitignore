@@ -48,6 +48,15 @@ example/ios/Pods
 # Ruby
 example/vendor/
 
+# Ignored to stop `git add -A` from recommitting the one this machine can
+# produce, not because a lockfile is unwanted. macOS ships Ruby 2.6.10, whose
+# Bundler writes `BUNDLED WITH 1.17.2`; a current Bundler honours that line by
+# re-execing 1.17.2, which dies calling String#untaint (removed in Ruby 3.2).
+# That turned build-ios red for the whole of 0.1.0's release run. Delete these
+# two lines and commit the file once one can be generated on a current Ruby —
+# `turbo.json` already hashes it when present.
+example/Gemfile.lock
+
 # node.js
 #
 node_modules/

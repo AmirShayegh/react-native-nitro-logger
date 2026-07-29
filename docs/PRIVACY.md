@@ -121,17 +121,30 @@ silent failure open.
 The practical consequence is that the strict profile takes two calls, not one:
 
 ```ts
+import { Log, ERROR_METADATA_KEYS } from 'react-native-nitro-logger';
+
 Log.privacyDefault('private');
-Log.metadataKeyCatalog(['requestId', 'statusCode', 'durationMs', 'retryCount']);
+Log.metadataKeyCatalog([
+  ...ERROR_METADATA_KEYS,
+  'requestId',
+  'statusCode',
+  'durationMs',
+  'retryCount',
+]);
 ```
 
-This applies to metadata the library itself emits. The crash handler logs under
-`errorName`, `errorMessage`, `errorFrames`, `errorFrameCount`,
-`errorFramesTruncated` and `fatal` — under `'private'`, catalog those six or
-crash reports arrive with their metadata stripped. Their *values* are already
-`pub()`-marked at the call site, because this package generates every one of
-them and none can carry caller data; but a `pub()` value does not exempt a key
-from the catalog, since the catalog exists to police key *names*.
+The catalog governs metadata the library itself emits, not only yours. The
+crash handler logs under six keys of its own, and under `'private'` an
+uncatalogued one means crash reports arrive with their metadata stripped —
+which is why those six are exported as `ERROR_METADATA_KEYS` rather than left
+for you to transcribe. Spreading the constant also survives a key being added
+in a future version, where a hand-written list would silently start dropping
+one.
+
+Their *values* are already `pub()`-marked at the call site, because this
+package generates every one of them and none can carry caller data; but a
+`pub()` value does not exempt a key from the catalog, since the catalog exists
+to police key *names*.
 
 `droppedMetadataCount` is the exception and needs no entry. It is added after
 filtering rather than passing through it, and is rejected as an incoming key,

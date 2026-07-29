@@ -17,6 +17,7 @@
     "src",
     "lib",
     "docs",
+    "CHANGELOG.md",
     "eslint-plugin",
     "android",
     "ios",
@@ -45,13 +46,27 @@
     "nitrogen": "nitrogen",
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
+    "check-docs": "./scripts/check-doc-samples.sh",
+    "check-doc-links": "./scripts/check-doc-links.sh",
     "changeset": "changeset",
-    "release": "changeset publish"
+    "release": "yarn check-doc-links && changeset publish"
   },
   "keywords": [
     "react-native",
     "ios",
-    "android"
+    "android",
+    "logging",
+    "logger",
+    "structured-logging",
+    "nitro",
+    "nitro-modules",
+    "os_log",
+    "logcat",
+    "privacy",
+    "redaction",
+    "hipaa",
+    "file-logging",
+    "log-rotation"
   ],
   "repository": {
     "type": "git",
