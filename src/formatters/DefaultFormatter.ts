@@ -90,12 +90,20 @@ function formatMessage(message: string): string {
 }
 
 /**
- * Renders C0, DEL, and C1 control characters as escapes.
+ * Renders C0, DEL, C1, and the Unicode line/paragraph separators as escapes.
  *
  * C1 (U+0080–U+009F) matters as much as C0 here and is easy to forget:
  * U+009B is a single-character CSI, so a terminal will happily read what
  * follows it as a cursor-movement or erase sequence, and U+0085 is NEL,
  * which Unicode-aware readers treat as a line break.
+ *
+ * U+2028 and U+2029 are here for exactly the reason U+0085 is. They are not
+ * control characters and a plain `\n`-splitting reader ignores them, but a
+ * JavaScript one does not: `^` and `$` under the `m` flag treat both as line
+ * terminators, so a log viewer written in JS — the likely kind for this
+ * package — sees a line break where a terminal sees none. That asymmetry is
+ * worse than either alone, because the forged line is invisible in the tool
+ * someone checks the raw file with.
  *
  * This layout is one entry per line, so a newline inside a *structured* field
  * lets whoever supplied that field forge whole log entries. A correlation ID,
@@ -112,7 +120,7 @@ function formatMessage(message: string): string {
  */
 function escapeControls(field: string): string {
   // eslint-disable-next-line no-control-regex
-  if (!/[\u0000-\u001F\u007F-\u009F]/.test(field)) return field;
+  if (!/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/.test(field)) return field;
 
   let out = '';
   for (const character of field) {
@@ -129,7 +137,10 @@ function escapeControls(field: string): string {
       default: {
         const code = character.codePointAt(0)!;
         out +=
-          code < 0x20 || (code >= 0x7f && code <= 0x9f)
+          code < 0x20 ||
+          (code >= 0x7f && code <= 0x9f) ||
+          code === 0x2028 ||
+          code === 0x2029
             ? `\\u{${code.toString(16).toUpperCase()}}`
             : character;
       }

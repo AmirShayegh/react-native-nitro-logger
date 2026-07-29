@@ -124,6 +124,34 @@ describe('DefaultFormatter — log injection', () => {
     ).toBe(' INFO | 12:15:30.842 | msg {k\\u{85}=v\\u{9B}}');
   });
 
+  test('U+2028 and U+2029 are escaped in structured fields', () => {
+    // The message splits on these (see the line-break test above), but a
+    // structured field must not: a correlation ID or a metadata value can
+    // arrive from a request header or a username, and this layout is one
+    // entry per line. They are invisible to a `\n`-splitting reader and are
+    // line terminators to a JavaScript one under `m`, so a forged line shows
+    // up in the log viewer and not in the file someone checks it against.
+    expect(
+      formatter.format(entry({ correlation: 'a\u2028ERROR | 00:00:00.000 |' }))
+    ).toBe(' INFO | 12:15:30.842 | [a\\u{2028}ERROR | 00:00:00.000 |] msg');
+    expect(
+      formatter.format(entry({ metadata: { 'k\u2028': 'v\u2029' } }))
+    ).toBe(' INFO | 12:15:30.842 | msg {k\\u{2028}=v\\u{2029}}');
+  });
+
+  test('a JS log reader cannot be shown a line a terminal cannot see', () => {
+    // The property the escaping exists for, asserted as a property: split the
+    // rendered record the way each kind of reader would and demand they agree
+    // on how many lines there are.
+    const out = formatter.format(
+      entry({ subsystem: 'net\u2029ERROR | 00:00:00.000 | forged' })
+    );
+    expect(out.split('\n')).toHaveLength(1);
+    // `m`-mode `^` treats U+2028/U+2029 as terminators, so this counts the
+    // lines a JavaScript viewer would draw.
+    expect(out.match(/^/gm)).toHaveLength(1);
+  });
+
   test('a clean field is returned unchanged', () => {
     expect(
       formatter.format(

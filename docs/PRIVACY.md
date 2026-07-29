@@ -110,10 +110,32 @@ With a catalog set, an unrecognised key is dropped and counted, in both direct
 and scoped metadata. Fail-closed, and the only mechanism here that stops a
 literal PHI key.
 
-Setting one is not enforced — nothing makes `privacyDefault('private')` require
-it, because a library cannot know your key vocabulary. It is a convention this
-document recommends for regulated use, and an app that wants it guaranteed
-should assert it in its own startup test.
+Under `privacyDefault('private')` the catalog is **mandatory, and enforced by
+the runtime rather than by convention**: with no catalog configured, no key is
+approved, so every metadata key drops and is counted. Choosing the strict
+profile and then forgetting the catalog leaves none of the metadata you
+supplied — only the injected `droppedMetadataCount`, which is exactly the
+signal that this is what happened. Loud, and in the safe direction; not a
+silent failure open.
+
+The practical consequence is that the strict profile takes two calls, not one:
+
+```ts
+Log.privacyDefault('private');
+Log.metadataKeyCatalog(['requestId', 'statusCode', 'durationMs', 'retryCount']);
+```
+
+This applies to metadata the library itself emits. The crash handler logs under
+`errorName`, `errorMessage`, `errorFrames`, `errorFrameCount`,
+`errorFramesTruncated` and `fatal` — under `'private'`, catalog those six or
+crash reports arrive with their metadata stripped. Their *values* are already
+`pub()`-marked at the call site, because this package generates every one of
+them and none can carry caller data; but a `pub()` value does not exempt a key
+from the catalog, since the catalog exists to police key *names*.
+
+`droppedMetadataCount` is the exception and needs no entry. It is added after
+filtering rather than passing through it, and is rejected as an incoming key,
+so the count of what was dropped can never itself be dropped.
 
 ---
 

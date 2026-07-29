@@ -10,6 +10,8 @@ import { REDACTED_MESSAGE } from '../src/integrations/sanitizeError';
 import type { LogDestination } from '../src/destinations/types';
 import type { LogEntry } from '../src/types';
 
+declare const globalThis: { __DEV__?: boolean };
+
 const SENTINEL = 'MRN-4417293';
 
 /** Captures entries and counts flushes, so both halves are observable. */
@@ -119,6 +121,86 @@ describe('installErrorHandler', () => {
 
     expect(destination.entries[0]!.metadata).toMatchObject({ fatal: true });
     expect(destination.entries[1]!.metadata).toMatchObject({ fatal: false });
+  });
+
+  // The strict profile is the one this package exists for, and it is also the
+  // one that can quietly hollow out a crash report: under `'private'` a bare
+  // primitive renders `<private>` in release, so a diagnostic field that is
+  // machine-generated has to say so at the call site or it arrives useless.
+  describe('under the strict privacy profile', () => {
+    const originalDev = globalThis.__DEV__;
+
+    afterEach(() => {
+      if (originalDev === undefined) delete globalThis.__DEV__;
+      else globalThis.__DEV__ = originalDev;
+    });
+
+    test('the generated diagnostic fields survive a release render', () => {
+      // Release, not dev: in dev everything reveals and this would pass
+      // whether or not the values were marked.
+      globalThis.__DEV__ = false;
+
+      const { logger, destination, errorUtils } = wired();
+      logger
+        .privacyDefault('private')
+        .metadataKeyCatalog([
+          'errorName',
+          'errorMessage',
+          'errorFrames',
+          'errorFrameCount',
+          'errorFramesTruncated',
+          'fatal',
+        ]);
+      installErrorHandler({ logger, errorUtils });
+
+      errorUtils.throw(new Error('boom'), true);
+
+      const metadata = destination.entries[0]!.metadata!;
+      expect(metadata.fatal).toBe(true);
+      expect(typeof metadata.errorFrameCount).toBe('number');
+      expect(typeof metadata.errorFramesTruncated).toBe('boolean');
+      // The message is redacted by sanitizeError before it ever reaches
+      // privacy — the point here is that the counters are not.
+      expect(metadata.fatal).not.toBe('<private>');
+      expect(metadata.errorFrameCount).not.toBe('<private>');
+      expect(metadata.errorFramesTruncated).not.toBe('<private>');
+    });
+
+    test('an uncatalogued key drops even though its value is public', () => {
+      // `pub()` speaks for the value; the catalog speaks for the name. Pins
+      // the reason PRIVACY.md tells you to catalog these six keys.
+      globalThis.__DEV__ = false;
+
+      const { logger, destination, errorUtils } = wired();
+      logger.privacyDefault('private').metadataKeyCatalog(['errorName']);
+      installErrorHandler({ logger, errorUtils });
+
+      errorUtils.throw(new Error('boom'), true);
+
+      const metadata = destination.entries[0]!.metadata!;
+      expect(metadata.errorName).toBeDefined();
+      expect(metadata.fatal).toBeUndefined();
+      expect(metadata.errorFrameCount).toBeUndefined();
+    });
+
+    test('no catalog at all drops every key, including the generated ones', () => {
+      // Fail-closed, and the behaviour PRIVACY.md previously described as a
+      // convention rather than a rule.
+      globalThis.__DEV__ = false;
+
+      const { logger, destination, errorUtils } = wired();
+      logger.privacyDefault('private');
+      installErrorHandler({ logger, errorUtils });
+
+      errorUtils.throw(new Error('boom'), true);
+
+      const metadata = destination.entries[0]!.metadata!;
+      expect(metadata.errorName).toBeUndefined();
+      expect(metadata.fatal).toBeUndefined();
+      // The count of what was dropped is added after filtering, so it is the
+      // one key that cannot be dropped.
+      expect(metadata.droppedMetadataCount).toBe(6);
+    });
   });
 
   describe('chaining', () => {

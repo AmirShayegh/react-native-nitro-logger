@@ -103,9 +103,17 @@ export function installErrorHandler(options?: ErrorHandlerOptions): Uninstall {
           errorName: pub(sanitized.name),
           errorMessage: pub(sanitized.message),
           errorFrames: pub(sanitized.frames.join(' | ')),
-          errorFrameCount: sanitized.frameCount,
-          errorFramesTruncated: sanitized.framesTruncated,
-          fatal: isFatal === true,
+          // Wrapped for the same reason as the three above, and it was an
+          // oversight that they were not: every one of these is generated
+          // here, from a count, a flag this function was handed, and a
+          // decision this module made. None can carry caller data. Left bare
+          // they follow the privacy default, so under `privacyDefault('private')`
+          // a crash report renders `fatal: <private>` — which withholds
+          // nothing, because there was nothing to withhold, and costs the
+          // reader the one field that says whether the app is still running.
+          errorFrameCount: pub(sanitized.frameCount),
+          errorFramesTruncated: pub(sanitized.framesTruncated),
+          fatal: pub(isFatal === true),
         },
         options?.subsystem
       );
