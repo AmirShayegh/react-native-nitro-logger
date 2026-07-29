@@ -5,17 +5,79 @@
   "tasks": {
     "build:android": {
       "env": ["ANDROID_HOME", "ORG_GRADLE_PROJECT_newArchEnabled"],
+      // Two things about these globs, both learned the hard way.
+      //
+      // They resolve relative to example/, because that is the package
+      // declaring the task. Without $TURBO_ROOT$, `android` meant
+      // example/android and the library's own android/ was never hashed at
+      // all — so a cached build reported success for native sources it had
+      // never seen, which is the one thing a build cache must not do. And
+      // `example/android` resolved to example/example/android, matching
+      // nothing. Verified by rebuilding the hash under both configs: with the
+      // old one, editing android/.../LogFileWriter.kt left it byte-identical.
+      //
+      // Sources are enumerated rather than whole directories minus their
+      // outputs. Naming `inputs` at all switches turbo from hashing tracked
+      // files to globbing the filesystem, so .gitignore stops protecting
+      // anything: `android/**` swept in android/.cxx, whose .ninja_log and
+      // timestamped CMake index change on every build. Hashing a build's own
+      // output is how a hash stops meaning anything. Listing sources cannot go
+      // stale in that direction — a new generated directory is simply not
+      // matched.
+      //
+      // `react-native.config.js` is listed because it is what points autolinking
+      // at ../ — the library is built into this app because that file says so,
+      // and an edit to it changes what gets compiled. `app.json` names the app
+      // the CLI builds. The JS entry points (index.js, metro/babel config) are
+      // deliberately absent: these are Debug builds that load JavaScript from
+      // Metro at runtime, so nothing about them changes the native artifact.
+      //
+      // `yarn.lock` is NOT listed and must not be — turbo already folds each
+      // package's resolved dependencies into the hash itself. Confirmed both
+      // ways: bumping a real `resolution:` moves the hash, while appending a
+      // comment leaves it alone, which is the behaviour worth having and is
+      // strictly better than a byte-level glob would give. `.yarnrc.yml` is in
+      // globalDependencies above. There are no `.yarn/patches`.
+      //
+      // The root `react-native.config.js` glob matches nothing today; the
+      // library ships no such file. It is listed because if one ever appears,
+      // autolinking will read it and a silently stale cache is exactly the
+      // failure this whole rewrite exists to remove. A glob matching no file
+      // costs nothing.
+      //
+      // Separately, and NOT caused by any of the above: turbo 2.10.7 returns
+      // one of two hashes at random for an untouched tree. It reproduces with
+      // `inputs` reduced to the single literal "package.json", with the daemon
+      // off, and on the previous config, so it is neither these globs nor
+      // anything in this repo. It is safe in the only direction that matters —
+      // a hash that varies can miss, never falsely hit — and the CI cache probe
+      // treats a hit as an optimisation rather than asserting one, so the
+      // effect is that these builds always run. Left alone deliberately; the
+      // sensitivity above was verified by comparing the SET of hashes over six
+      // runs before and after an edit, which is disjoint under this config and
+      // identical under the old one.
       "inputs": [
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/nitro.json",
+        "$TURBO_ROOT$/android/src/**",
+        "$TURBO_ROOT$/android/build.gradle",
+        "$TURBO_ROOT$/android/CMakeLists.txt",
+        "$TURBO_ROOT$/nitrogen/**",
+        "$TURBO_ROOT$/src/**",
+        "$TURBO_ROOT$/react-native.config.js",
         "package.json",
-        "android",
-        "!android/build",
-        "src/*.ts",
-        "src/*.tsx",
-        "example/package.json",
-        "example/android",
-        "!example/android/.gradle",
-        "!example/android/build",
-        "!example/android/app/build"
+        "src/**",
+        "app.json",
+        "react-native.config.js",
+        "android/app/src/**",
+        "android/app/build.gradle",
+        "android/app/proguard-rules.pro",
+        "android/build.gradle",
+        "android/settings.gradle",
+        "android/gradle.properties",
+        "android/gradle/**",
+        "android/gradlew",
+        "android/gradlew.bat"
       ],
       "outputs": []
     },
@@ -26,16 +88,42 @@
         "RCT_USE_RN_DEP",
         "RCT_USE_PREBUILT_RNCORE"
       ],
+      // See build:android for why every library path carries $TURBO_ROOT$ and
+      // why sources are listed rather than directories. The podspec is the
+      // library's: `*.podspec` alone looked for example/*.podspec, which does
+      // not exist. Pods/ and build/ are excluded by not being named — they are
+      // outputs, and hashing an output is how a hash stops being stable. The
+      // library's own sources are `ios/*.swift` rather than `ios/**` for that
+      // same reason: nothing builds into ios/ today, but a directory glob is a
+      // standing invitation for whatever lands there next, and the file list
+      // there is seven Swift files.
+      //
+      // The .xcworkspace is here and not only the .xcodeproj because the
+      // workspace is what xcodebuild opens once CocoaPods has been through.
+      // `Gemfile`/`Gemfile.lock` pin the CocoaPods that generates Pods/, and
+      // this task runs `pod install` itself — `react-native.config.js` sets
+      // `automaticPodsInstallation`, which is also why that file matters here
+      // as much as it does for Android.
       "inputs": [
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/nitro.json",
+        "$TURBO_ROOT$/*.podspec",
+        "$TURBO_ROOT$/ios/*.swift",
+        "$TURBO_ROOT$/nitrogen/**",
+        "$TURBO_ROOT$/src/**",
+        "$TURBO_ROOT$/react-native.config.js",
         "package.json",
-        "*.podspec",
-        "ios",
-        "src/*.ts",
-        "src/*.tsx",
-        "example/package.json",
-        "example/ios",
-        "!example/ios/build",
-        "!example/ios/Pods"
+        "src/**",
+        "app.json",
+        "react-native.config.js",
+        "Gemfile",
+        "Gemfile.lock",
+        "ios/Podfile",
+        "ios/Podfile.lock",
+        "ios/.xcode.env",
+        "ios/NitroLoggerExample/**",
+        "ios/NitroLoggerExample.xcodeproj/**",
+        "ios/NitroLoggerExample.xcworkspace/**"
       ],
       "outputs": []
     }

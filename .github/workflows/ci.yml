@@ -187,16 +187,26 @@ jobs:
       - name: Regenerate nitrogen code
         run: yarn nitrogen
 
-      # `nitrogen/` is gitignored, so scoping this to that directory asserted
-      # nothing and passed vacuously. Checking the whole tree is the real test:
-      # generation must not touch anything tracked, and if the bindings are
-      # ever committed this starts catching spec drift without further edits.
+      # `nitrogen/` is tracked, so this now does what its name says. While it
+      # was gitignored there was nothing for the regenerated output to differ
+      # from, and the job passed no matter how far the bindings had drifted
+      # from the `.nitro.ts` specs.
       #
-      # What actually catches a stale binding today is compilation — the iOS
-      # and Android jobs both regenerate before they build, which is how a
-      # hand-written adapter that drifted from a changed spec gets found.
-      - name: Verify regeneration touches nothing tracked
-        run: git diff --exit-code
+      # Committing generated code is a real cost — every spec change carries a
+      # regenerated diff — and it buys the one thing nothing else here provides:
+      # a spec edited without regenerating fails on this line rather than at
+      # some later compile whose error names a file nobody wrote by hand.
+      # Generation is deterministic, so a clean tree stays clean.
+      - name: Verify regeneration matches what is committed
+        run: |
+          # `git diff` does not look at untracked files, so a brand-new spec
+          # whose bindings were never committed would produce only new files
+          # and slip through. Adding nitrogen/ with --intent-to-add first makes
+          # those additions part of the diff. Today a new spec also rewrites the
+          # tracked autolinking manifests, so this would fail either way — that
+          # is luck, not a guarantee, and this does not depend on it.
+          git add --intent-to-add --all nitrogen/
+          git diff --exit-code
 
   build-android:
     runs-on: ubuntu-latest

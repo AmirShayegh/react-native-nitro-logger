@@ -83,7 +83,14 @@ ios/generated
 android/generated
 
 # React Native Nitro Modules
-nitrogen/
+#
+# `nitrogen/` is deliberately NOT ignored. It is generated from the `.nitro.ts`
+# specs, but it is also shipped in the npm tarball and referenced by relative
+# path from both build systems — and while it was ignored, the `nitrogen-diff`
+# CI job could not see drift between a spec and its bindings, because there was
+# nothing tracked for the regenerated output to differ from. Committing it is
+# what makes that gate real. Generation is deterministic; if this ever produces
+# noise in a diff, that is the bug, not the tracking.
 
 # SwiftPM build products from the XCTest harness in Package.swift
 .build/
