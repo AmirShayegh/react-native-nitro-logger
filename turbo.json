@@ -100,10 +100,20 @@
       //
       // The .xcworkspace is here and not only the .xcodeproj because the
       // workspace is what xcodebuild opens once CocoaPods has been through.
-      // `Gemfile`/`Gemfile.lock` pin the CocoaPods that generates Pods/, and
-      // this task runs `pod install` itself — `react-native.config.js` sets
+      // `Gemfile` pins the CocoaPods that generates Pods/, and this task runs
+      // `pod install` itself — `react-native.config.js` sets
       // `automaticPodsInstallation`, which is also why that file matters here
       // as much as it does for Android.
+      //
+      // `Gemfile.lock` is listed but deliberately not committed. It belongs in
+      // the hash whenever it exists, because a developer's resolved CocoaPods
+      // is part of what produced their Pods/ — but the only lockfile this
+      // repository can currently generate comes from the Ruby that ships with
+      // macOS, and one written by its Bundler 1.17.2 makes a modern Bundler
+      // re-exec 1.17.2, which dies calling `String#untaint` (removed in Ruby
+      // 3.2). scripts/check-min-rn-ios.sh already refuses to depend on that
+      // Ruby for the same reason. A lockfile generated on a current Ruby would
+      // be worth committing; that one is worse than none.
       "inputs": [
         "$TURBO_ROOT$/package.json",
         "$TURBO_ROOT$/nitro.json",
