@@ -109,11 +109,11 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
+    "@typescript-eslint/parser": "*",
     "eslint": ">=9.0.0",
     "react": "*",
     "react-native": ">=0.78.0",
-    "react-native-nitro-modules": "^0.36.3",
-    "@typescript-eslint/parser": "*"
+    "react-native-nitro-modules": "^0.36.3"
   },
   "workspaces": [
     "example",
@@ -161,10 +161,10 @@
     "version": "0.63.0"
   },
   "peerDependenciesMeta": {
-    "eslint": {
+    "@typescript-eslint/parser": {
       "optional": true
     },
-    "@typescript-eslint/parser": {
+    "eslint": {
       "optional": true
     }
   }
