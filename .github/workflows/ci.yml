@@ -42,6 +42,15 @@ jobs:
       - name: Verify the documented ESLint setup lints TypeScript
         run: yarn check-eslint-consumer
 
+      # Which built file each of `require`, `import` and Jest actually gets.
+      # Through 0.1.2 the package shipped ESM only, so a React Native app's
+      # stock Jest died with "Cannot use import statement outside a module"
+      # before running a test. In-repo nothing sees that: workspace links and
+      # the `-source` export condition resolve to src/, so the shipped export
+      # map is never the one exercised.
+      - name: Verify every consumer entry point resolves
+        run: yarn check-package-exports
+
       # Every ```ts block in the shipped docs, compiled against this tree.
       # A sample is the first thing a reader copies, so a renamed export should
       # break the documentation at the same moment it breaks the code rather
