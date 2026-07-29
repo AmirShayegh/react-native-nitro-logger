@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  RECEIVER_OPTION_PROPERTIES,
   describeLogCall,
   describeScopedCall,
   isOmitted,
@@ -52,9 +53,7 @@ module.exports = {
       {
         type: 'object',
         properties: {
-          loggerNames: { type: 'array', items: { type: 'string' } },
-          loggerModules: { type: 'array', items: { type: 'string' } },
-          singletonName: { type: 'string' },
+          ...RECEIVER_OPTION_PROPERTIES,
           // The catalog mirrors the runtime's contract exactly. A key the
           // runtime would reject is worse than useless in lint: it approves
           // at build time something that is silently dropped in production.
@@ -155,20 +154,30 @@ module.exports = {
 
         // `Log.scoped(correlation, subsystem, metadata)` carries metadata
         // for every message the scope emits, so it gets the same treatment.
-        const scoped = describeScopedCall(context, node);
-        if (!scoped) return;
-        if (scoped.spreadArgs) {
-          // `Log.scoped(...args)` — the metadata position is unknowable, and
-          // a scope's metadata rides every message it emits.
-          reportOpaque(node);
-          return;
-        }
-        // `Log.scoped(id, 'sub', undefined)` states there is no metadata,
-        // which is what the runtime sees too.
-        if (!isOmitted(context, scoped.args[2])) {
-          checkMetadataExpression(scoped.args[2]);
-        }
+        checkScopedMetadata(node);
       },
+
+      // `new ScopedLogger(logger, correlation, subsystem, metadata)` sets the
+      // same default metadata. `describeScopedCall` normalizes the positions,
+      // so this is the identical check — without it the constructor form of a
+      // computed key went unreported while `Log.scoped()` was caught.
+      NewExpression: checkScopedMetadata,
     };
+
+    function checkScopedMetadata(node) {
+      const scoped = describeScopedCall(context, node);
+      if (!scoped) return;
+      if (scoped.spreadArgs) {
+        // `Log.scoped(...args)` — the metadata position is unknowable, and
+        // a scope's metadata rides every message it emits.
+        reportOpaque(node);
+        return;
+      }
+      // `Log.scoped(id, 'sub', undefined)` states there is no metadata,
+      // which is what the runtime sees too.
+      if (!isOmitted(context, scoped.args[2])) {
+        checkMetadataExpression(scoped.args[2]);
+      }
+    }
   },
 };

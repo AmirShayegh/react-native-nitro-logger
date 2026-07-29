@@ -1,6 +1,10 @@
 'use strict';
 
-const { describeLogCall, isStaticMessage } = require('../shared');
+const {
+  RECEIVER_OPTION_PROPERTIES,
+  describeLogCall,
+  isStaticMessage,
+} = require('../shared');
 
 /**
  * The message is public by contract: the runtime cannot redact it, because
@@ -22,9 +26,7 @@ module.exports = {
       {
         type: 'object',
         properties: {
-          loggerNames: { type: 'array', items: { type: 'string' } },
-          loggerModules: { type: 'array', items: { type: 'string' } },
-          singletonName: { type: 'string' },
+          ...RECEIVER_OPTION_PROPERTIES,
         },
         additionalProperties: false,
       },

@@ -47,6 +47,7 @@
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
     "check-docs": "./scripts/check-doc-samples.sh",
+    "check-eslint-consumer": "./scripts/check-eslint-consumer.sh",
     "check-doc-links": "./scripts/check-doc-links.sh",
     "changeset": "changeset",
     "release": "yarn check-doc-links && changeset publish"
@@ -111,7 +112,8 @@
     "eslint": ">=9.0.0",
     "react": "*",
     "react-native": ">=0.78.0",
-    "react-native-nitro-modules": "^0.36.3"
+    "react-native-nitro-modules": "^0.36.3",
+    "@typescript-eslint/parser": "*"
   },
   "workspaces": [
     "example",
@@ -160,6 +162,9 @@
   },
   "peerDependenciesMeta": {
     "eslint": {
+      "optional": true
+    },
+    "@typescript-eslint/parser": {
       "optional": true
     }
   }

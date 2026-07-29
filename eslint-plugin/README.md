@@ -12,19 +12,60 @@ Under the default `privacyDefault('public')` profile, values are not redacted
 either — they are public because you declared them so. These rules matter more
 there, not less.
 
+<!-- eslint-setup:begin -->
+
 ```js
-// eslint.config.js
+// eslint.config.mjs
 import nitroLogger from 'react-native-nitro-logger/eslint-plugin';
 
-export default [nitroLogger.configs.strict];
+export default [nitroLogger.configs.strictTypeScript];
 ```
+
+<!-- eslint-setup:end -->
 
 ## Configs
 
-| Config        | Rules                                                       | For                                                     |
-| ------------- | ----------------------------------------------------------- | ------------------------------------------------------- |
-| `recommended` | `no-dynamic-message`, `no-computed-metadata-key`             | OSS apps. Catches what is almost always a mistake.      |
-| `strict`      | those plus `no-derived-correlation`, `literal-subsystem`     | Apps under `privacyDefault('private')` — PHI, PII.      |
+| Config                  | Lints                        | Rules                                                    | For                                                |
+| ----------------------- | ---------------------------- | -------------------------------------------------------- | -------------------------------------------------- |
+| `recommended`           | **JavaScript only**          | `no-dynamic-message`, `no-computed-metadata-key`          | OSS apps. Catches what is almost always a mistake. |
+| `strict`                | **JavaScript only**          | those plus `no-derived-correlation`, `literal-subsystem`  | Apps under `privacyDefault('private')` — PHI, PII. |
+| `recommendedTypeScript` | `.ts`, `.tsx` and JavaScript | same as `recommended`                                     | The same, in a TypeScript app.                     |
+| `strictTypeScript`      | `.ts`, `.tsx` and JavaScript | same as `strict`                                          | The same, in a TypeScript app.                     |
+
+Pick **one**, not two — the TypeScript variants already cover JavaScript.
+"JavaScript only" above means *used on their own*; see the qualification below.
+
+**Why the distinction is load-bearing.** A flat config with no `files` key
+selects only ESLint's default set: `.js`, `.mjs`, `.cjs`. Point the bare
+`strict` config at a TypeScript app and it brings in nothing — `eslint .`
+prints no findings and exits 0, and `eslint src/app.ts` says "File ignored
+because no matching configuration was supplied". These rules are the *only*
+protection for message text, correlation IDs and subsystems, none of which the
+runtime can redact, so that silence looks identical to compliance and is the
+opposite of it. The TypeScript variants set both the file set and the parser.
+
+One qualification, because it is why this went unnoticed for two releases: a
+file-less entry *does* apply to a TypeScript file that another entry in the
+same config has already selected and supplied a parser for. This repository's
+own `eslint.config.mjs` extends `@react-native/eslint-config`, which does
+exactly that — so the rules ran here while the published config was inert.
+That behaviour lasts only as long as the other entry keeps selecting
+TypeScript and supplying a compatible parser, which is another package's
+decision to change, so it is not something to depend on deliberately.
+
+They need `@typescript-eslint/parser`, declared as an **optional** peer with no
+version constraint: these configs hand the parser to ESLint and never
+introspect it, so pinning a range would only risk an `ERESOLVE` for a consumer
+whose parser already works — a `>=8.60` floor would reject parser 8.20 with
+TypeScript 5.7, which lints these rules perfectly well. The parser's own peer
+range governs which TypeScript it accepts. In practice ESLint sets the floor:
+these configs require `eslint >=9`, and parser 7.x declares `eslint ^8.56.0`,
+so an app still on `@react-native/eslint-config@0.78` (which pins parser
+`^7.1.1`) needs to upgrade both before any of this applies. Selecting a
+TypeScript config without the parser fails with an install command rather than
+a resolution stack trace. Flow-annotated `.js` is the one case to avoid these
+configs: the TypeScript parser rejects it, so compose `strict` with your own
+parser instead.
 
 Both fail closed on metadata: an object the rules cannot open is reported,
 because that is exactly the case where they cannot tell a reviewed key from a
@@ -65,6 +106,12 @@ Tell the plugin which modules legitimately hand out the logger:
 
 List every module that re-exports it. This is a trust boundary — anything named
 here is believed to hand out the real Logger, so keep it to modules you own.
+
+Since 0.1.2 this applies to `new ScopedLogger(logger, correlation, subsystem)`
+as well, which reaches the same two unredactable channels as
+`logger.scoped(...)`. A `ScopedLogger` re-exported from your own barrel is
+checked either way; naming that barrel here is what stops the *correct*
+spelling from reporting, exactly as it does for `Log.scoped()`.
 
 ## Rules
 

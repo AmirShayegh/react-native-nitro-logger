@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  RECEIVER_OPTION_PROPERTIES,
   describeLogCall,
   describeScopedCall,
   describeSubsystemConfigCall,
@@ -31,9 +32,7 @@ module.exports = {
       {
         type: 'object',
         properties: {
-          loggerNames: { type: 'array', items: { type: 'string' } },
-          loggerModules: { type: 'array', items: { type: 'string' } },
-          singletonName: { type: 'string' },
+          ...RECEIVER_OPTION_PROPERTIES,
         },
         additionalProperties: false,
       },
@@ -89,14 +88,23 @@ module.exports = {
 
         // `Log.scoped(correlation, subsystem, metadata)` — the subsystem
         // here renders on every message the scope emits.
-        const scoped = describeScopedCall(context, node);
-        if (!scoped) return;
-        if (scoped.spreadArgs) {
-          context.report({ node, messageId: 'unanalyzable' });
-        } else {
-          check(scoped.args[1]);
-        }
+        checkScopedSubsystem(node);
       },
+
+      // `new ScopedLogger(logger, correlation, subsystem, …)` reaches the same
+      // channel; `describeScopedCall` normalizes the positions so this is the
+      // identical check.
+      NewExpression: checkScopedSubsystem,
     };
+
+    function checkScopedSubsystem(node) {
+      const scoped = describeScopedCall(context, node);
+      if (!scoped) return;
+      if (scoped.spreadArgs) {
+        context.report({ node, messageId: 'unanalyzable' });
+      } else {
+        check(scoped.args[1]);
+      }
+    }
   },
 };

@@ -64,6 +64,13 @@ inherits what it does not override.
 Its default metadata goes through the same redaction path as call-site
 metadata, and the ESLint rules read both.
 
+Constructing one directly — `new ScopedLogger(logger, correlation, subsystem)` —
+is equivalent to `logger.scoped(correlation, subsystem)` and is linted the
+same way: the correlation and subsystem arguments are the same two channels
+the runtime cannot redact, and the rules check them in either spelling. That
+was not true before 0.1.2, when only `scoped()` was recognised and the
+constructor reported nothing.
+
 <!-- api: ScopedLogger -->
 
 ### `LogOptions`, `LazyMessage`, `LogLevel`, `LogEntry`

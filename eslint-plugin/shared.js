@@ -139,6 +139,56 @@ function canonicalLoggerName(context) {
   );
 }
 
+/**
+ * The exported classes a consumer can construct a logger from.
+ *
+ * `Log.scoped()` is the documented way to get a ScopedLogger, but both classes
+ * are root exports and `new ScopedLogger(logger, correlation, subsystem)` takes
+ * the two unredactable channels directly as arguments. A rule set that only
+ * understood `.scoped()` was silent on the constructor — same identifiers, same
+ * destinations, no report.
+ *
+ * Matched against the **exported symbol**, not the local binding, so
+ * `import { ScopedLogger as Scope }` and `new Scope(…)` is still a ScopedLogger.
+ */
+const DEFAULT_LOGGER_CLASSES = ['Logger'];
+const DEFAULT_SCOPED_CLASSES = ['ScopedLogger'];
+
+function loggerClassNames(context) {
+  const configured = context.options?.[0]?.loggerClassNames;
+  return new Set(
+    Array.isArray(configured) && configured.length > 0
+      ? configured
+      : DEFAULT_LOGGER_CLASSES
+  );
+}
+
+function scopedClassNames(context) {
+  const configured = context.options?.[0]?.scopedClassNames;
+  return new Set(
+    Array.isArray(configured) && configured.length > 0
+      ? configured
+      : DEFAULT_SCOPED_CLASSES
+  );
+}
+
+/**
+ * The receiver-resolution options every rule accepts.
+ *
+ * Shared rather than copied into each rule's `meta.schema`. They were copied
+ * before, and `additionalProperties: false` turns a missed copy into a crash
+ * for any consumer who sets the option — the rule that forgot it rejects a
+ * config the others accept. Adding an option here reaches all four rules at
+ * once, which is the only way this stays true.
+ */
+const RECEIVER_OPTION_PROPERTIES = {
+  loggerNames: { type: 'array', items: { type: 'string' } },
+  loggerModules: { type: 'array', items: { type: 'string' } },
+  singletonName: { type: 'string' },
+  loggerClassNames: { type: 'array', items: { type: 'string' } },
+  scopedClassNames: { type: 'array', items: { type: 'string' } },
+};
+
 /** Modules an import of the Logger may legitimately come from. */
 const DEFAULT_LOGGER_MODULES = ['react-native-nitro-logger'];
 
@@ -655,8 +705,15 @@ function isGlobalNamed(context, node, names) {
  * The namespace has to be the real global: `const JSON = { stringify: (o) =>
  * { o.up = leak; return ''; } }` would otherwise launder a mutation through
  * the allowlist.
+ *
+ * A `new` is never one of these. `new Object.freeze(M)` throws at runtime, so
+ * exempting it protects nothing — but once `computeIsMutable` began asking
+ * this question about constructors too, it silently widened the escape
+ * exemption past the one constructor it is meant to cover.
  */
 function isNonMutatingStatic(context, node) {
+  if (node.type === 'NewExpression') return false;
+
   const callee = unwrap(node.callee);
   if (!callee || callee.type !== 'MemberExpression' || callee.computed) {
     return false;
@@ -699,6 +756,25 @@ function isTrustedApiMethod(context, member) {
 }
 
 function isTrustedLoggerCall(context, node) {
+  // `new ScopedLogger(Log, id, 'net')` hands the Logger to the package's own
+  // constructor. Without this it reads as an escape — the binding was passed
+  // to code that could write through it — and `Log` loses the trust that
+  // `Log.newCorrelationId()` depends on, so the *encouraged* form of the
+  // constructor reports a derived correlation ID. A false positive on the
+  // correct spelling is how a rule gets switched off, and this one guards a
+  // channel nothing else guards.
+  //
+  // Only the package's own classes qualify, on the same provenance rule as
+  // everything else here: a lookalike from another module is exactly the code
+  // that could write through the reference. TRUST needs `verified`, unlike
+  // `describeScopedCall`, which only needs to know the arguments are worth
+  // checking — a class reached through a local barrel is checked but is not
+  // proof that nothing writes through what it is handed.
+  if (node.type === 'NewExpression') {
+    const provenance = constructionProvenance(context, node);
+    return !!provenance && provenance.kind === 'scoped' && provenance.verified;
+  }
+
   const callee = unwrap(node.callee);
   if (!callee || callee.type !== 'MemberExpression') return false;
 
@@ -980,14 +1056,16 @@ function computeIsMutable(context, variable) {
     }
 
     // Handed to a function that could write through it.
+    //
+    // `new` is asked the same question as a call rather than being assumed
+    // hostile: `new ScopedLogger(Log, id, 'net')` is the constructor form of
+    // `Log.scoped(id, 'net')`, and treating it as an escape cost `Log` the
+    // trust that `Log.newCorrelationId()` needs — reporting the encouraged
+    // spelling as a derived correlation ID. `callCanMutateArguments` still
+    // says yes for every constructor that is not one of the package's own.
     if (parent.type === 'CallExpression' || parent.type === 'NewExpression') {
       if (parent.callee === identifier) continue;
-      if (
-        parent.type === 'CallExpression' &&
-        !callCanMutateArguments(context, parent)
-      ) {
-        continue;
-      }
+      if (!callCanMutateArguments(context, parent)) continue;
       return true;
     }
 
@@ -1537,7 +1615,110 @@ function classifyReceiver(context, node, seen = new Set()) {
     return null;
   }
 
+  // `new ScopedLogger(…)` / `new Logger(…)`.
+  if (current.type === 'NewExpression') {
+    return classifyConstruction(context, current);
+  }
+
   return null;
+}
+
+/**
+ * What `new X(…)` produces, and how sure we are.
+ *
+ * Returns `{ kind: 'scoped' | 'logger', verified: boolean }`, or `null` when
+ * the callee is nothing this cares about.
+ *
+ * The two answers are needed separately because they buy different things.
+ * `kind` decides whether the arguments are WORTH CHECKING — a `new
+ * ScopedLogger(…)` puts a correlation ID and a subsystem in the two channels
+ * the runtime cannot redact no matter where the class was imported from.
+ * `verified` decides whether the construction is worth TRUSTING, which is a
+ * much stronger claim and the only thing that may relax a check.
+ *
+ * Collapsing them is how the first cut of this fix left the most common real
+ * spelling unguarded. An app with `export { ScopedLogger } from
+ * 'react-native-nitro-logger'` in `src/logging.ts` imports the genuine class
+ * through a local barrel, which cannot be traced to the package by specifier,
+ * so it is unverified — and treating unverified as "not a ScopedLogger at all"
+ * meant `new ScopedLogger(Log, patient.id, …)` reported nothing, while the
+ * `Log.scoped(patient.id, …)` spelling of the same leak reported `derived`.
+ * That is the C2 defect reproduced one layer in.
+ *
+ * Provenance is decided the same way {@link isLoggerImport} decides it for the
+ * singleton — by the module the binding came from, not by what it is called.
+ * A local `class Logger {}` is not this package's Logger, and trusting it
+ * would let its own `newCorrelationId` mint approved IDs.
+ *
+ * Only a named import carries an exported symbol. A default or namespace
+ * import binds whatever the module chose to put there, so `import AppScope
+ * from './logging'` is not the export named `AppScope` and does not qualify as
+ * verified however the options are configured.
+ */
+function constructionProvenance(context, node) {
+  const callee = unwrap(node.callee);
+  if (!callee) return null;
+
+  const scopedNames = scopedClassNames(context);
+  const loggerNamesOfClasses = loggerClassNames(context);
+  const byName = (name) => {
+    if (scopedNames.has(name)) return 'scoped';
+    if (loggerNamesOfClasses.has(name)) return 'logger';
+    return null;
+  };
+
+  // `new M.Logger()` — the specifier check cannot see through a namespace
+  // object to learn which module the class came from, so this is a property
+  // name and nothing more. Never verified.
+  if (callee.type === 'MemberExpression') {
+    const name = staticPropertyName(context, callee);
+    if (name === null) return null;
+    const kind = byName(name);
+    return kind && { kind, verified: false };
+  }
+
+  if (callee.type !== 'Identifier') return null;
+
+  const variable = resolveVariable(context, callee);
+  const def = variable && singleDef(variable);
+
+  // A named import is the only form that carries an exported symbol. Reading
+  // `imported` means an alias still resolves to the class it aliases:
+  // `import { ScopedLogger as S }` and `new S(…)` is still a ScopedLogger.
+  if (
+    def &&
+    def.type === 'ImportBinding' &&
+    def.node.type === 'ImportSpecifier'
+  ) {
+    const kind = byName(def.node.imported?.name);
+    if (!kind) return null;
+    const source = def.parent?.source?.value;
+    return {
+      kind,
+      verified:
+        typeof source === 'string' && loggerModules(context).has(source),
+    };
+  }
+
+  // A local class, a parameter, a default or namespace import, or a binding
+  // that cannot be pinned down. The name is a hint; it is never provenance.
+  const kind = byName(callee.name);
+  return kind && { kind, verified: false };
+}
+
+/**
+ * The receiver classification for `new X(…)`.
+ *
+ * Unverified constructions resolve to `'ambiguous'` rather than `null`,
+ * matching the identifier branch above: their calls are still worth CHECKING,
+ * they are just never worth TRUSTING. The asymmetry is deliberate — a false
+ * report on a lookalike costs a suppression comment, a missed one costs a
+ * patient identifier in a log file.
+ */
+function classifyConstruction(context, node) {
+  const provenance = constructionProvenance(context, node);
+  if (!provenance) return null;
+  return provenance.verified ? provenance.kind : 'ambiguous';
 }
 
 /** Could this receiver be the Logger singleton? */
@@ -1780,8 +1961,40 @@ function describeLogCall(context, node) {
   return LOG_METHODS.has(call.method) || call.opaqueMethod ? call : null;
 }
 
-/** `Log.scoped(correlation, subsystem, metadata)` or `scope.scoped(…)`. */
+/**
+ * Anything that produces a ScopedLogger, with its arguments normalized.
+ *
+ * `Log.scoped(correlation, subsystem, metadata)` and
+ * `new ScopedLogger(logger, correlation, subsystem, metadata)` carry the same
+ * three channels; the constructor just puts the logger in front. Dropping that
+ * first argument here means both forms present `args[0]` as correlation and
+ * `args[1]` as subsystem, so the rules that read those positions cover the
+ * constructor without knowing it exists.
+ *
+ * That normalization is the fix for the half of this that receiver
+ * classification does not reach: classifying `new ScopedLogger(…)` makes later
+ * `scope.info(…)` calls checkable, but the identifiers passed to the
+ * constructor itself are already in the two unredactable channels.
+ */
 function describeScopedCall(context, node) {
+  if (node.type === 'NewExpression') {
+    // CHECKED whether or not the class can be traced to the package: an
+    // unverified `new ScopedLogger(…)` still puts its arguments in the two
+    // unredactable channels. Requiring verification here is what left the
+    // local-barrel spelling — the common one — reporting nothing.
+    const provenance = constructionProvenance(context, node);
+    if (!provenance || provenance.kind !== 'scoped') return null;
+    const args = node.arguments.slice(1);
+    return {
+      method: 'scoped',
+      receiver: provenance.verified ? 'scoped' : 'ambiguous',
+      args,
+      // A spread anywhere makes every later position unknowable — including a
+      // spread in the logger slot, which shifts everything after it.
+      spreadArgs: hasSpread(node.arguments),
+    };
+  }
+
   const call = describeCall(context, node);
   return call && call.method === 'scoped' ? call : null;
 }
@@ -1923,6 +2136,8 @@ module.exports = {
   LEVEL_METHODS,
   LOGGER_OWN_METHODS,
   LOG_METHODS,
+  RECEIVER_OPTION_PROPERTIES,
+  classifyConstruction,
   classifyReceiver,
   correlationArguments,
   describeCall,

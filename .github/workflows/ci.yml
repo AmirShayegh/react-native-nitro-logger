@@ -31,6 +31,17 @@ jobs:
       - name: Typecheck files
         run: yarn typecheck
 
+      # The documented ESLint setup, exercised the way a stranger would: packed
+      # tarball, fresh dependency tree, temp directory outside this repository.
+      #
+      # This job cannot see the bug it exists for by linting in-repo. Our own
+      # eslint.config.mjs inherits `files` and a TypeScript parser from
+      # @react-native/eslint-config, which supplies exactly what the shipped
+      # config was missing — so CI stayed green through two releases while the
+      # published config lint nothing in a TypeScript app.
+      - name: Verify the documented ESLint setup lints TypeScript
+        run: yarn check-eslint-consumer
+
       # Every ```ts block in the shipped docs, compiled against this tree.
       # A sample is the first thing a reader copies, so a renamed export should
       # break the documentation at the same moment it breaks the code rather

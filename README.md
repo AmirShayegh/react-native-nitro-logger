@@ -103,12 +103,34 @@ contract** — they are never redacted at runtime. The bundled ESLint plugin
 constrains them at build time instead, but only once you enable it: installing
 this package ships the rules, it does not apply them.
 
+<!-- eslint-setup:begin -->
+
 ```js
 // eslint.config.mjs
 import nitroLogger from 'react-native-nitro-logger/eslint-plugin';
 
-export default [nitroLogger.configs.strict];
+export default [nitroLogger.configs.strictTypeScript];
 ```
+
+<!-- eslint-setup:end -->
+
+`strictTypeScript` covers `.ts`, `.tsx` **and** JavaScript, so it is the only
+entry a React Native app needs — pick one config, not both. It needs
+`@typescript-eslint/parser` (an optional peer, no version constraint), which
+most RN apps already have via `@react-native/eslint-config`.
+
+**Used on their own, `configs.strict` and `configs.recommended` lint
+JavaScript only.** A flat config with no `files` key applies to ESLint's
+default set — `.js`, `.mjs`, `.cjs` — so on their own they never bring `.ts`
+or `.tsx` into the linted set, and `eslint .` exits 0 without a word. If some
+*other* entry in your config already matches TypeScript and supplies a parser,
+these rules do run there as well — that is incidental composition, not
+something to rely on, and it is exactly why this repository's own CI stayed
+green while the published config was inert. It holds only while that other
+entry keeps selecting TypeScript and supplying a compatible parser. Reach for
+the bare configs if your sources are JavaScript, or if you have Flow-annotated
+`.js` that the TypeScript parser would reject, in which case compose `strict`
+with your own parser.
 
 **Read [docs/PRIVACY.md](docs/PRIVACY.md) before using this in an app that
 handles regulated data.** It covers what the contract does and does not

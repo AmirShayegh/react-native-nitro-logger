@@ -1177,6 +1177,94 @@ describe('plugin configs', () => {
     ]);
   });
 
+  test('the TypeScript variants carry the same rules as their siblings', () => {
+    // Whole objects, not key lists: the docs say the variants are "the same
+    // as `strict`, in a TypeScript app", and a downgraded severity or a
+    // changed options object would break that promise while the names still
+    // matched.
+    expect(plugin.configs.recommendedTypeScript.rules).toEqual(
+      plugin.configs.recommended.rules
+    );
+    expect(plugin.configs.strictTypeScript.rules).toEqual(
+      plugin.configs.strict.rules
+    );
+  });
+
+  test('the TypeScript variants match TypeScript, and the plain ones do not', () => {
+    // The whole of C1. A flat config with no `files` applies only to ESLint's
+    // default set, so `strict` in a TypeScript app inspects nothing and exits
+    // 0 — silence that reads exactly like compliance. `scripts/check-eslint-
+    // consumer.sh` proves the end-to-end behaviour from a packed tarball;
+    // this pins the shape so the regression is visible here too.
+    for (const name of ['recommended', 'strict']) {
+      expect(plugin.configs[name].files).toBeUndefined();
+    }
+    for (const name of ['recommendedTypeScript', 'strictTypeScript']) {
+      const [pattern] = plugin.configs[name].files;
+      expect(pattern).toContain('ts');
+      expect(pattern).toContain('tsx');
+      // Covers JavaScript too, so a consumer needs one entry rather than two.
+      expect(pattern).toContain('js');
+    }
+  });
+
+  test('the parser is resolved lazily, not at import', () => {
+    // A JavaScript-only consumer never installs the optional peer. Resolving
+    // it eagerly would make importing the plugin throw for them, turning an
+    // optional peer into a hard dependency — and spreading `languageOptions`
+    // anywhere would do the same by evaluating the getter.
+    for (const name of ['recommendedTypeScript', 'strictTypeScript']) {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        plugin.configs[name].languageOptions,
+        'parser'
+      );
+      expect(typeof descriptor.get).toBe('function');
+      expect('value' in descriptor).toBe(false);
+    }
+  });
+
+  test('the parser peer constrains no version and may be absent', () => {
+    // `optional` means the package may be ABSENT; it does not stop npm
+    // checking the RANGE when it is present. These configs hand the parser
+    // straight to ESLint and never introspect it, so any floor would be an
+    // ERESOLVE waiting to happen for a consumer whose setup already works —
+    // and @react-native/eslint-config@0.78 pins parser ^7.1.1, so even a
+    // `>=8` floor would break the toolchain this package targets.
+    const pkg = require('../package.json');
+    expect(pkg.peerDependencies['@typescript-eslint/parser']).toBe('*');
+    expect(pkg.peerDependenciesMeta['@typescript-eslint/parser'].optional).toBe(
+      true
+    );
+  });
+
+  test('the missing-parser error is actionable and promises no version', () => {
+    // It must name the package and an install command, and must NOT print a
+    // range — the manifest does not enforce one, and telling someone to
+    // install a specific range would contradict what the package accepts.
+    const message = (() => {
+      try {
+        plugin.configs.strictTypeScript.languageOptions.parser;
+        return null;
+      } catch (error) {
+        return error.message;
+      }
+    })();
+
+    // The parser IS installed in this repo, so the getter resolves and there
+    // is no error to inspect. Assert the resolution instead, and leave the
+    // error text to the consumer fixture, which is the only place the parser
+    // is genuinely absent.
+    if (message === null) {
+      expect(
+        plugin.configs.strictTypeScript.languageOptions.parser
+      ).toBeTruthy();
+      return;
+    }
+    expect(message).toContain('@typescript-eslint/parser');
+    expect(message).toContain('npm install');
+    expect(message).not.toMatch(/[><]=?\s*\d+\.\d+\.\d+/);
+  });
+
   test('both configs fail closed on metadata by default', () => {
     for (const name of ['recommended', 'strict']) {
       // No options object at all: opaque metadata is an error unless the
@@ -1390,14 +1478,718 @@ describe('plugin configs', () => {
   });
 
   test('every rule declares the options it reads', () => {
+    const { RECEIVER_OPTION_PROPERTIES } = require('../eslint-plugin/shared');
+
     for (const [name, rule] of Object.entries(plugin.rules)) {
       const schema = rule.meta.schema[0];
       expect(schema.additionalProperties).toBe(false);
-      expect(Object.keys(schema.properties)).toContain('loggerNames');
+
+      // Every rule resolves receivers, so every rule must accept every
+      // receiver option. `additionalProperties: false` turns a rule that
+      // missed one into a hard config error for anyone who sets it — the
+      // rules would disagree about what a valid config is. These were
+      // hand-copied into four files before, which is exactly how that drifts.
+      for (const option of Object.keys(RECEIVER_OPTION_PROPERTIES)) {
+        expect(Object.keys(schema.properties)).toContain(option);
+      }
+
       expect(rule.meta.type).toBe('problem');
       expect(Object.keys(rule.meta.messages).length).toBeGreaterThan(0);
       expect(typeof rule.meta.docs.description).toBe('string');
       expect(name).toMatch(/^[a-z-]+$/);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * Constructing a logger
+ * ---------------------------------------------------------------------- */
+
+/**
+ * `Log.scoped()` is the documented way to get a ScopedLogger, so the rules
+ * only ever learned that one. But `ScopedLogger` is a root export whose
+ * constructor takes correlation and subsystem — the two channels the runtime
+ * cannot redact — as plain arguments, and `new ScopedLogger(Log, patient.id,
+ * `tenant-${patient.id}`)` reported NOTHING while the `.scoped()` spelling of
+ * the same thing reported three errors.
+ *
+ * These assert EXACT classifications rather than "not null". `'ambiguous'` is
+ * not null, so a truthiness check passes with the constructor unrecognized —
+ * the same shape of vacuous test the marker guard in `apiReference.test.js`
+ * had to be rewritten to avoid.
+ */
+const { Linter } = require('eslint');
+const shared = require('../eslint-plugin/shared');
+
+/** What `classifyConstruction` returns for each `new` in `code`. */
+function classificationsOf(code, options = {}) {
+  const seen = [];
+  const probe = {
+    meta: {
+      schema: [
+        {
+          type: 'object',
+          properties: shared.RECEIVER_OPTION_PROPERTIES,
+          additionalProperties: false,
+        },
+      ],
+    },
+    create(context) {
+      return {
+        NewExpression(node) {
+          seen.push(shared.classifyConstruction(context, node));
+        },
+      };
+    },
+  };
+
+  // Through the real Linter, so scope resolution and import bindings are the
+  // ones ESLint actually builds rather than a hand-made stand-in.
+  const messages = new Linter().verify(code, {
+    plugins: { probe: { rules: { probe } } },
+    languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+    rules: { 'probe/probe': ['error', options] },
+  });
+  const fatal = messages.filter((m) => m.fatal);
+  if (fatal.length)
+    throw new Error(`fixture did not parse: ${fatal[0].message}`);
+
+  return seen;
+}
+
+describe('constructing a logger', () => {
+  const FROM_PACKAGE = "from 'react-native-nitro-logger';";
+
+  test('an imported ScopedLogger constructs a scoped logger', () => {
+    expect(
+      classificationsOf(
+        `import { ScopedLogger } ${FROM_PACKAGE}\nnew ScopedLogger(l, 'c');`
+      )
+    ).toEqual(['scoped']);
+  });
+
+  test('an imported Logger constructs a logger', () => {
+    expect(
+      classificationsOf(`import { Logger } ${FROM_PACKAGE}\nnew Logger();`)
+    ).toEqual(['logger']);
+  });
+
+  test('an alias resolves to the class it aliases, not its local name', () => {
+    // Provenance is the exported symbol. Keying off the local binding would
+    // make `import { ScopedLogger as S }` invisible.
+    expect(
+      classificationsOf(
+        `import { ScopedLogger as S } ${FROM_PACKAGE}\nnew S(l, 'c');`
+      )
+    ).toEqual(['scoped']);
+    expect(
+      classificationsOf(`import { Logger as L } ${FROM_PACKAGE}\nnew L();`)
+    ).toEqual(['logger']);
+  });
+
+  test('the same name from another module is checked but never trusted', () => {
+    // A name is not provenance: `./phi-helpers` could export anything.
+    expect(
+      classificationsOf(
+        "import { ScopedLogger } from './phi-helpers';\nnew ScopedLogger(l, 'c');"
+      )
+    ).toEqual(['ambiguous']);
+  });
+
+  test('a local class of the same name is checked but never trusted', () => {
+    expect(
+      classificationsOf("class ScopedLogger {}\nnew ScopedLogger(l, 'c');")
+    ).toEqual(['ambiguous']);
+  });
+
+  test('a shadowing binding is never the import it shadows', () => {
+    // Provenance is resolved through the scope active at the `new`, not by
+    // spelling. If it were by spelling, any of these would inherit the
+    // outer import's trust and silence the correlation and subsystem checks
+    // on a value the resolver knows nothing about.
+    const shadows = [
+      // A parameter.
+      `import { ScopedLogger } ${FROM_PACKAGE}\nfunction f(ScopedLogger) { new ScopedLogger(l, 'c'); }`,
+      // A block-local class.
+      `import { ScopedLogger } ${FROM_PACKAGE}\n{ class ScopedLogger {} new ScopedLogger(l, 'c'); }`,
+      // A catch binding.
+      `import { ScopedLogger } ${FROM_PACKAGE}\ntry { g(); } catch (ScopedLogger) { new ScopedLogger(l, 'c'); }`,
+      // A local `const` in an inner scope.
+      `import { ScopedLogger } ${FROM_PACKAGE}\nfunction f() { const ScopedLogger = Other; new ScopedLogger(l, 'c'); }`,
+    ];
+    for (const code of shadows) {
+      expect(classificationsOf(code)).toEqual(['ambiguous']);
+    }
+  });
+
+  test('a default import is not the export that shares its name', () => {
+    // Only a named import carries an exported symbol. A default import binds
+    // whatever the module put there, so verifying it against `loggerModules`
+    // would grant trusted-constructor status on the strength of the local
+    // name alone — the exact thing the specifier check exists to prevent.
+    expect(
+      classificationsOf(
+        "import AppScope from './logging';\nnew AppScope(l, 'c');",
+        {
+          scopedClassNames: ['AppScope'],
+          loggerModules: ['./logging'],
+        }
+      )
+    ).toEqual(['ambiguous']);
+    // The named import from the identical module IS verified, so the
+    // distinction above is about the import form and nothing else.
+    expect(
+      classificationsOf(
+        "import { AppScope } from './logging';\nnew AppScope(l, 'c');",
+        { scopedClassNames: ['AppScope'], loggerModules: ['./logging'] }
+      )
+    ).toEqual(['scoped']);
+  });
+
+  test('the namespace form is explicitly unsupported, not silently trusted', () => {
+    // The specifier check cannot see through a namespace object to learn
+    // which module the class came from, so this is a property name and
+    // nothing more. Downgrading to 'ambiguous' keeps its calls checked.
+    expect(
+      classificationsOf(
+        `import * as M ${FROM_PACKAGE}\nnew M.ScopedLogger(l, 'c');`
+      )
+    ).toEqual(['ambiguous']);
+  });
+
+  test('an unrelated class is not a logger at all', () => {
+    expect(classificationsOf('class Widget {}\nnew Widget();')).toEqual([null]);
+    expect(
+      classificationsOf(`import { Widget } ${FROM_PACKAGE}\nnew Widget();`)
+    ).toEqual([null]);
+  });
+
+  test('configured class names are honoured', () => {
+    expect(
+      classificationsOf(
+        "import { AppScope } from './logging';\nnew AppScope(l, 'c');",
+        { scopedClassNames: ['AppScope'], loggerModules: ['./logging'] }
+      )
+    ).toEqual(['scoped']);
+  });
+
+  test('the new options compose with the existing ones', () => {
+    // `additionalProperties: false` means an option a rule forgot to declare
+    // is a hard config error, so the combination has to be exercised.
+    expect(
+      classificationsOf(
+        "import { AppScope } from './logging';\nnew AppScope(l, 'c');",
+        {
+          loggerNames: ['Log', 'logger'],
+          loggerModules: ['./logging'],
+          singletonName: 'Log',
+          loggerClassNames: ['AppLogger'],
+          scopedClassNames: ['AppScope'],
+        }
+      )
+    ).toEqual(['scoped']);
+  });
+});
+
+describe('the constructor reaches the same channels as scoped()', () => {
+  // End-to-end through the real rules, because classification alone does not
+  // prove the rules consume the resulting argument shape. `new ScopedLogger`
+  // puts the logger first, so correlation and subsystem sit one position
+  // later than in `Log.scoped(...)`.
+  const IMPORTS =
+    "import { Log, ScopedLogger } from 'react-native-nitro-logger';";
+
+  ruleTester.run(
+    'no-derived-correlation',
+    plugin.rules['no-derived-correlation'],
+    {
+      valid: [
+        `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'checkout');`,
+      ],
+      invalid: [
+        {
+          code: `${IMPORTS}\nnew ScopedLogger(Log, patient.id, 'checkout');`,
+          errors: [{ messageId: 'derived' }],
+        },
+        {
+          code: `${IMPORTS}\nnew ScopedLogger(...args);`,
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+      ],
+    }
+  );
+
+  ruleTester.run('literal-subsystem', plugin.rules['literal-subsystem'], {
+    valid: [
+      `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'checkout');`,
+    ],
+    invalid: [
+      {
+        code:
+          IMPORTS +
+          '\nnew ScopedLogger(Log, Log.newCorrelationId(), `tenant-${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+    ],
+  });
+
+  ruleTester.run(
+    'no-computed-metadata-key',
+    plugin.rules['no-computed-metadata-key'],
+    {
+      valid: [
+        `${IMPORTS}\nconst s = new ScopedLogger(Log, Log.newCorrelationId());\ns.info('ok', { statusCode: 200 });`,
+      ],
+      invalid: [
+        {
+          code: `${IMPORTS}\nconst s = new ScopedLogger(Log, Log.newCorrelationId());\ns.info('ok', { [patient.id]: 1 });`,
+          errors: [{ messageId: 'computed' }],
+        },
+      ],
+    }
+  );
+
+  ruleTester.run('no-dynamic-message', plugin.rules['no-dynamic-message'], {
+    valid: [
+      `${IMPORTS}\nconst s = new ScopedLogger(Log, Log.newCorrelationId());\ns.info('admitted');`,
+    ],
+    invalid: [
+      {
+        code:
+          IMPORTS +
+          '\nconst s = new ScopedLogger(Log, Log.newCorrelationId());\ns.info(`patient ${p.name}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+    ],
+  });
+
+  // The constructor's fourth argument is the scope's DEFAULT metadata: it
+  // rides every message the scope emits, so a computed key there leaks once
+  // per log line. `describeScopedCall` normalizes it into `args[2]`, but that
+  // only helps a rule that actually visits `NewExpression` — this one did not,
+  // so the constructor spelling went unreported while `Log.scoped()` with the
+  // identical object was caught.
+  ruleTester.run(
+    'no-computed-metadata-key',
+    plugin.rules['no-computed-metadata-key'],
+    {
+      valid: [
+        `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'sub', { statusCode: 200 });`,
+        // Stating there is no metadata is what the runtime sees too.
+        `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'sub', undefined);`,
+      ],
+      invalid: [
+        {
+          code: `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'sub', { [patient.id]: 1 });`,
+          errors: [{ messageId: 'computed' }],
+        },
+        {
+          code: `${IMPORTS}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'sub', { ...patient });`,
+          errors: [{ messageId: 'spread' }],
+        },
+      ],
+    }
+  );
+});
+
+describe('a ScopedLogger reached through a local barrel is still checked', () => {
+  /*
+   * `export { ScopedLogger } from 'react-native-nitro-logger'` in an app's own
+   * `src/logging.ts` is the ordinary way React Native apps centralise this —
+   * arguably more common than importing the package directly. The class is the
+   * genuine one, but the specifier says `./logging`, so provenance cannot be
+   * verified.
+   *
+   * The first cut of this fix treated unverified as "not a ScopedLogger", and
+   * these all reported NOTHING while the `Log.scoped(...)` spelling of the same
+   * leak reported `derived` — the C2 defect reproduced one layer in. Checking
+   * is decided by what the arguments reach; only TRUST needs provenance.
+   */
+  const BARREL = "import { ScopedLogger, Log } from './logging';";
+
+  ruleTester.run(
+    'no-derived-correlation',
+    plugin.rules['no-derived-correlation'],
+    {
+      valid: [
+        {
+          // The escape hatch, and the reason it has to be pinned: naming the
+          // barrel in `loggerModules` restores trust, so the encouraged form
+          // stops reporting. Only the rejecting cases were pinned before, and
+          // a provenance change could have left this configured path broken
+          // with the suite still green.
+          code: `${BARREL}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'checkout');`,
+          options: [{ loggerModules: ['./logging'] }],
+        },
+      ],
+      invalid: [
+        {
+          code: `${BARREL}\nnew ScopedLogger(Log, patient.id, 'checkout');`,
+          errors: [{ messageId: 'derived' }],
+        },
+        {
+          // Unconfigured, the correct spelling is still reported: `Log` from
+          // an unverified module is not a trusted mint. Conservative and
+          // deliberate — and identical to what `Log.scoped()` has always done
+          // through an unconfigured barrel, so the constructor is consistent
+          // rather than newly strict.
+          code: `${BARREL}\nnew ScopedLogger(Log, Log.newCorrelationId(), 'checkout');`,
+          errors: [{ messageId: 'derived' }],
+        },
+      ],
+    }
+  );
+
+  ruleTester.run('literal-subsystem', plugin.rules['literal-subsystem'], {
+    valid: [],
+    invalid: [
+      {
+        code: BARREL + '\nnew ScopedLogger(Log, c, `tenant-${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+    ],
+  });
+
+  ruleTester.run(
+    'no-computed-metadata-key',
+    plugin.rules['no-computed-metadata-key'],
+    {
+      valid: [],
+      invalid: [
+        {
+          code: `${BARREL}\nnew ScopedLogger(Log, c, 'sub', { [patient.id]: 1 });`,
+          errors: [{ messageId: 'computed' }],
+        },
+      ],
+    }
+  );
+
+  test('a same-named class from an unrelated library is checked too', () => {
+    // The deliberate cost of checking unverified constructions: `Logger` is a
+    // common class name, so `new Logger()` from another logging library gets
+    // its later calls checked as well.
+    //
+    // That is defensible rather than accidental. These rules do not protect
+    // this package's API, they enforce "no interpolated log messages in this
+    // codebase" — and under `strict`, in an app handling PHI, a variable
+    // interpolated into tslog's output leaks exactly as much as one
+    // interpolated into ours. The line is drawn at "looks like a logger":
+    // an unrelated `Widget` is left alone entirely.
+    const run = (code, options = {}) =>
+      new Linter()
+        .verify(code, {
+          plugins: { n: plugin },
+          languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+          rules: { 'n/no-dynamic-message': ['error', options] },
+        })
+        .map((m) => m.messageId);
+
+    const OTHER_LIB =
+      "import { Logger } from 'tslog';\n" +
+      'const log = new Logger();\n' +
+      'log.info(`user ${id}`);';
+
+    expect(run(OTHER_LIB)).toEqual(['dynamic']);
+    // Nothing that does not look like a logger is touched.
+    expect(
+      run(
+        "import { Widget } from 'x';\nconst w = new Widget();\nw.info(`user ${id}`);"
+      )
+    ).toEqual([]);
+    // And the escape hatch genuinely narrows it, so a project that wants only
+    // its own class checked can say so.
+    expect(run(OTHER_LIB, { loggerClassNames: ['AppLogger'] })).toEqual([]);
+  });
+
+  test('checking it does not also mean trusting it', () => {
+    // The barrel class is checked, but it is not proof that nothing writes
+    // through what it is handed, so it must NOT buy the escape exemption the
+    // verified constructor gets.
+    const messages = new Linter().verify(
+      `${BARREL}\nconst MESSAGES = { start: 'started' };\n` +
+        "new ScopedLogger(Log, 'c', 'sub', MESSAGES);\n" +
+        'Log.info(MESSAGES.start);',
+      {
+        plugins: { n: plugin },
+        languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+        rules: { 'n/no-dynamic-message': 'error' },
+      }
+    );
+    expect(messages.map((m) => m.messageId)).toEqual(['dynamic']);
+  });
+});
+
+describe('constructing does not launder a binding', () => {
+  // Handing a value to `new X(…)` is normally an escape: X can write through
+  // the reference before a later call reads it. Recognizing the package's own
+  // constructors had to carve one exemption out of that, and the exemption
+  // must stay exactly one constructor wide.
+  //
+  // The carve-out exists because without it `new ScopedLogger(Log, …)` made
+  // `Log` escape, which cost it the trust `Log.newCorrelationId()` needs — so
+  // the *encouraged* form of the constructor reported a derived correlation
+  // ID. A rule that fires on correct code is a rule that gets disabled.
+  ruleTester.run('no-dynamic-message', plugin.rules['no-dynamic-message'], {
+    valid: [
+      // The package's own constructor cannot rewrite what it is handed.
+      "import { Log, ScopedLogger } from 'react-native-nitro-logger';\n" +
+        "const MESSAGES = { start: 'started' };\n" +
+        "new ScopedLogger(Log, 'c', 'sub', MESSAGES);\n" +
+        'Log.info(MESSAGES.start);',
+    ],
+    invalid: [
+      {
+        // Any other constructor is a function we cannot see inside.
+        code:
+          `${IMPORT_LOG}\n` +
+          "const MESSAGES = { start: 'started' };\n" +
+          'new Registry(MESSAGES);\n' +
+          'Log.info(MESSAGES.start);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        // A same-named constructor from somewhere else is not the package's.
+        code:
+          `${IMPORT_LOG}\n` +
+          "import { ScopedLogger } from './phi-helpers';\n" +
+          "const MESSAGES = { start: 'started' };\n" +
+          "new ScopedLogger(Log, 'c', 'sub', MESSAGES);\n" +
+          'Log.info(MESSAGES.start);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        // The builtin-statics allowlist is for CALLS. Routing constructors
+        // through `callCanMutateArguments` briefly let this through as well,
+        // which is one exemption more than the fix needs — `new Object.freeze`
+        // throws at runtime, so nothing is gained by trusting it.
+        code:
+          `${IMPORT_LOG}\n` +
+          "const MESSAGES = { start: 'started' };\n" +
+          'new Object.freeze(MESSAGES);\n' +
+          'Log.info(MESSAGES.start);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+    ],
+  });
+
+  test('the call form of the same allowlist is untouched', () => {
+    // Narrowing the constructor path must not cost `Object.freeze(M)` its
+    // exemption, which is the case the allowlist actually exists for.
+    const messages = new Linter().verify(
+      "import { Log } from 'react-native-nitro-logger';\n" +
+        "const MESSAGES = { start: 'started' };\n" +
+        'Object.freeze(MESSAGES);\n' +
+        'Log.info(MESSAGES.start);',
+      {
+        plugins: { n: plugin },
+        languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+        rules: { 'n/no-dynamic-message': 'error' },
+      }
+    );
+    expect(messages).toEqual([]);
+  });
+});
+
+describe('every constructible logger is classified', () => {
+  /**
+   * The provenance twin of the `LOGGER_OWN_METHODS` pin.
+   *
+   * That one fails when the Logger grows a method nobody classified. This one
+   * fails when the package grows a *class* you can construct a logger from and
+   * nobody taught `classifyConstruction` about it — which is how the
+   * `ScopedLogger` constructor went unguarded through two releases while
+   * `Log.scoped()` was covered.
+   *
+   * Derived from the real export list rather than a written-down list, so it
+   * cannot be satisfied by remembering to update it.
+   */
+  const { LOG_METHODS } = require('../eslint-plugin/shared');
+  const ts = require('typescript');
+  const { readdirSync, readFileSync } = require('fs');
+  const { join } = require('path');
+
+  /**
+   * Every exported class under `src/`, with the names it extends.
+   *
+   * Read from the source text rather than by importing: `src/index.tsx` pulls
+   * in `react-native-nitro-modules`, which needs a TurboModule that does not
+   * exist in this environment. Scanning the whole tree rather than following
+   * `src/index.tsx` is deliberate and errs wide — a class is found wherever it
+   * lives, so a new logger cannot hide behind a barrel that has not re-exported
+   * it yet. The cost is that a class exported from a module the package never
+   * re-exports is guarded too, which is the harmless direction.
+   *
+   * Handled: an `export` modifier or a later `export { X }`; an emitting
+   * method or a property holding a function; and `extends` through a
+   * qualified name or a renamed import.
+   *
+   * NOT handled, because this is syntax rather than a resolved program: a base
+   * class reached through a namespace import (`import * as m; extends m.X`),
+   * `export * from`, or a base class whose name collides across two files.
+   * Those would need a real `ts.Program` and a TypeChecker. The failure mode
+   * is a new emitting class going unguarded, so this is a floor on coverage,
+   * not a proof of completeness.
+   */
+  function exportedClasses(dir) {
+    const found = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        found.push(...exportedClasses(path));
+        continue;
+      }
+      if (!/\.tsx?$/.test(entry.name)) continue;
+
+      const file = ts.createSourceFile(
+        path,
+        readFileSync(path, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX
+      );
+
+      // `export { AuditLogger }` further down the file exports just as much as
+      // an `export` modifier on the declaration.
+      const exportedLater = new Set();
+      // `import { Logger as BaseLogger }` — the heritage clause names the
+      // local alias, so `extends BaseLogger` has to resolve back to `Logger`
+      // or an inherited emitter looks like an unrelated base class.
+      const importAliases = new Map();
+      for (const node of file.statements) {
+        if (ts.isExportDeclaration(node) && node.exportClause) {
+          if (ts.isNamedExports(node.exportClause)) {
+            for (const el of node.exportClause.elements) {
+              exportedLater.add((el.propertyName ?? el.name).text);
+            }
+          }
+          continue;
+        }
+        if (ts.isImportDeclaration(node) && node.importClause?.namedBindings) {
+          const bindings = node.importClause.namedBindings;
+          if (ts.isNamedImports(bindings)) {
+            for (const el of bindings.elements) {
+              if (el.propertyName) {
+                importAliases.set(el.name.text, el.propertyName.text);
+              }
+            }
+          }
+        }
+      }
+
+      for (const node of file.statements) {
+        if (!ts.isClassDeclaration(node) || !node.name) continue;
+        const exported =
+          (ts.getModifiers(node) ?? []).some(
+            (m) => m.kind === ts.SyntaxKind.ExportKeyword
+          ) || exportedLater.has(node.name.text);
+        if (!exported) continue;
+
+        // A method, or a property holding a function — `info = (m) => …` is
+        // as much an emitting method to a caller as `info(m) { … }`.
+        const declaresEmitter = node.members.some((m) => {
+          const named =
+            m.name && ts.isIdentifier(m.name) && LOG_METHODS.has(m.name.text);
+          if (!named) return false;
+          if (ts.isMethodDeclaration(m)) return true;
+          return (
+            ts.isPropertyDeclaration(m) &&
+            !!m.initializer &&
+            (ts.isArrowFunction(m.initializer) ||
+              ts.isFunctionExpression(m.initializer))
+          );
+        });
+
+        // `extends Logger`, `extends BaseLogger` (an alias), and
+        // `extends logging.Logger` all name the same base. Take the rightmost
+        // identifier of a qualified expression, then map any local alias back
+        // to the symbol it was imported under.
+        const baseName = (expression) => {
+          if (ts.isIdentifier(expression)) return expression.text;
+          if (
+            ts.isPropertyAccessExpression(expression) &&
+            ts.isIdentifier(expression.name)
+          ) {
+            return expression.name.text;
+          }
+          return null;
+        };
+
+        const extendsNames = (node.heritageClauses ?? [])
+          .filter((h) => h.token === ts.SyntaxKind.ExtendsKeyword)
+          .flatMap((h) => h.types.map((t) => baseName(t.expression)))
+          .filter(Boolean)
+          .map((name) => importAliases.get(name) ?? name);
+
+        found.push({ name: node.name.text, declaresEmitter, extendsNames });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Classes that emit, including by inheritance.
+   *
+   * A subclass that adds nothing still reaches every destination its base
+   * does, so `class AuditLogger extends Logger {}` has to be classified even
+   * though it declares no method of its own.
+   */
+  function emittingClasses(classes) {
+    const emitting = new Set(
+      classes.filter((c) => c.declaresEmitter).map((c) => c.name)
+    );
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const c of classes) {
+        if (emitting.has(c.name)) continue;
+        if (c.extendsNames.some((base) => emitting.has(base))) {
+          emitting.add(c.name);
+          changed = true;
+        }
+      }
+    }
+    return [...emitting];
+  }
+
+  const declared = exportedClasses(join(__dirname, '..', 'src'));
+  const loggerClasses = emittingClasses(declared).sort();
+
+  test('the source scan found the classes it is meant to guard', () => {
+    // Without this the loop below passes vacuously on an empty list.
+    expect(loggerClasses).toEqual(['Logger', 'ScopedLogger']);
+  });
+
+  test('inheritance is followed transitively and survives a cycle', () => {
+    // The fixed-point loop is what makes a subclass that declares nothing
+    // still count. It runs over syntax, so a cycle — which TypeScript itself
+    // rejects, but a malformed tree can contain — must terminate rather than
+    // hang the suite.
+    expect(
+      emittingClasses([
+        { name: 'Logger', declaresEmitter: true, extendsNames: [] },
+        {
+          name: 'AuditLogger',
+          declaresEmitter: false,
+          extendsNames: ['Logger'],
+        },
+        // Two levels down, and via an alias the scan already resolved.
+        {
+          name: 'TenantLogger',
+          declaresEmitter: false,
+          extendsNames: ['AuditLogger'],
+        },
+        { name: 'Unrelated', declaresEmitter: false, extendsNames: ['Widget'] },
+        { name: 'A', declaresEmitter: false, extendsNames: ['B'] },
+        { name: 'B', declaresEmitter: false, extendsNames: ['A'] },
+      ]).sort()
+    ).toEqual(['AuditLogger', 'Logger', 'TenantLogger']);
+  });
+
+  test.each(loggerClasses)('new %s() is classified, not ignored', (name) => {
+    const [classification] = classificationsOf(
+      `import { ${name} } from 'react-native-nitro-logger';\nnew ${name}(a, 'c');`
+    );
+    // Exact, not truthy: 'ambiguous' is truthy and would mean the class was
+    // recognized by NAME only, with its provenance never established.
+    expect(['logger', 'scoped']).toContain(classification);
   });
 });

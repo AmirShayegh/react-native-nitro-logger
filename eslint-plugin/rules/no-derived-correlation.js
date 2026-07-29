@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  RECEIVER_OPTION_PROPERTIES,
   correlationArguments,
   describeLogCall,
   describeScopedCall,
@@ -93,9 +94,7 @@ module.exports = {
       {
         type: 'object',
         properties: {
-          loggerNames: { type: 'array', items: { type: 'string' } },
-          loggerModules: { type: 'array', items: { type: 'string' } },
-          singletonName: { type: 'string' },
+          ...RECEIVER_OPTION_PROPERTIES,
         },
         additionalProperties: false,
       },
@@ -134,7 +133,22 @@ module.exports = {
       context.report({ node, messageId: 'derived' });
     }
 
+    // `new ScopedLogger(logger, correlation, …)` puts a correlation ID in the
+    // same channel `Log.scoped()` does. `describeScopedCall` normalizes the
+    // argument positions, so the check below is the same one.
+    function checkScopedConstruction(node) {
+      const scoped = describeScopedCall(context, node);
+      if (!scoped) return;
+      if (scoped.spreadArgs) {
+        context.report({ node, messageId: 'unanalyzable' });
+        return;
+      }
+      if (scoped.args.length > 0) check(scoped.args[0]);
+    }
+
     return {
+      NewExpression: checkScopedConstruction,
+
       CallExpression(node) {
         const scoped = describeScopedCall(context, node);
         if (scoped) {

@@ -171,15 +171,37 @@ not hold for your codebase.
 | `correlation` | must come from `Log.newCorrelationId()` | `no-derived-correlation` |
 | `subsystem` | literal constant | `literal-subsystem` |
 
+<!-- eslint-setup:begin -->
+
 ```js
 // eslint.config.mjs
 import nitroLogger from 'react-native-nitro-logger/eslint-plugin';
 
-export default [nitroLogger.configs.strict];
+export default [nitroLogger.configs.strictTypeScript];
 ```
+
+<!-- eslint-setup:end -->
 
 `recommended` enables the first two. `strict` enables all four and is what the
 telehealth profile means.
+
+**Use the `TypeScript` variant, and check that it is the one you have.** The
+bare `strict` and `recommended` configs carry no `files` key, so under ESLint
+flat config they select only `.js`, `.mjs` and `.cjs`. Used on their own in a
+TypeScript app they inspect nothing, report nothing, and exit 0 — which reads
+exactly like compliance. Every rule here guards a field the runtime *cannot*
+redact, so that silence is the whole protection gone. `strictTypeScript` sets
+the file set and the parser; it covers JavaScript too, so it is the only entry
+needed.
+
+A file-less config *does* apply to a TypeScript file that some other entry in
+your config already selects and supplies a parser for. That is what masked
+this defect in our own repository, where `@react-native/eslint-config`
+provided both. Do not rely on it: it lasts only as long as that other entry
+keeps selecting TypeScript and supplying a compatible parser, which is another
+package's decision to change. **Confirm the rules fire on your own code**: interpolate a
+variable into a `Log.info` message in a `.ts` file and check that it is
+reported.
 
 The rules reject variables, concatenation, template interpolation, calls,
 conditionals and dynamic thunk bodies in the message position. There are
