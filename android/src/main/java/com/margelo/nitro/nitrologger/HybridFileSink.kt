@@ -3,6 +3,8 @@ package com.margelo.nitro.nitrologger
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
 import java.io.File
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * The Nitro adapter. Everything interesting is in [LogFileWriter]; this
@@ -15,7 +17,50 @@ import java.io.File
  */
 @DoNotStrip
 class HybridFileSink : HybridFileSinkSpec() {
+  /**
+   * Guards [handle] and [mayHaveArtifacts] together, matching the iOS adapter.
+   *
+   * They have to move under one lock rather than being individually volatile:
+   * the question `clearLogs` asks is the *pair* — no handle AND nothing was
+   * ever created. Reading them separately lets a close land in between and
+   * produce "no handle, never opened", which is the one answer that is never
+   * true and the one that reports a durable purge over surviving files.
+   */
+  private val lock = ReentrantLock()
   private var handle: LogFileHandle? = null
+
+  /**
+   * Whether this sink may have put anything on disk.
+   *
+   * A null handle conflates two states that owe the caller opposite answers:
+   * nothing was ever created, and the files are still there but out of reach.
+   *
+   * Set *before* the acquisition attempt, not after it succeeds. Acquiring
+   * creates the log directory and can then fail on the file itself, so a throw
+   * is not evidence that nothing was written — and this flag exists precisely
+   * to keep a later purge from claiming otherwise. Never cleared: closing
+   * releases the handle, it does not unmake the files.
+   */
+  private var mayHaveArtifacts = false
+
+  /**
+   * An [open] past its check and inside `acquire`.
+   *
+   * Published so a second open is refused instead of racing to install a handle
+   * over the first one's, and so [close] can tell "nothing here" from
+   * "something is on its way".
+   */
+  private var opening = false
+
+  /**
+   * A [close] that arrived while [opening] was true.
+   *
+   * That close had no handle to flush and has already returned; this tells the
+   * in-flight open to throw away what it acquired rather than install it.
+   */
+  private var closePending = false
+
+  private fun current(): LogFileHandle? = lock.withLock { handle }
 
   override val defaultLogDirectory: String
     get() {
@@ -30,21 +75,56 @@ class HybridFileSink : HybridFileSinkSpec() {
     }
 
   override fun open(path: String, rotation: RotationConfig?, lineFramed: Boolean?) {
-    if (handle != null) {
-      throw LogWriterException(
-        LogWriterException.Kind.CONFIG_CONFLICT,
-        "this sink is already open"
-      )
+    lock.withLock {
+      // `opening` counts as open. Acquisition does real I/O — creates the
+      // directory, opens the file, may scan a torn tail — so the lock is not
+      // held across it, or every `getStatus` would queue behind disk latency,
+      // which is the one thing that call must not do. The in-flight attempt is
+      // published instead, and a second one is refused rather than allowed to
+      // acquire a writer that would overwrite the first: the loser's handle
+      // would be unreachable, and unreachable means a later purge never
+      // deletes its files.
+      if (handle != null || opening) {
+        throw LogWriterException(
+          LogWriterException.Kind.CONFIG_CONFLICT,
+          "this sink is already open"
+        )
+      }
+      opening = true
+      closePending = false
+      // Before the attempt: see [mayHaveArtifacts].
+      mayHaveArtifacts = true
     }
-    handle = LogWriterRegistry.shared.acquire(
-      path = path,
-      policy = policyOf(rotation),
-      // Absent means absent: without a declared one-record-per-line contract
-      // the startup scan must not trim a trailing record, because it cannot
-      // tell a torn one from an intentional newline.
-      lineFramed = lineFramed ?: false,
-      platform = AndroidPlatformIo
-    )
+
+    val acquired = try {
+      LogWriterRegistry.shared.acquire(
+        path = path,
+        policy = policyOf(rotation),
+        // Absent means absent: without a declared one-record-per-line contract
+        // the startup scan must not trim a trailing record, because it cannot
+        // tell a torn one from an intentional newline.
+        lineFramed = lineFramed ?: false,
+        platform = AndroidPlatformIo
+      )
+    } catch (e: Throwable) {
+      // Failed attempts have to clear the flag, or a retry is refused forever.
+      lock.withLock { opening = false }
+      throw e
+    }
+
+    val abandon = lock.withLock {
+      opening = false
+      val pending = closePending
+      closePending = false
+      // A close that arrived mid-acquisition found nothing to hand back and has
+      // already returned. Installing now would leave a live writer holding a
+      // descriptor nothing can reach or release.
+      if (!pending) handle = acquired
+      pending
+    }
+
+    // Zero deadline: the caller has already been told this sink is closed.
+    if (abandon) acquired.close(0.0)
   }
 
   private fun policyOf(rotation: RotationConfig?): LogRotationPolicy {
@@ -60,7 +140,7 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   override fun appendBatch(batch: String, entryCount: Double): AppendResult {
-    val live = handle ?: return AppendResult(
+    val live = current() ?: return AppendResult(
       false, RejectReason.CLOSED, 0.0, 0.0, 0.0, 0.0
     )
     // Refused rather than coerced, matching `Int(exactly:)` on iOS. A count
@@ -90,7 +170,7 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   override fun getStatus(): SinkStatus {
-    val live = handle ?: return SinkStatus(0.0, 0.0, 0.0, 0.0)
+    val live = current() ?: return SinkStatus(0.0, 0.0, 0.0, 0.0)
     val status = live.status()
     return SinkStatus(
       status.queuedBytes.toDouble(),
@@ -101,15 +181,23 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   override fun flush(deadlineMs: Double): FlushOutcome {
-    val live = handle ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
+    val live = current() ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
     return outcomeOf(live.flush(deadlineMs))
   }
 
   override fun close(deadlineMs: Double): FlushOutcome {
-    val live = handle ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
-    val outcome = live.close(deadlineMs)
-    handle = null
-    return outcomeOf(outcome)
+    // Detached before the close runs, so a concurrent caller cannot pick up a
+    // handle that is on its way out.
+    val live = lock.withLock {
+      val current = handle
+      handle = null
+      // Nothing to close, but an acquisition is in flight and will finish after
+      // this returns. Recording the intent keeps that writer from being
+      // installed into a sink the caller has already closed.
+      if (current == null && opening) closePending = true
+      current
+    } ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return outcomeOf(live.close(deadlineMs))
   }
 
   private fun outcomeOf(outcome: LogFlushOutcome) = FlushOutcome(
@@ -123,10 +211,25 @@ class HybridFileSink : HybridFileSinkSpec() {
   )
 
   override fun getLogFilePaths(): Array<String> =
-    handle?.logFilePaths()?.toTypedArray() ?: emptyArray()
+    current()?.logFilePaths()?.toTypedArray() ?: emptyArray()
 
   override fun clearLogs(deadlineMs: Double): ClearOutcome {
-    val live = handle ?: return ClearOutcome(0.0, emptyArray(), true, false)
+    // Never opened: nothing was created, so "every artifact is gone" holds
+    // vacuously. Opened and since closed: the files are still on disk and this
+    // object cannot reach them, so the only honest answer is `durable = false`.
+    // The registry draws the same distinction for a released handle, but
+    // `close` nils the handle below before that branch is reachable.
+    //
+    // Reporting a durable purge over surviving files is the worst lie this API
+    // can tell: the caller asking is the one deleting patient data on request.
+    //
+    // Both fields are read in one critical section: a close landing between two
+    // separate reads would show "no handle, nothing created", which is the one
+    // combination that is never true and the one that lies in the dangerous
+    // direction.
+    val live = lock.withLock {
+      handle ?: return ClearOutcome(0.0, emptyArray(), !mayHaveArtifacts, false)
+    }
     val outcome = live.clearLogs(deadlineMs)
     return ClearOutcome(
       outcome.deletedCount.toDouble(),

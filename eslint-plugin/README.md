@@ -204,6 +204,24 @@ Object.assign(handlers, { emit: Log.info }); // Object.assign
 Those six forms are the supported set. Anything that hands the logger to a
 function and lets the function install it is not.
 
+**Which methods are checked.** The six level helpers (`verbose`, `debug`,
+`info`, `warning`, `error`, `todo`), plus `log` and `logMessage` — the latter
+because it is public and is what every other emitting method delegates to.
+`scoped`, `subsystem` and `resetSubsystem` are checked for their own arguments.
+
+That list is not maintained by hand against memory: a test enumerates
+`Logger.prototype` and `ScopedLogger.prototype` and fails on any method that is
+neither covered by a rule nor named in an explicit not-emitting list. This
+matters because it is how coverage drifts — `logMessage` was public from the
+start, was known to the plugin as a trusted method, and was checked by nothing,
+so a `logMessage` call with an interpolated message linted clean while the
+identical `log` call errored. Adding an emitting method now fails the suite
+until somebody decides which side it falls on.
+
+Within an options object both `metadata` and `scopeMetadata` are inspected.
+They reach the same redaction path, and reading only the first left the other
+half of the same pipeline unchecked.
+
 Two more behaviours follow from taking the module boundary seriously, and both
 look strict on first contact:
 

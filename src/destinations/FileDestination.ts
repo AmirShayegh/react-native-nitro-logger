@@ -256,6 +256,23 @@ export class FileDestination implements LogDestination {
    * about.
    */
   purge(deadlineMs: number = DEFAULT_DEADLINE_MS): PurgeOutcome {
+    // A disposed destination has closed its sink, and a closed sink has no
+    // handle left to delete through — so this call cannot do the one thing it
+    // exists to do. Saying so is the entire point: the alternative is a
+    // `durable: true` over files that are still on disk, told to the one caller
+    // who asked because they are legally obliged to know. `removeDestination()`
+    // then a compliance purge is an ordinary sequence, not a contrived one.
+    if (this.disposed) {
+      return {
+        durable: false,
+        rebound: false,
+        deletedCount: 0,
+        failedPaths: [],
+        discardedEntries: 0,
+        discardedBytes: 0,
+      };
+    }
+
     this.fenced = true;
     const discarded = this.batcher.discard();
 

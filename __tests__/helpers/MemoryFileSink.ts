@@ -248,6 +248,19 @@ export class MemoryFileSink implements FileSinkLike {
 
   clearLogs(_deadlineMs: number): ClearOutcome {
     this.clearCalls += 1;
+    // A closed sink has no handle to delete through, and the file it wrote is
+    // still there. Both native adapters answer `durable: false` here; a double
+    // that purged anyway would let a purge-after-dispose test pass against a
+    // library that reports a successful compliance deletion over surviving
+    // files. The double has to be able to fail the way the real thing fails.
+    if (this.closed) {
+      return {
+        deletedCount: 0,
+        failedPaths: [this.openedPath ?? ''],
+        durable: false,
+        rebound: false,
+      };
+    }
     const deleted = this.writer.file.length;
     const durable = this.writer.purge();
     // Deletion succeeding and the writer being usable again are separate

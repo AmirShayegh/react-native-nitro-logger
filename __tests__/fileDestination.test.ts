@@ -525,6 +525,60 @@ describe('FileDestination — lifecycle', () => {
     expect(sink.closeCalls).toBe(1);
   });
 
+  test('purging a disposed destination reports failure, not a silent success', () => {
+    const { destination, writer } = build();
+    destination.write(entry({ message: 'on disk' }));
+    destination.dispose();
+
+    // The sequence this guards is ordinary, not contrived: remove the file
+    // destination, then honour a "delete my data" request. Answering
+    // `durable: true` there tells a caller under a legal obligation that
+    // patient data is gone while it is still sitting on disk.
+    const outcome = destination.purge(1000);
+
+    expect(outcome.durable).toBe(false);
+    expect(outcome.rebound).toBe(false);
+    expect(outcome.deletedCount).toBe(0);
+    expect(records(writer).map((r) => r.message)).toEqual(['on disk']);
+  });
+
+  test('a disposed destination does not consult the sink at all to answer a purge', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'on disk' }));
+    destination.dispose();
+
+    // `FileSinkLike` is a structural, public interface — the two adapters this
+    // package ships are not the only implementations, and one of them
+    // answering `durable: true` for a released handle must not be able to
+    // become this destination's answer. So the guard refuses locally rather
+    // than trusting whatever comes back.
+    sink.clearLogs = () => ({
+      deletedCount: 99,
+      failedPaths: [],
+      durable: true,
+      rebound: true,
+    });
+
+    const outcome = destination.purge(1000);
+
+    expect(sink.clearCalls).toBe(0);
+    expect(outcome.durable).toBe(false);
+    expect(outcome.deletedCount).toBe(0);
+    // And the fence must not lift on a lie, either.
+    expect(destination.isEnabled).toBe(false);
+  });
+
+  test('a purge that never opened anything is still durable', () => {
+    // The other side of the same distinction. Nothing was ever created, so
+    // there is nothing to delete and the vacuous answer is the true one — this
+    // is what the disposed guard above must not accidentally swallow.
+    const { destination, writer } = build();
+    const outcome = destination.purge(1000);
+
+    expect(outcome.durable).toBe(true);
+    expect(writer.file).toEqual([]);
+  });
+
   test('a closing sink that throws does not take the caller with it', () => {
     const { destination, sink } = build();
     sink.close = () => {

@@ -135,6 +135,17 @@ describe('no-dynamic-message', () => {
         errors: [{ messageId: 'dynamic' }],
       },
       { code: 'Log.info(patientName);', errors: [{ messageId: 'dynamic' }] },
+      // The bypass this rule cared about most: `logMessage` is public and is
+      // what every level helper calls, so an interpolated message through it
+      // reaches a log file by exactly the same path.
+      {
+        code: 'Log.logMessage(`patient ${id} admitted`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: "Log.logMessage(patientName, { level: 'error' });",
+        errors: [{ messageId: 'dynamic' }],
+      },
       {
         code: "Log.info('patient ' + id);",
         errors: [{ messageId: 'dynamic' }],
@@ -865,6 +876,38 @@ describe('no-computed-metadata-key', () => {
           code: "Log.scoped(...[patientId, 'sub', { [patientId]: v }]);",
           errors: [{ messageId: 'unanalyzable' }],
         },
+        // `logMessage` is what `log` delegates to, and equally public. It was
+        // absent from the rule's method set, so this exact call — identical to
+        // a `Log.log` the rule does catch — went unexamined.
+        {
+          code: "Log.logMessage('m', { metadata: { [patientId]: 'x' } });",
+          errors: [{ messageId: 'computed' }],
+        },
+        {
+          code: "Log.logMessage('m', { metadata: metadataBuiltElsewhere });",
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        // `scopeMetadata` reaches the same redaction path as `metadata` and is
+        // just as reachable from application code; reading only one of the two
+        // left half the pipeline unchecked.
+        {
+          code: "Log.log('m', { scopeMetadata: { [patientId]: 'x' } });",
+          errors: [{ messageId: 'computed' }],
+        },
+        {
+          code: "Log.logMessage('m', { scopeMetadata: { [patientId]: 'x' } });",
+          errors: [{ messageId: 'computed' }],
+        },
+        {
+          code: "Log.log('m', { scopeMetadata: { patient } });",
+          options: [{ catalog: ['state'] }],
+          errors: [{ messageId: 'unapproved', data: { key: 'patient' } }],
+        },
+        // Both fields on one call are two findings, not one.
+        {
+          code: "Log.log('m', { metadata: { [a]: 1 }, scopeMetadata: { [b]: 2 } });",
+          errors: [{ messageId: 'computed' }, { messageId: 'computed' }],
+        },
       ],
     }
   );
@@ -932,6 +975,10 @@ describe('no-derived-correlation', () => {
         },
         {
           code: "Log.log('m', { correlation: patientId });",
+          errors: [{ messageId: 'derived' }],
+        },
+        {
+          code: "Log.logMessage('m', { correlation: patientId });",
           errors: [{ messageId: 'derived' }],
         },
         {
@@ -1085,6 +1132,10 @@ describe('literal-subsystem', () => {
       },
       {
         code: "Log.log('m', { subsystem: dynamicName });",
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: "Log.logMessage('m', { subsystem: dynamicName });",
         errors: [{ messageId: 'dynamic' }],
       },
       { code: 'Log.resetSubsystem(name);', errors: [{ messageId: 'dynamic' }] },
@@ -1275,6 +1326,67 @@ describe('plugin configs', () => {
     // call the package never makes, which is the `__defineGetter__` hole.
     const extra = [...LOGGER_OWN_METHODS].filter((n) => !defined.has(n));
     expect(extra).toEqual([]);
+  });
+
+  /**
+   * The companion to the test above, and the one that would have caught
+   * `logMessage`.
+   *
+   * `LOGGER_OWN_METHODS` is about *trust* — is this method one the package
+   * wrote. `LOG_METHODS` is about *coverage* — does calling it put a
+   * public-by-contract field on the wire. `logMessage` was in the first set and
+   * missing from the second, so the plugin knew the method existed and checked
+   * nothing about its arguments. `Log.logMessage(`MRN ${x}`)` linted clean.
+   *
+   * Every emitting method must therefore be classified deliberately. Adding one
+   * to the Logger without deciding which side it falls on fails here.
+   */
+  test('every emitting method is covered by a rule, or listed as not emitting', () => {
+    const { LOG_METHODS } = require('../eslint-plugin/shared');
+    const { Logger } = require('../src/Logger');
+    const { ScopedLogger } = require('../src/ScopedLogger');
+
+    // Methods that exist on the loggers but do not put caller-supplied text
+    // into an entry. Each is here because of what it does, not because adding
+    // it made the test pass.
+    const NOT_EMITTING = new Set([
+      'addDestination', // takes a destination, no message
+      'consoleLogging', // boolean toggle
+      'flush', // deadline only
+      'metadataKeyCatalog', // key names, checked at runtime instead
+      'minimumLevel', // level only
+      'newCorrelationId', // generates, never accepts
+      'privacyDefault', // mode only
+      'redactAllMetadata', // no arguments
+      'removeDestination', // label only
+      'resetSubsystem', // covered by CONFIG_METHODS
+      'scoped', // covered by API_METHODS; creates, does not emit
+      'subsystem', // covered by CONFIG_METHODS
+      'noteFailure', // internal, takes no caller text
+      'privacySettings', // internal accessor
+    ]);
+
+    const unclassified = [];
+    for (const klass of [Logger, ScopedLogger]) {
+      for (const name of Object.getOwnPropertyNames(klass.prototype)) {
+        if (name === 'constructor' || name.startsWith('#')) continue;
+        if (typeof klass.prototype[name] !== 'function') continue;
+        if (LOG_METHODS.has(name) || NOT_EMITTING.has(name)) continue;
+        unclassified.push(name);
+      }
+    }
+
+    expect(unclassified).toEqual([]);
+
+    // And the exemption list may not drift into naming methods that no longer
+    // exist — a stale entry there would silently re-open the same hole.
+    const defined = new Set();
+    for (const klass of [Logger, ScopedLogger]) {
+      for (const name of Object.getOwnPropertyNames(klass.prototype)) {
+        defined.add(name);
+      }
+    }
+    expect([...NOT_EMITTING].filter((n) => !defined.has(n))).toEqual([]);
   });
 
   test('every rule declares the options it reads', () => {

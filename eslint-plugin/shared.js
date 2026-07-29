@@ -36,11 +36,43 @@ const LEVEL_METHODS = new Set([
   'todo',
 ]);
 
-/** Level helpers plus the generic entry point. */
-const LOG_METHODS = new Set([...LEVEL_METHODS, 'log']);
+/**
+ * Level helpers plus the generic entry points.
+ *
+ * `logMessage` is here because it is public, exported, and the thing `log`
+ * delegates to — `log(message, options)` is a one-line passthrough. Leaving it
+ * out made `Log.logMessage(`MRN ${x}`, ...)` lint clean while the identical
+ * `Log.log(...)` errored, which is not a defence-in-depth gap: message,
+ * correlation and subsystem have no runtime redaction anywhere, so these rules
+ * are the only thing standing between them and a log file.
+ *
+ * Anything emitting added to `Logger` must land in this set. That is not left
+ * to memory — see the exhaustiveness test in `__tests__/eslintPlugin.test.js`,
+ * which fails on a prototype method it cannot classify.
+ */
+const LOG_METHODS = new Set([...LEVEL_METHODS, 'log', 'logMessage']);
 
 /** Level configuration, which only the Logger singleton exposes. */
 const CONFIG_METHODS = new Set(['subsystem', 'resetSubsystem']);
+
+/**
+ * Methods whose second argument is a `LogOptions` object rather than metadata.
+ *
+ * `Log.log` is only this shape when its receiver resolves to the Logger — a
+ * ScopedLogger's `log` takes `(message, level, metadata)`. `logMessage` has no
+ * such overload, so it is always the options shape.
+ */
+const OPTIONS_METHODS = new Set(['log', 'logMessage']);
+
+/**
+ * Fields on a `LogOptions` object that carry caller metadata.
+ *
+ * Both reach `redactMetadata` and both are equally public — `scopeMetadata` is
+ * what `ScopedLogger` threads through, and nothing stops an application from
+ * passing it directly. A rule that read only `metadata` left the other half of
+ * the same pipeline unchecked.
+ */
+const METADATA_OPTION_FIELDS = ['metadata', 'scopeMetadata'];
 
 /** Every method whose arguments are public by contract. */
 const API_METHODS = new Set([...LOG_METHODS, ...CONFIG_METHODS, 'scoped']);
@@ -1813,7 +1845,11 @@ function optionsProperty(context, node, name) {
  * shape, and anything else — including an omitted argument, since a scope's
  * level is defaulted — means both have to be checked.
  */
-function logCallShape({ receiver, args }, context) {
+function logCallShape({ receiver, args, method }, context) {
+  // `logMessage` exists only on the Logger and takes exactly one shape,
+  // `(message, options)`. There is no ScopedLogger overload to disambiguate
+  // against, so it never needs the argument sniffing below.
+  if (method === 'logMessage') return 'logger';
   if (receiver === 'scoped') return 'scoped';
   if (receiver === 'logger') return 'logger';
   const second = unwrap(args[1]);
@@ -1834,7 +1870,7 @@ function metadataArguments(context, call) {
   // Spread is handled by the rule, which has the call node to report on.
   if (call.spreadArgs) return [];
   const { method, args } = call;
-  if (method !== 'log') {
+  if (!OPTIONS_METHODS.has(method)) {
     return isOmitted(context, args[1]) ? [] : [found(args[1])];
   }
 
@@ -1844,15 +1880,17 @@ function metadataArguments(context, call) {
     if (!isOmitted(context, args[2])) results.push(found(args[2]));
   }
   if (shape === 'logger' || shape === 'both') {
-    const property = optionsProperty(context, args[1], 'metadata');
-    if (property.kind !== 'absent') results.push(property);
+    for (const field of METADATA_OPTION_FIELDS) {
+      const property = optionsProperty(context, args[1], field);
+      if (property.kind !== 'absent') results.push(property);
+    }
   }
   return results;
 }
 
 /** Positions carrying an options-object field of the Logger shape. */
 function loggerOptionField(context, call, name) {
-  if (call.method !== 'log') return [];
+  if (!OPTIONS_METHODS.has(call.method)) return [];
   const shape = logCallShape(call, context);
   if (shape === 'scoped') return [];
   const property = optionsProperty(context, call.args[1], name);
@@ -1862,7 +1900,7 @@ function loggerOptionField(context, call, name) {
 /** Argument positions carrying a subsystem name. */
 function subsystemArguments(context, call) {
   const { method, receiver, args } = call;
-  if (method !== 'log') {
+  if (!OPTIONS_METHODS.has(method)) {
     // Only the Logger's level helpers take a subsystem third argument;
     // ScopedLogger inherits it and has no such parameter.
     if (!maybeLogger(receiver)) return [];
