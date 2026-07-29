@@ -394,9 +394,18 @@ final class LogSecureFileTests: LogWriterTestCase {
 
     // A decoy takes the name. Path-based verification would now be answering
     // about the decoy; the descriptor keeps answering about the real file.
+    //
+    // The decoy is built elsewhere and *renamed* into place rather than written
+    // at the path directly. That is what a real name-swap does, and it is also
+    // the only version of this that is not flaky: creating a file at a path a
+    // protected file just vacated let it intermittently come up carrying the
+    // backup-exclusion xattr, which is metadata this test exists to prove it
+    // does not have. A rename brings the decoy's own metadata with it.
     let parked = logsDirectory.appendingPathComponent("parked.txt")
     try FileManager.default.moveItem(at: original, to: parked)
-    try Data("decoy".utf8).write(to: original)
+    let impostor = logsDirectory.appendingPathComponent("impostor.txt")
+    try Data("decoy".utf8).write(to: impostor)
+    try FileManager.default.moveItem(at: impostor, to: original)
 
     XCTAssertTrue(LogSecureFile.isProtected(descriptor: fd),
                   "the protected file is still protected, whatever holds its old name")

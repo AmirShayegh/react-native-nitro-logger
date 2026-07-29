@@ -188,7 +188,7 @@ platforms is a bug report nobody can reproduce.
 
 The rows below are the places where they genuinely differ, and why. Everything
 not listed here is the same on both platforms and covered by suites that assert
-the same invariants: 112 XCTest cases and 68 JUnit cases, neither of which needs
+the same invariants: 122 XCTest cases and 102 JUnit cases, neither of which needs
 a simulator or an emulator.
 
 | Concern | iOS | Android | Consequence |
@@ -199,6 +199,28 @@ a simulator or an emulator.
 | At-rest protection | `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion flag, per artifact | `noBackupFilesDir` plus owner-only modes | **not equivalent** — see below |
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
 | Deadlines | `DispatchTime` | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently |
+| Console chunk size | 900 bytes per `os_log` entry | 3800 bytes per logcat entry | the platform limits genuinely differ; the behaviour around them — `(i/n)` markers, 8-chunk ceiling, a truncation notice that fits inside its own entry — is identical |
+| Console split boundary | grapheme clusters (`Character`) | code points | iOS also keeps combining sequences whole; Android only guarantees surrogate pairs are not cut. Both prevent replacement characters, which is the corruption that matters — see below |
+
+## Why the console split boundary differs
+
+Both platforms drop the tail of an over-long console line in silence — no
+ellipsis, no diagnostic — so both writers split it themselves and mark the
+pieces. What they will not do is split *inside a character*, because that
+produces replacement characters in the console and suggests corruption that is
+not there.
+
+iOS splits on `Character`, which is an extended grapheme cluster, so a flag
+emoji and a combining sequence both stay whole. Android splits on code points,
+which keeps surrogate pairs — the emoji — together but can separate a combining
+mark from the letter it modifies.
+
+The gap is deliberate. Matching iOS exactly means `BreakIterator` and therefore
+ICU, whose version varies by device, in the one code path that runs on every
+console line of every app. The failure it would prevent is a combining mark
+rendering on its own at a chunk boundary: visually odd, still legible, and
+still valid UTF-8. The failure both platforms *do* prevent is a half-encoded
+character, which is neither.
 
 ## At-rest protection is not equivalent
 

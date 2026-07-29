@@ -1,33 +1,23 @@
 package com.margelo.nitro.nitrologger
 
-import android.util.Log
 import com.facebook.proguard.annotations.DoNotStrip
 
 /**
  * Routes pre-formatted lines into logcat so JS entries interleave with
  * native ones. Tag = the installed category.
+ *
+ * Marshalling only. The level map and the chunking that keeps logcat from
+ * silently eating the tail of a long line live in [NativeConsoleWriter], which
+ * imports nothing from Nitro and is therefore testable — the same split the
+ * file sink uses, and for the same reason.
  */
 @DoNotStrip
 class HybridNativeConsoleSink : HybridNativeConsoleSinkSpec() {
-  private var tag: String = "NitroLogger"
+  private val writer = NativeConsoleWriter()
 
-  override fun install(subsystem: String, category: String) {
-    // logcat has no subsystem dimension; category becomes the tag.
-    tag = category
-  }
+  override fun install(subsystem: String, category: String) =
+    writer.install(subsystem, category)
 
-  override fun logBatch(levels: DoubleArray, messages: Array<String>) {
-    for (i in messages.indices) {
-      val code = if (i < levels.size) levels[i].toInt() else 2
-      val priority = when (code) {
-        0 -> Log.VERBOSE
-        1 -> Log.DEBUG
-        2 -> Log.INFO
-        3 -> Log.WARN
-        4 -> Log.ERROR
-        else -> Log.ASSERT // todo → highest visibility, mirrors os_log .fault
-      }
-      Log.println(priority, tag, messages[i])
-    }
-  }
+  override fun logBatch(levels: DoubleArray, messages: Array<String>) =
+    writer.logBatch(levels, messages)
 }

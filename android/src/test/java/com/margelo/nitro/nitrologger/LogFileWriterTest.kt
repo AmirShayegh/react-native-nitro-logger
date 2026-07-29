@@ -1,15 +1,17 @@
 package com.margelo.nitro.nitrologger
 
 import org.junit.After
+import org.junit.Assume
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 
 /**
  * The Android writer against the same invariants the Swift suite asserts.
@@ -627,16 +629,227 @@ class LogFileWriterTest {
 
   // MARK: - Secure creation
 
+  /**
+   * The actual mode bits, not `canRead()`.
+   *
+   * `canRead`/`canWrite` answer for the *current user*, so they are true of a
+   * world-readable file and of an owner-only one alike — an assertion that
+   * cannot fail is not a test, and this one used to end at `assertNotNull`.
+   *
+   * `java.nio.file` is API 26 and this library supports 24, which is why the
+   * shipped writer does not use it. That constraint does not reach the test
+   * source set: these run on a desktop JVM, and reading the mode is the only
+   * way to know the writer applied it.
+   */
+  private fun mode(file: File): Set<PosixFilePermission> =
+    Files.getPosixFilePermissions(file.toPath())
+
+  private val ownerOnlyDirectory = setOf(
+    PosixFilePermission.OWNER_READ,
+    PosixFilePermission.OWNER_WRITE,
+    PosixFilePermission.OWNER_EXECUTE
+  )
+
+  private val ownerOnlyFile = setOf(
+    PosixFilePermission.OWNER_READ,
+    PosixFilePermission.OWNER_WRITE
+  )
+
   @Test
   fun `the log directory and file are restricted to their owner`() {
-    val w = writer()
+    val w = writer(name = "sub/app.log")
+    w.write("x\n")
     w.flush(1, 500.0)
-    val file = File(directory, "app.log")
-    assertTrue(file.exists())
-    assertTrue(directory.canRead() && directory.canWrite())
-    // The negative direction is what matters, and java.io can only speak for
-    // the current user — the exact mode bits are asserted on device.
-    assertNotNull(file.absolutePath)
+    val logs = File(directory, "sub")
+
+    assertEquals(ownerOnlyDirectory, mode(logs))
+    assertEquals(ownerOnlyFile, mode(File(logs, "app.log")))
+  }
+
+  /**
+   * A directory needs the execute bit or nothing inside it can be reached by
+   * path; a file must not have it. `0700` on a file is the kind of thing that
+   * gets copied into the next project.
+   */
+  @Test
+  fun `the log file does not get the directory's execute bit`() {
+    val w = writer()
+    w.write("x\n")
+    w.flush(1, 500.0)
+
+    assertFalse(PosixFilePermission.OWNER_EXECUTE in mode(File(directory, "app.log")))
+  }
+
+  /**
+   * An archive that inherits default permissions is exactly as readable as the
+   * log it was rotated from, so rotation is the interesting case, not creation.
+   */
+  @Test
+  fun `every rotation artifact is restricted to its owner`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 64.0))
+    repeat(6) { w.write("x".repeat(40) + "\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val artifacts = directory.listFiles()!!.filter { it.isFile }
+    assertTrue("nothing rotated, so this asserted nothing", artifacts.size > 1)
+    for (artifact in artifacts) {
+      assertEquals("$artifact is readable by more than its owner",
+                   ownerOnlyFile, mode(artifact))
+    }
+  }
+
+  /** Compression stages through a `.part` file, which is just as sensitive. */
+  @Test
+  fun `a gzipped archive is restricted to its owner`() {
+    val w = writer(policy = LogRotationPolicy.of(
+      maxFileSizeBytes = 64.0, compressArchives = true))
+    repeat(6) { w.write("x".repeat(40) + "\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val gzipped = directory.listFiles()!!.filter { it.name.endsWith(".gz") }
+    assertTrue("nothing compressed, so this asserted nothing", gzipped.isNotEmpty())
+    for (archive in gzipped) assertEquals(ownerOnlyFile, mode(archive))
+  }
+
+  /**
+   * A file recreated after an external delete must not come back looser.
+   *
+   * The injected link count is what makes the reopen happen at all: the JVM
+   * `PlatformIo` answers `-1` — "cannot say" — and the writer treats that as
+   * no evidence of deletion rather than as deletion.
+   */
+  @Test
+  fun `a recreated log file is restricted to its owner`() {
+    var links = 1
+    val w = writer(platform = object : PlatformIo by PlatformIo.Jvm {
+      override fun linkCount(descriptor: java.io.FileDescriptor) = links
+    })
+    w.write("before\n")
+    w.flush(1, 500.0)
+    assertTrue(File(directory, "app.log").delete())
+    links = 0
+
+    repeat(LogFileWriterConstants.HEALTH_CHECK_STRIDE + 1) { w.write("after\n") }
+    w.flush(1, 500.0)
+    w.settleForTesting()
+
+    assertEquals(ownerOnlyFile, mode(File(directory, "app.log")))
+  }
+
+  /**
+   * `noBackupFilesDir` is the other half of the at-rest story and is asserted
+   * nowhere here on purpose: it comes from `HybridFileSink.defaultLogDirectory`
+   * via an Android `Context`, which does not exist under JUnit. It is covered
+   * by the on-device pass, not by a stub that would only restate the source.
+   */
+  @Test
+  fun `the writer reports rather than repairs a directory it cannot secure`() {
+    val w = writer(platform = object : PlatformIo by PlatformIo.Jvm {
+      override fun restrictToOwner(file: File, isDirectory: Boolean) = false
+    })
+    w.write("x\n")
+    w.flush(1, 500.0)
+
+    assertTrue(w.status(1).degraded and LogDegradation.PROTECTION != 0)
+  }
+
+  // MARK: - Degradation is reported, not guessed at
+  //
+  // `degraded` is the only channel the app has for "logging is still happening
+  // but not the way you configured it". A bit that is never set is a promise
+  // the writer silently stops keeping — so each one gets a test that produces
+  // the real failure rather than asserting the constant exists.
+
+  /**
+   * A rotation that cannot rename has to say so. Until this, only GZIP was
+   * asserted anywhere, and ROTATION, PRUNE and SIDECAR could all have been
+   * dead code.
+   */
+  @Test
+  fun `a rotation that cannot rename is recorded`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
+    w.write("before\n")
+    w.flush(1, 500.0)
+    w.settleForTesting()
+
+    // Rename needs write permission on the directory; the file itself is
+    // already open and keeps being writable through its descriptor.
+    assertTrue(directory.setWritable(false, false))
+    try {
+      w.write("0123456789012345\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+
+      assertTrue("a failed rotation went unreported",
+                 w.status(1).degraded and LogDegradation.ROTATION != 0)
+    } finally {
+      directory.setWritable(true, true)
+    }
+  }
+
+  /**
+   * An unreadable directory is not an empty one. A sweep that quietly did
+   * nothing would let retention drift with no word to the app — which for a
+   * package whose retention limit is a compliance control is the failure that
+   * matters most here.
+   */
+  @Test
+  fun `a retention sweep that cannot list the directory is recorded`() {
+    val w = writer(policy = LogRotationPolicy.of(
+      maxFileSizeBytes = 16.0, maxArchivedFilesCount = 1.0))
+    w.write("before\n")
+    w.flush(1, 500.0)
+    w.settleForTesting()
+
+    // Readable off, writable on: the rename still works, the listing does not.
+    assertTrue(directory.setReadable(false, false))
+    try {
+      // Probed HERE, not after the writes. A rotation ends in `reopen`, which
+      // re-secures the directory and hands the read bit straight back — so a
+      // check afterwards always finds it readable, and the precondition would
+      // read as unmet on every run. The only honest moment to ask is while the
+      // permission is off.
+      //
+      // `assumeTrue`, not an `if`: a root JVM can list a mode-0300 directory,
+      // and there is then no failure for the writer to report. That is an
+      // environment this invariant cannot be exercised in, and it should say
+      // so — a silent pass claims coverage the run did not have.
+      Assume.assumeTrue("this runtime can list a mode-0300 directory",
+                        directory.list() == null)
+
+      w.write("0123456789012345\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+
+      assertTrue("a sweep that could not list went unreported",
+                 w.status(1).degraded and LogDegradation.PRUNE != 0)
+    } finally {
+      directory.setReadable(true, true)
+    }
+  }
+
+  /**
+   * Losing the sidecar does not break the writer, it breaks *age-based
+   * rotation* — the clock restarts on every open, so a file configured to
+   * rotate daily may never rotate at all. Degraded, not broken, and therefore
+   * exactly the kind of thing the bitmask exists to carry.
+   */
+  @Test
+  fun `a sidecar that cannot be written is recorded`() {
+    // A directory where the sidecar file belongs: `writeText` cannot open it,
+    // whatever the permissions say, and unlike a mode this cannot be undone by
+    // the writer re-securing its own directory.
+    assertTrue(File(directory, "app.log.meta").mkdir())
+
+    val w = writer(policy = LogRotationPolicy.of(maxFileAgeSeconds = 60.0))
+    w.write("x\n")
+    w.flush(1, 500.0)
+    w.settleForTesting()
+
+    assertTrue("a sidecar that could not be written went unreported",
+               w.status(1).degraded and LogDegradation.SIDECAR != 0)
   }
 
   // MARK: - Config clamping

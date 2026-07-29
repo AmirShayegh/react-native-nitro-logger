@@ -62,6 +62,57 @@ class HybridFileSink : HybridFileSinkSpec() {
 
   private fun current(): LogFileHandle? = lock.withLock { handle }
 
+  /**
+   * The manual release, which JavaScript can call and usually does not.
+   *
+   * `@CallSuper`, so `super.dispose()` is not optional — it is what frees the
+   * C++ side.
+   */
+  override fun dispose() {
+    releaseHandle()
+    super.dispose()
+  }
+
+  /**
+   * The release that happens whether or not anything asked for one, and the
+   * reason this class needs both.
+   *
+   * A Metro reload tears the JavaScript context down without running any of
+   * it, so a JS `dispose()` is never a guarantee. Without this the writer
+   * survives the reload holding the registry slot and the descriptor, and the
+   * next `open` with a different rotation config fails `CONFIG_CONFLICT`
+   * against a sink nothing can reach to close — an every-reload failure during
+   * development. iOS gets this from `deinit`; on ART the equivalent is
+   * `finalize`, deprecated and still the only hook there is.
+   *
+   * Best effort by nature: the finalizer thread may never run this. It is a
+   * backstop under `dispose`, not a replacement for it.
+   */
+  @Suppress("removal", "DEPRECATION")
+  protected fun finalize() {
+    releaseHandle()
+  }
+
+  /**
+   * Deliberately routed through [close] rather than reaching for the handle
+   * directly. `close` is the one place that also records [closePending], and a
+   * `dispose` racing an in-flight `open` is exactly when that matters: JS can
+   * call `dispose` from another thread while `open` is inside `acquire`, and
+   * without the flag that acquisition installs a live writer into a sink
+   * nothing can reach to release. (`finalize` cannot hit that race — a thread
+   * inside `open` keeps the object reachable — but it costs nothing to be
+   * right by construction rather than by argument.)
+   *
+   * Idempotent: `close` detaches under the lock, so a second call finds
+   * nothing. Both callers above can fire for the same object.
+   *
+   * Zero deadline: a teardown must not wait on a wedged disk, and on the
+   * finalizer thread blocking would stall every other object's release.
+   */
+  private fun releaseHandle() {
+    runCatching { close(0.0) }
+  }
+
   override val defaultLogDirectory: String
     get() {
       val context = NitroModules.applicationContext
