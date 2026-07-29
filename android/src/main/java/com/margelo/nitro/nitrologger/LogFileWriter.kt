@@ -660,9 +660,22 @@ class LogFileWriter internal constructor(
 
   // MARK: - Stream liveness (executor only)
 
-  private fun writableStream(): FileOutputStream? {
+  /**
+   * The live stream, reopening if the backoff allows.
+   *
+   * [ignoringBackoff] is for the explicit-durability paths — [flush] and
+   * [close]. A caller there is asking for what is buffered to be on storage
+   * NOW, and a degraded writer sitting inside its reopen backoff would
+   * otherwise report failure and hand back nothing, with no second chance
+   * coming. That is exactly the process-death case, where the records being
+   * given up on are the ones explaining the shutdown.
+   *
+   * The parameter comes from SwiftLogger's `FileDestination`, by way of the
+   * iOS twin's `writableHandle(ignoringBackoff:)`; both ports had dropped it.
+   */
+  private fun writableStream(ignoringBackoff: Boolean = false): FileOutputStream? {
     stream?.let { return it }
-    if (monotonic() - lastReopenAttempt < REOPEN_BACKOFF_MS) return null
+    if (!ignoringBackoff && monotonic() - lastReopenAttempt < REOPEN_BACKOFF_MS) return null
     reopen()
     return stream
   }
@@ -771,7 +784,11 @@ class LogFileWriter internal constructor(
    * is the difference between `durable` and "we asked".
    */
   private fun syncNow() {
-    val live = stream
+    // Ignoring the backoff, which is the whole point: this runs only for a
+    // caller that asked for durability now. Without it a writer that lost its
+    // stream inside the backoff window reports a failed flush and reopens
+    // nothing, so the retry the caller is told to make fails the same way.
+    val live = writableStream(ignoringBackoff = true)
     if (live == null) {
       stateLock.withLock { lastSyncSucceeded = false }
       return

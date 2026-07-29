@@ -213,6 +213,33 @@ applied to every artifact, and on iOS each artifact also gets
 `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion
 flag.
 
+**A log directory the writer did not create is inspected, never changed.** The
+log path is yours to choose, and nothing stops it being a directory your app
+already owns and uses. Every protection here is a property of the *directory*
+and outlives the sink: the backup exclusion is persistent and directory-wide,
+the protection class is inherited by every file created there afterwards, and
+even `0700` strips access from a directory that may be deliberately shared with
+an app group or an extension. Point a sink at `<Documents>/app.log` and claiming
+those would silently take your whole document tree out of iCloud backup.
+
+So if the directory was already there, the writer leaves it exactly as it found
+it and reports a loose mode as a `protection` degradation for you to act on. If
+the writer created the directory, it is unambiguously the writer's and gets all
+three. *Files* are different and always get all three: a log file at the log
+path is one the writer is about to append to, rotate and purge, so it counts as
+its own even if it was already there — and a `0644` log file left by an earlier
+version is exactly the thing worth tightening. Android has nothing to scope —
+its equivalent is structural (`noBackupFilesDir`), and its `restrictToOwner`
+only sets modes.
+
+The practical consequence: **if you supply your own log directory, create it
+with the protections you want.** This applies to the iOS default too —
+`Library/Logs` is a standard system directory and may well already exist, in
+which case the writer inspects it like any other. That is not a gap: what the
+backup exclusion and the protection class are actually protecting is the log
+files, and those are the writer's own artifacts, so they get both regardless of
+who made the directory around them.
+
 Those are applied, not guaranteed. When the platform refuses, the writer records
 a `protection` bit in the `degraded` bitmask and keeps logging rather than
 failing shut — losing a mode is worth reporting, not worth dropping the app's

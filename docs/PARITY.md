@@ -219,6 +219,27 @@ are much closer, and neither is a defence against an attacker who already has
 privileged access to the device — that case is out of scope for both, and
 `docs/PRIVACY.md` says so.
 
+The platforms also differ in how much they have to *withhold*. On iOS all three
+protections — mode, protection class, backup exclusion — are applied only to a
+log directory the writer itself created; one that was already there is inspected
+and left alone, because each of them is directory-wide, outlives the sink, and
+the log path may well be a directory the host app owns and shares. Android has
+nothing to withhold at that level: `restrictToOwner` sets modes and nothing
+else, and the Auto Backup exclusion comes from living under `noBackupFilesDir`
+rather than from an attribute the writer sets. Android's Kotlin therefore still
+tightens a pre-existing log directory's mode where iOS now reports it instead.
+That is a deliberate difference and the one place the two writers' directory
+handling is not identical: the case iOS is protecting — a directory deliberately
+shared with an app group or an extension — has no Android counterpart. App
+storage there is uid-isolated with no cross-process sharing to strip, and a
+directory on external storage does not honour POSIX modes in the first place.
+Files are treated the same on both, and unlike directories they are treated as
+owned whether or not the writer created them — a log file already sitting at the
+log path is one this writer is about to append to, rotate, and purge, so it is
+its artifact by every meaning that matters, and a `0644` one full of patient
+data is worth tightening. Every writer-managed file gets everything its platform
+offers.
+
 Both platforms can also fall short of what they attempt: applying or verifying
 a mode can fail, and the writer records a `protection` degradation and keeps
 logging rather than refusing to log at all. So "owner-only modes on every

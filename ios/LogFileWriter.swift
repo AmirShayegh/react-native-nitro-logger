@@ -178,9 +178,17 @@ public final class LogWriter {
   /// Successful writes between descriptor-liveness checks.
   private static let healthCheckStride = 8
   /// How long a failed rotation waits before being attempted again.
-  private static let rotationBackoff: TimeInterval = 5
-  /// How long a failed reopen waits.
-  private static let reopenBackoff: TimeInterval = 1
+  ///
+  /// Milliseconds on the monotonic clock, not `Date`. A backoff asks "has
+  /// enough time passed since the last failure", which an NTP correction or a
+  /// user changing the date must never re-answer: a backward step of an hour
+  /// would wedge rotation — and reopening, below — for an hour. File AGE still
+  /// uses `Date`, and has to, because it is measured against a creation time
+  /// recorded on a previous run. Android already splits these two clocks; this
+  /// is the same split, and the Kotlin comment claiming iOS had it is now true.
+  private static let rotationBackoffMs: Int64 = 5_000
+  /// How long a failed reopen waits. Monotonic, for the reason above.
+  private static let reopenBackoffMs: Int64 = 1_000
   /// Longest any deadline-bounded call will wait. Well short of the watchdog
   /// window a synchronous crash-path flush has to live inside.
   private static let MAX_DEADLINE_MS = 30_000
@@ -227,8 +235,11 @@ public final class LogWriter {
   private var descriptor: Int32 = -1
   private var currentFileSize: UInt64 = 0
   private var currentFileStart = Date()
-  private var lastReopenAttempt = Date.distantPast
-  private var rotationBlockedUntil = Date.distantPast
+  /// Monotonic ms of the last reopen attempt; nil until one has been made, so
+  /// the very first attempt is never held back by an uninitialised timestamp.
+  private var lastReopenAttempt: Int64?
+  /// Monotonic ms before which rotation will not be retried.
+  private var rotationBlockedUntil: Int64 = 0
   private var writesSinceHealthCheck = 0
   /// Set by the close barrier, on this queue. Everything enqueued before the
   /// barrier still writes; everything after it is refused.
@@ -568,16 +579,39 @@ public final class LogWriter {
 
   // MARK: - Handle liveness (queue only)
 
-  private func writableHandle() -> FileHandle? {
+  /// The live descriptor, reopening if the backoff allows.
+  ///
+  /// `ignoringBackoff` is for the explicit-durability paths — `flush` and
+  /// `close`. A caller there is asking for what is buffered to be on storage
+  /// NOW, and a degraded writer sitting inside its reopen backoff would
+  /// otherwise report failure and hand back nothing, with no second chance
+  /// coming. That is exactly the `applicationWillTerminate` case, where the
+  /// records being given up on are the ones explaining the shutdown.
+  ///
+  /// Ported back from SwiftLogger, whose `FileDestination` has carried this
+  /// parameter since the crash-path work; the port dropped it.
+  private func writableHandle(ignoringBackoff: Bool = false) -> FileHandle? {
     if let handle { return handle }
-    guard Date().timeIntervalSince(lastReopenAttempt) >= Self.reopenBackoff else { return nil }
+    if !ignoringBackoff, let last = lastReopenAttempt,
+       Self.steadyMillis() - last < Self.reopenBackoffMs {
+      return nil
+    }
     attemptReopen()
     return handle
   }
 
+  /// Monotonic milliseconds since boot.
+  ///
+  /// `DispatchTime` rather than `Date` for every elapsed-time question in this
+  /// file. It cannot be moved by the user or by NTP, which is the whole point:
+  /// a clock that jumps backwards turns a one-second backoff into an outage.
+  private static func steadyMillis() -> Int64 {
+    Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+  }
+
   @discardableResult
   private func attemptReopen() -> Bool {
-    lastReopenAttempt = Date()
+    lastReopenAttempt = Self.steadyMillis()
     closeCurrentHandle()
 
     if let shortfall = try? LogSecureFile.createDirectory(at: fileURL.deletingLastPathComponent()) {
@@ -695,8 +729,14 @@ public final class LogWriter {
 
   /// Queue-confined. Records whether the data actually reached storage, which
   /// is the difference between `durable` and "we asked".
+  ///
+  /// The reopen ignores the backoff. This runs only for `flush` and the close
+  /// barrier, where the caller is asking for durability now and there is no
+  /// later attempt to fall back on — refusing to try because a failed reopen
+  /// happened half a second ago would give up on the buffer at exactly the
+  /// moment it matters most.
   private func syncNow() {
-    guard let handle else {
+    guard let handle = writableHandle(ignoringBackoff: true) else {
       stateLock.lock(); lastSyncSucceeded = false; stateLock.unlock()
       return
     }
@@ -780,7 +820,7 @@ public final class LogWriter {
 
   private func rotateIfNeeded() {
     guard let live = handle else { return }
-    guard Date() >= rotationBlockedUntil else { return }
+    guard Self.steadyMillis() >= rotationBlockedUntil else { return }
     let tooBig = currentFileSize >= policy.maxFileSizeBytes
     let tooOld = policy.maxFileAgeSeconds.map {
       Date().timeIntervalSince(currentFileStart) >= $0
@@ -802,7 +842,7 @@ public final class LogWriter {
       // a directory someone removed — would otherwise retry on every single
       // batch, turning a degraded log into a busy one.
       note(.rotation)
-      rotationBlockedUntil = Date().addingTimeInterval(Self.rotationBackoff)
+      rotationBlockedUntil = Self.steadyMillis() + Self.rotationBackoffMs
       attemptReopen()
       return
     }

@@ -505,12 +505,80 @@ class LogFileWriterTest {
     assertTrue("the writer never reopened", File(directory, "app.log").exists())
   }
 
-  @Test
-  fun `a writer with no stream reports a flush that is not durable`() {
-    val w = writer()
+  /**
+   * Arms the reopen backoff by making one reopen genuinely fail.
+   *
+   * The log directory is deleted and its *parent* made unwritable, because
+   * `reopen` re-creates the log directory itself — making that one unwritable
+   * only has `restrictToOwner` hand the permission straight back. Returns the
+   * log directory, with the parent writable again: the writer is now inside a
+   * backoff window whose obstacle is gone.
+   */
+  private fun armReopenBackoff(w: LogFileWriter, logs: File) {
     w.closeStreamForTesting()
-    val outcome = w.flush(1, 500.0)
-    assertFalse(outcome.durable)
+    assertTrue(logs.deleteRecursively())
+    assertTrue(directory.setWritable(false, false))
+    w.write("blocked\n")
+    w.settleForTesting()
+    assertFalse("precondition: the reopen has to have failed", logs.exists())
+    assertTrue(directory.setWritable(true, true))
+  }
+
+  /**
+   * A flush is a caller saying "put what is buffered on storage now", and the
+   * answer must not be "not for another second". Without the bypass a writer
+   * that lost its stream inside the backoff window reports a failed flush and
+   * reopens nothing, so the retry the caller is told to make fails identically
+   * — which on the process-death path loses the records explaining the
+   * shutdown.
+   */
+  @Test
+  fun `a flush reopens a stream lost inside the backoff window`() {
+    val logs = File(directory, "sub")
+    val w = writer(name = "sub/app.log")
+    armReopenBackoff(w, logs)
+
+    // `steady` has not moved, so the writer is still inside its backoff window.
+    val outcome = w.flush(1, 1000.0)
+
+    assertTrue("a flush must ignore the reopen backoff", outcome.durable)
+    assertTrue(File(logs, "app.log").exists())
+  }
+
+  /**
+   * The other direction, and the reason the bypass is a parameter rather than
+   * the new default: an ordinary write inside the window must still be refused,
+   * or a writer on a read-only volume retries the open on every single batch.
+   */
+  @Test
+  fun `an ordinary write still honours the backoff window`() {
+    val logs = File(directory, "sub")
+    val w = writer(name = "sub/app.log")
+    armReopenBackoff(w, logs)
+
+    w.write("still inside the window\n")
+    w.settleForTesting()
+    assertFalse("a plain write must not bypass the backoff", logs.exists())
+
+    steady += LogFileWriterConstants.REOPEN_BACKOFF_MS
+    w.write("window elapsed\n")
+    w.settleForTesting()
+    assertTrue("once the window passes the write reopens", File(logs, "app.log").exists())
+  }
+
+  /** A flush that reopens and still cannot write reports the truth. */
+  @Test
+  fun `a writer that cannot reopen reports a flush that is not durable`() {
+    val logs = File(directory, "sub")
+    val w = writer(name = "sub/app.log")
+    w.closeStreamForTesting()
+    assertTrue(logs.deleteRecursively())
+    assertTrue(directory.setWritable(false, false))
+    try {
+      assertFalse(w.flush(1, 500.0).durable)
+    } finally {
+      directory.setWritable(true, true)
+    }
   }
 
   // MARK: - Deadlines
@@ -951,4 +1019,7 @@ class LogFileWriterTest {
 /** Mirror of the writer's private stride, so the liveness test can drive past it. */
 object LogFileWriterConstants {
   const val HEALTH_CHECK_STRIDE = 8
+
+  /** Mirrors the writer's private `REOPEN_BACKOFF_MS`. */
+  const val REOPEN_BACKOFF_MS = 1_000L
 }

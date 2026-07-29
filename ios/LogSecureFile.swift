@@ -51,19 +51,98 @@ internal enum LogSecureFile {
 
   /// Creates `url` and every missing parent as owner-only directories.
   ///
-  /// `withIntermediateDirectories` applies the attributes to directories it
-  /// creates, but says nothing about ones that already exist — an app upgrade
-  /// or a restored backup can leave a `Logs` directory someone else's code
-  /// made world-readable. So the mode is asserted afterwards either way, and
-  /// then read back.
+  /// **A directory this call did not create is inspected, never changed.** The
+  /// log path is caller-supplied and nothing constrains it to a directory this
+  /// package owns — `<Documents>/app.log` is a perfectly ordinary thing to ask
+  /// for, and `Documents` belongs to the host app. Every one of the three
+  /// protections is a property of the *directory* and outlives this sink:
+  ///
+  /// - the backup exclusion is persistent and directory-wide, so claiming it
+  ///   silently takes the app's whole `Documents` tree out of iCloud backup;
+  /// - the protection class is inherited by every file created in there
+  ///   afterwards, including files this package never writes;
+  /// - even the mode is not ours. `0700` looks like harmless tightening, but it
+  ///   strips group and other access from a directory that may be deliberately
+  ///   shared — an app group, an extension, a helper process — and the app has
+  ///   no way to know we did it.
+  ///
+  /// So a pre-existing directory keeps its own policy and a loose mode comes
+  /// back as `permissions`, which the writer surfaces as a `protection`
+  /// degradation for the app to act on. Report rather than mutate is the rule
+  /// the rest of this writer already follows, and the reason the app is told at
+  /// all: a world-readable `Logs` left behind by an upgrade or a restored
+  /// backup is real, it just is not ours to silently reconfigure.
+  ///
+  /// A directory this call *creates* is unambiguously ours and gets all three.
+  ///
+  /// **Ownership is decided by `mkdir` itself, not by a check before it.** A
+  /// `lstat` that says "nothing here" is a statement about the past by the time
+  /// the directory is created, and the gap between the two is long enough for
+  /// another process to put a directory — or a symlink to one — in the way.
+  /// Losing that race means claiming somebody else's directory, which is the
+  /// whole thing this is here to prevent. `mkdir` cannot be raced: it either
+  /// creates the leaf, in which case it is ours, or it returns `EEXIST`, in
+  /// which case it is not, and the kernel decides which with no window in
+  /// between. It does not follow symlinks either, so a link already at the path
+  /// is `EEXIST` and is inspected rather than claimed through.
   @discardableResult
   static func createDirectory(at url: URL) throws -> Shortfall {
+    // Parents first, so the leaf `mkdir` has somewhere to land. The same rule
+    // applies to them by construction: `withIntermediateDirectories` gives the
+    // mode only to directories it creates and leaves existing ones alone.
     try FileManager.default.createDirectory(
-      at: url,
+      at: url.deletingLastPathComponent(),
       withIntermediateDirectories: true,
       attributes: [.posixPermissions: directoryMode]
     )
-    return secure(url, isDirectory: true)
+
+    // Subject to the umask, which is why `secure` re-asserts the mode and reads
+    // it back rather than trusting this argument.
+    if mkdir(url.path, mode_t(directoryMode)) == 0 {
+      return secure(url, isDirectory: true)
+    }
+    let failure = errno
+    guard failure == EEXIST else { throw posixError(failure, at: url) }
+
+    // `EEXIST` says something is there, not that it is a directory: a regular
+    // file, a symlink to one, or a dangling link all answer the same way. That
+    // is a configuration error and has to stay one. Reporting it as a mere
+    // shortfall would leave the sink to fail on the open a moment later, and a
+    // destination that accepts records into a path that can never hold them is
+    // worse than one that refuses to start. `stat`, not `lstat` — a symlink to
+    // a real directory is a usable directory, and is inspected like any other
+    // thing this call did not create.
+    var existing = stat()
+    if stat(url.path, &existing) != 0 {
+      // Its own errno, not a blanket `ENOTDIR`: a dangling link is `ENOENT`, an
+      // unreadable parent is `EACCES`, and failing storage is `EIO`. Those want
+      // different responses from whoever reads the log about the log.
+      let cause = errno
+      throw posixError(cause, at: url)
+    }
+    guard (existing.st_mode & S_IFMT) == S_IFDIR else {
+      throw posixError(ENOTDIR, at: url)
+    }
+    return inspect(url)
+  }
+
+  /// The path is safe to carry here: this error is consumed inside the writer —
+  /// `attemptReopen` discards it, and the Nitro adapter replaces every open
+  /// failure with a payload-free message before anything crosses into
+  /// JavaScript, precisely because a path is the kind of string that carries a
+  /// username.
+  private static func posixError(_ code: Int32, at url: URL) -> NSError {
+    NSError(domain: NSPOSIXErrorDomain, code: Int(code),
+            userInfo: [NSFilePathErrorKey: url.path])
+  }
+
+  /// What a directory we did not create falls short of, changing nothing.
+  ///
+  /// Only the mode is reportable. Whether the app excluded its own directory
+  /// from backup, or what protection class it chose, are its decisions and not
+  /// shortfalls — the writer is not entitled to an opinion on either.
+  private static func inspect(_ url: URL) -> Shortfall {
+    hasExpectedMode(url, isDirectory: true) ? [] : .permissions
   }
 
   /// Applies the protections to an artifact that already exists — an archive
@@ -73,6 +152,10 @@ internal enum LogSecureFile {
   /// preserves the source's attributes on the same volume, but says nothing
   /// about a destination created by some other means, and the whole point is
   /// that no artifact is exempt.
+  ///
+  /// Only ever called on an artifact this writer owns. `createDirectory`
+  /// decides that question for directories and does not call this when the
+  /// answer is no.
   @discardableResult
   static func secure(_ url: URL, isDirectory: Bool = false) -> Shortfall {
     var shortfall = Shortfall()

@@ -224,6 +224,58 @@ final class LogFileWriterTests: LogWriterTestCase {
     XCTAssertTrue(contents().contains("after-11\n"), "later writes reach the recreated file")
   }
 
+  /// A flush must not be refused by a backoff that exists to protect ordinary
+  /// writes.
+  ///
+  /// The reopen backoff stops a dead descriptor from being retried on every
+  /// single append. But `flush` is the caller saying "put it on storage now",
+  /// and for the crash and terminate paths there is no later attempt coming —
+  /// so honouring the backoff there gives up on exactly the records that
+  /// explain the shutdown. SwiftLogger has carried `ignoringBackoff` for this
+  /// since the crash-path work; the port dropped it.
+  func testFlushReopensInsideTheBackoffWindow() throws {
+    let handle = try makeHandle()
+    write(handle, "before\n")
+
+    // Arm the backoff with a reopen that genuinely fails. Removing the
+    // directory is not enough on its own — a reopen recreates it — so the
+    // parent is made immutable too.
+    handle.writerForTesting.closeHandleForTesting()
+    try FileManager.default.removeItem(at: logsDirectory)
+    TestFlags.makeImmutable(root)
+    write(handle, "lost\n")
+    XCTAssertFalse(
+      handle.writerForTesting.hasLiveHandleForTesting,
+      "precondition: the failed reopen armed the backoff")
+
+    // Make a reopen possible again, then ask for durability immediately —
+    // well inside the one-second window.
+    chflags(root.path, 0)
+
+    let outcome = handle.flush(deadlineMs: 1000)
+
+    XCTAssertTrue(outcome.durable, "flush ignores the backoff and reopens")
+    XCTAssertTrue(handle.writerForTesting.hasLiveHandleForTesting)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: logURL.path))
+  }
+
+  /// The other half of the same contract: an ordinary append must still be
+  /// held back, or the backoff protects nothing.
+  func testAnOrdinaryWriteStillHonoursTheBackoff() throws {
+    let handle = try makeHandle()
+    handle.writerForTesting.closeHandleForTesting()
+    try FileManager.default.removeItem(at: logsDirectory)
+    TestFlags.makeImmutable(root)
+    write(handle, "lost\n")
+
+    chflags(root.path, 0)
+
+    write(handle, "still within the window\n")
+    XCTAssertFalse(
+      handle.writerForTesting.hasLiveHandleForTesting,
+      "an append inside the window must not retry the reopen")
+  }
+
   func testWritesResumeAfterTheDescriptorIsLost() throws {
     let handle = try makeHandle()
     write(handle, "before\n")
