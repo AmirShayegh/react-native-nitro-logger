@@ -8967,11 +8967,14 @@ __metadata:
     turbo: "npm:^2.9.16"
     typescript: "npm:^6.0.3"
   peerDependencies:
+    "@typescript-eslint/parser": "*"
     eslint: ">=9.0.0"
     react: "*"
     react-native: ">=0.78.0"
     react-native-nitro-modules: ^0.36.3
   peerDependenciesMeta:
+    "@typescript-eslint/parser":
+      optional: true
     eslint:
       optional: true
   languageName: unknown
