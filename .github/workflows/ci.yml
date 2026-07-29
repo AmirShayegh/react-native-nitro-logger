@@ -63,6 +63,13 @@ jobs:
       - name: Typecheck the documentation samples
         run: yarn check-docs
 
+      # The git tag the podspec points at must be the tag the release creates.
+      # Through 0.1.2 it interpolated a bare "0.1.2" while Changesets tags
+      # `react-native-nitro-logger@0.1.2`, so a CocoaPods consumer installing
+      # from git resolved a tag that had never existed in any release.
+      - name: Check the podspec points at a tag that will exist
+        run: yarn check-podspec-tag
+
   test-js:
     runs-on: ubuntu-latest
 
@@ -164,6 +171,16 @@ jobs:
 
       - name: Bundle with --dev false and check for reveal sentinels
         run: ./scripts/check-release-bundle.sh
+
+      # The check above bundles from example/, whose metro.config.js sets
+      # `conditions: ['react-native-nitro-logger-source']` and therefore
+      # resolves src/index.tsx. A real app has only the `react-native`
+      # condition and gets lib/module/index.js — a different file, produced by
+      # a different toolchain. So the check above has never said anything about
+      # what ships. This one rebuilds lib/, packs, installs into an app outside
+      # the monorepo, and inspects the artifact that app actually bundles.
+      - name: Check the artifact consumers bundle
+        run: ./scripts/check-release-bundle-consumer.sh
 
   # Backs the "iOS ≥ 0.78" compatibility claim with an actual run.
   #

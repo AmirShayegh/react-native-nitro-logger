@@ -57,9 +57,11 @@
     "check-docs": "./scripts/check-doc-samples.sh",
     "check-eslint-consumer": "./scripts/check-eslint-consumer.sh",
     "check-package-exports": "./scripts/check-package-exports.sh",
+    "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",
     "check-doc-links": "./scripts/check-doc-links.sh",
     "changeset": "changeset",
-    "release": "yarn check-doc-links && changeset publish"
+    "check-podspec-tag": "./scripts/check-podspec-tag.sh",
+    "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish"
   },
   "keywords": [
     "react-native",

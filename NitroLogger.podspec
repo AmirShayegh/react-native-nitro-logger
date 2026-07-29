@@ -11,7 +11,12 @@ Pod::Spec.new do |s|
   s.authors      = package["author"]
 
   s.platforms    = { :ios => min_ios_version_supported }
-  s.source       = { :git => "https://github.com/AmirShayegh/react-native-nitro-logger.git", :tag => "#{s.version}" }
+  # Changesets tags releases as `<npm package name>@<version>`, so a bare
+  # version names a tag that has never existed — a CocoaPods consumer
+  # installing from git resolved nothing through 0.1.2. The name has to come
+  # from package.json, not from `s.name`: this pod is "NitroLogger" while the
+  # npm package, and therefore the tag, is "react-native-nitro-logger".
+  s.source       = { :git => "https://github.com/AmirShayegh/react-native-nitro-logger.git", :tag => "#{package["name"]}@#{s.version}" }
 
   s.source_files = [
     "ios/**/*.{swift}",
