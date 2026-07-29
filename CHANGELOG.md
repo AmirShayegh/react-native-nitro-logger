@@ -1,5 +1,25 @@
 # react-native-nitro-logger
 
+## 0.1.2
+
+### Patch Changes
+
+- The published ESLint config now lints TypeScript, and `new ScopedLogger(...)` is checked.
+
+  `configs.recommended` and `configs.strict` carry no `files` key, so under ESLint
+  flat config they select only `.js`, `.mjs` and `.cjs`. In a React Native app the
+  documented setup therefore matched nothing and `eslint .` exited 0 in silence —
+  and message text, correlation IDs and subsystems have no runtime redaction, so
+  those rules were the whole protection. Use **`configs.strictTypeScript`** (or
+  `recommendedTypeScript`), which set the file set and the parser and cover
+  JavaScript too, so one entry is enough. `@typescript-eslint/parser` is an
+  optional peer with no version constraint.
+
+  `new ScopedLogger(logger, correlation, subsystem, metadata)` reaches the same
+  unredactable channels as `logger.scoped(...)` and was reported on by nothing;
+  all four rules now check both spellings, including a `ScopedLogger` re-exported
+  through your own barrel.
+
 ## 0.1.1
 
 ### Patch Changes
