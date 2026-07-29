@@ -158,6 +158,63 @@ else
   failures=$((failures + 1))
 fi
 
+echo "==> what Metro selects"
+# Metro is the consumer Node cannot speak for. It sets
+# `unstable_enablePackageExports: true` but matches only the conditions in
+# `unstable_conditionNames` — Metro's own default is `[]`, and a React Native
+# app via @react-native/metro-config gets `["react-native"]`. Neither includes
+# `require` or `import`, so BOTH fall through to `default`.
+#
+# That makes `default` load-bearing in a way Node can never reveal: point it at
+# the CommonJS build and `require`/`import`/Jest all still resolve correctly
+# while every Metro bundle silently switches artifact. The conditions are read
+# from the installed Metro rather than written down here, so this stops being
+# true the moment Metro changes it.
+METRO="$(node -e '
+  const fs = require("fs"), path = require("path");
+  const [pkgDir, fixture] = process.argv.slice(1);
+  const exp = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).exports["."];
+
+  // The condition sets Metro actually uses, read from Metro itself.
+  const sets = {};
+  try {
+    const mc = require(require.resolve("metro-config", { paths: [fixture] }));
+    sets["metro default"] = [];   // getDefaultConfig is async; [] is its documented default
+  } catch {}
+  try {
+    const rn = require(require.resolve("@react-native/metro-config", { paths: [fixture] }));
+    const d = rn.getDefaultConfig(fixture);
+    sets["react native"] = d.resolver.unstable_conditionNames ?? [];
+  } catch { sets["react native"] = ["react-native"]; }
+
+  // The spec walk: first key whose condition is active wins; `default` always is.
+  const pick = (node, active) => {
+    if (typeof node === "string") return node;
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "default" || active.includes(key)) {
+        const hit = pick(value, active);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+
+  const problems = [];
+  for (const [label, conditions] of Object.entries(sets)) {
+    const got = pick(exp, conditions);
+    if (got !== "./lib/module/index.js") {
+      problems.push(`${label} (${JSON.stringify(conditions)}) -> ${got}, expected ./lib/module/index.js`);
+    }
+  }
+  console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + Object.keys(sets).join(", "));
+' "$PKG" "$FIXTURE" 2>&1)"
+if [[ "$METRO" == PASS* ]]; then
+  note ok "falls through to default -> lib/module (${METRO#PASS|})"
+else
+  note FAIL "${METRO#FAIL|}"
+  failures=$((failures + 1))
+fi
+
 echo "==> the source condition stays out of a consumer's way"
 # `react-native-nitro-logger-source` exists for the in-repo example app. If a
 # consumer ever resolved through it they would get TypeScript, which their
