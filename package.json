@@ -47,6 +47,14 @@
     "!**/__mocks__",
     "!**/.*"
   ],
+  "codegenConfig": {
+    "name": "NitroLoggerSpec",
+    "type": "modules",
+    "jsSrcsDir": "./src",
+    "android": {
+      "javaPackageName": "com.margelo.nitro.nitrologger"
+    }
+  },
   "scripts": {
     "test": "jest",
     "example": "yarn workspace react-native-nitro-logger-example",

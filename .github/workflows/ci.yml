@@ -390,6 +390,17 @@ jobs:
         run: |
           yarn turbo run build:android --cache-dir="${{ env.TURBO_CACHE_DIR }}"
 
+      # The step above builds the example app in **debug**, which is what
+      # `react-native build-android` defaults to — and a debug build never
+      # compares the classes it dexes. That is how ~90 of React Native's own
+      # generated spec classes came to be compiled into this library's artifact
+      # and shipped through 0.1.3, breaking every consumer's *release* build on
+      # a duplicate-class error while this job stayed green.
+      - name: Check what the Android artifact contains
+        env:
+          JAVA_OPTS: "-XX:MaxHeapSize=6g"
+        run: ./scripts/check-android-packaging.sh
+
   build-ios:
     runs-on: macos-latest
 
