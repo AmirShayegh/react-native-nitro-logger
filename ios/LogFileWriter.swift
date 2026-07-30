@@ -96,6 +96,16 @@ public struct LogDegradation: OptionSet, Sendable {
   public static let prune = LogDegradation(rawValue: 1 << 2)
   public static let sidecar = LogDegradation(rawValue: 1 << 3)
   public static let protection = LogDegradation(rawValue: 1 << 4)
+
+  /// This writer holds no exclusive claim on its file, because the filesystem
+  /// would not give one.
+  ///
+  /// Not a failure to write — the log keeps working — but a failure of the
+  /// promise that one process at a time owns this file, and the caller is the
+  /// only one who can decide whether that matters. Proceeding unlocked is the
+  /// deliberate choice: refusing to log because a filesystem does not support
+  /// locking would be a worse answer than logging without the guarantee.
+  public static let exclusivity = LogDegradation(rawValue: 1 << 5)
 }
 
 // MARK: - Results
@@ -146,6 +156,9 @@ public enum LogWriterError: Error, Equatable {
   /// A previous writer for this path has not finished shutting down. Retrying
   /// is reasonable; opening a second writer alongside it is not.
   case stillClosing
+  /// Another OS process holds this log file. Its own case, because it is the
+  /// one failure here that no amount of retrying inside this process can fix.
+  case locked
 }
 
 // MARK: - Writer
@@ -251,6 +264,11 @@ public final class LogWriter {
 
   private var handle: FileHandle?
   private var descriptor: Int32 = -1
+  /// The exclusion this writer holds on its file, or -1 if it never got one.
+  ///
+  /// Taken in `init` and given back by the close barrier or `deinit`; releasing
+  /// is idempotent, because a writer that fails to open has both to run.
+  private var lockDescriptor: Int32 = -1
   private var currentFileSize: UInt64 = 0
   private var currentFileStart = Date()
   /// Monotonic ms of the last reopen attempt; nil until one has been made, so
@@ -311,6 +329,27 @@ public final class LogWriter {
     let shortfall = try LogSecureFile.createDirectory(at: fileURL.deletingLastPathComponent())
       .union(directoryShortfall)
     if !shortfall.isEmpty { degraded.insert(.protection) }
+
+    // Before anything is opened or trimmed, because the trim truncates: a
+    // second process reaching that with the first one's file would cut bytes
+    // out from under it.
+    switch Self.takeExclusiveLock(for: fileURL) {
+    case .acquired(let fd, let secured):
+      lockDescriptor = fd
+      if !secured { degraded.insert(.protection) }
+    case .taken:
+      throw LogWriterError.locked
+    case .impossible:
+      degraded.insert(.exclusivity)
+    }
+
+    // Explicit, not left to `deinit`. Whether a class whose `init` throws gets
+    // one is a subtlety of the language, and a descriptor held for the life of
+    // the process — locking a file no writer exists for — is far too costly a
+    // thing to rest on it.
+    var opening = true
+    defer { if opening { releaseExclusiveLock() } }
+
     guard let opened = Self.openForAppending(at: fileURL) else {
       throw LogWriterError.openFailed("could not open the log file")
     }
@@ -322,6 +361,7 @@ public final class LogWriter {
 
     trimTornTailIfFramed()
     sweepRetention()
+    opening = false
   }
 
   deinit {
@@ -329,6 +369,9 @@ public final class LogWriter {
     handle = nil
     try? live?.synchronize()
     try? live?.close()
+    // Also the failed-`init` path: a lock taken before the append open failed
+    // has nothing else left to give it back.
+    releaseExclusiveLock()
   }
 
   // MARK: - Reference counting (registry-owned, called under the registry lock)
@@ -838,6 +881,10 @@ public final class LogWriter {
     queue.async { [self] in
       terminated = true
       closeCurrentHandle()
+      // After the handle, before anyone is told: the claim must outlast every
+      // byte this writer will ever put on disk, or a replacement process can
+      // start appending while the last batch is still landing.
+      releaseExclusiveLock()
       onTerminated?()
       group.leave()
     }
@@ -845,6 +892,77 @@ public final class LogWriter {
     // already in the past makes this return at once rather than wait afresh.
     _ = group.wait(timeout: deadline)
     return outcome
+  }
+
+  // MARK: - One process at a time
+
+  /// What asking for the exclusion got.
+  enum LockOutcome {
+    /// Held, on this descriptor. `secured` is false if the mode did not stick.
+    case acquired(Int32, secured: Bool)
+    /// Another process is appending to this file right now.
+    case taken
+    /// The filesystem will not do this. Log anyway, and say so.
+    case impossible
+  }
+
+  /// Takes the process-exclusive claim on a log file, or explains why not.
+  ///
+  /// A lock on a file of its own rather than on the active log: rotation renames
+  /// the active file out from under itself, and `flock` follows the inode, so
+  /// the exclusion would quietly move to an archive at the first rotation and
+  /// leave the live file unguarded.
+  ///
+  /// Three outcomes, and each is a decision. Acquired is the ordinary one.
+  /// Taken means another process is appending to this file right now, and two
+  /// processes interleaving mid-record is the collision this whole library is
+  /// built to prevent — so the caller throws. Impossible carries on unlocked and
+  /// raises `exclusivity`, because refusing to log at all would be the worse
+  /// answer and the caller can read the bit and decide for itself.
+  ///
+  /// `O_NOFOLLOW` for the same reason the log file gets it: a symlink where the
+  /// lock file goes would put the exclusion on a file in a directory nobody
+  /// chose. `O_CLOEXEC` because a lock inherited by a spawned process outlives
+  /// the writer that took it.
+  static func takeExclusiveLock(for fileURL: URL) -> LockOutcome {
+    let url = fileURL
+      .deletingLastPathComponent()
+      .appendingPathComponent(lockName(fileURL.lastPathComponent))
+
+    // `O_NOFOLLOW` makes a symlink here fail rather than redirect: following one
+    // would put the lock — and the `fchmod` below — on a file nobody chose, and
+    // could quietly make two unrelated paths exclude each other. The failure is
+    // `.impossible`, so the target is left untouched and logging continues
+    // without the guarantee; Android reaches the same answer by checking.
+    let fd = Darwin.open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+    guard fd >= 0 else { return .impossible }
+
+    // `LOCK_NB`, never a blocking wait. A logger that hangs at construction
+    // because another process has the file is worse than one that says so.
+    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+      let conflict = errno == EWOULDBLOCK
+      Darwin.close(fd)
+      // Anything else — a filesystem that does not implement `flock`, which is
+      // what `EOPNOTSUPP` means on a network mount — is not another process.
+      return conflict ? .taken : .impossible
+    }
+
+    // Owner-only like every other file this writer creates. It carries no log
+    // bytes, but it is created in the log directory under a name derived from
+    // the caller's, and there is no reason for it to be the one file in there
+    // that anyone can read. Through the descriptor, so a name swapped after the
+    // open cannot redirect it.
+    let secured = fchmod(fd, S_IRUSR | S_IWUSR) == 0
+    return .acquired(fd, secured: secured)
+  }
+
+  /// Gives the claim back. Idempotent; the kernel would do it at exit anyway.
+  private func releaseExclusiveLock() {
+    let fd = lockDescriptor
+    lockDescriptor = -1
+    guard fd >= 0 else { return }
+    flock(fd, LOCK_UN)
+    Darwin.close(fd)
   }
 
   /// `Infinity` means "wait as long as you are allowed to", which is the
@@ -1091,6 +1209,21 @@ public final class LogWriter {
   static func isStagingName(_ name: String, baseName: String) -> Bool {
     matches(name, baseName: baseName, pattern: #"^\d{8}T\d{6}Z_[a-f0-9]{8}\.gz\.part$"#)
   }
+
+  /// The exclusion file for `baseName`, and **deliberately not an artifact.**
+  ///
+  /// It holds zero log bytes — it exists only to be locked — so a purge that
+  /// leaves it behind has still deleted every byte of log data, and `durable`
+  /// keeps the compliance meaning it has everywhere else. Deleting it would be
+  /// worse than useless: `flock` lives on the inode, so unlinking the name while
+  /// a writer holds it lets the next process create a fresh file, lock that
+  /// instead, and write alongside the first — defeating the exclusion in exactly
+  /// the case it exists for.
+  ///
+  /// It is not deleted on close either. A close and another process's open race,
+  /// and whoever wins that race must not have the file pulled out from under it.
+  /// An empty file is a cheap thing to leave behind.
+  static func lockName(_ baseName: String) -> String { baseName + ".lock" }
 
   /// Everything this writer can ever put on disk under its directory: the
   /// active file, the sidecar, every archive, every gzip staging file.

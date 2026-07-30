@@ -41,7 +41,7 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=171
+    MINIMUM=179
     REQUIRED_SUITES="FileSinkLifecycleTests LogBurstTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
@@ -53,7 +53,7 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=153
+    MINIMUM=161
     REQUIRED_SUITES="BridgeNumberTest FileSinkLifecycleTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)

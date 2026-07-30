@@ -219,6 +219,7 @@ part of either platform's coverage that is not free.
 | Concern | iOS | Android | Consequence |
 | ------- | --- | ------- | ----------- |
 | Open-and-check | `O_RDWR\|O_APPEND\|O_CREAT\|O_NOFOLLOW\|O_NONBLOCK` in one syscall, then `fstat` | check-then-open: `lstat` for a symlink, then `FileOutputStream` | a window on Android, over app-private storage no other app can write to |
+| Taking the exclusion | `open(O_CREAT\|O_RDWR\|O_NOFOLLOW\|O_CLOEXEC)` then `flock(LOCK_EX\|LOCK_NB)`, and `fchmod` through that descriptor | `lstat` for a symlink, then `RandomAccessFile` and `FileChannel.tryLock`, and a path-based mode | the same three answers on both — held, refused, or no exclusion with the `exclusivity` bit raised — and the same refusal to follow a symlink at the lock path. The difference is only where the refusal comes from: one syscall on iOS, a check before the open on Android, with the same window and the same reason it is acceptable as the row above |
 | Crash-tail trim | through the same descriptor it will append with | a separate `RandomAccessFile` opened before the append stream exists | the trim and the writes provably concern one inode on iOS; on Android that rests on there being no other descriptor yet |
 | File age across restarts | `creationDate` from the filesystem | `<base>.meta` sidecar, authoritative once written | see below |
 | At-rest protection | `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion flag, per artifact | `noBackupFilesDir` plus owner-only modes | **not equivalent** — see below |

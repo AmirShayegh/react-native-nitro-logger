@@ -3,6 +3,8 @@ package com.margelo.nitro.nitrologger
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -173,6 +175,23 @@ class LogFileWriter internal constructor(
       matches(name, baseName, STAGING_SUFFIX)
 
     /**
+     * The exclusion file for [baseName], and **deliberately not an artifact.**
+     *
+     * It holds zero log bytes — it exists only to be locked — so a purge that
+     * leaves it behind has still deleted every byte of log data, and `durable`
+     * keeps the compliance meaning it has everywhere else. Deleting it would be
+     * worse than useless: an advisory lock lives on the inode, so unlinking the
+     * name while a writer holds it lets the next process create a fresh file,
+     * lock that instead, and write alongside the first — defeating the exclusion
+     * in exactly the case it exists for.
+     *
+     * It is not deleted on close either. A close and another process's open
+     * race, and whoever wins that race must not have the file pulled out from
+     * under it. An empty file is a cheap thing to leave behind.
+     */
+    fun lockName(baseName: String): String = "$baseName.lock"
+
+    /**
      * Everything this writer can ever put on disk under its directory: the
      * active file, the sidecar, every archive, every gzip staging file.
      *
@@ -289,6 +308,16 @@ class LogFileWriter internal constructor(
     }
   })
 
+  /**
+   * The exclusion this writer holds on its file, or nulls if it never got one.
+   *
+   * Taken in [start] on the constructing thread and released by the close
+   * barrier on the executor; nothing else touches them, and the executor's own
+   * queue orders the two.
+   */
+  private var lockHandle: RandomAccessFile? = null
+  private var fileLock: FileLock? = null
+
   // State behind stateLock — cheap, never held across I/O.
   private val stateLock = ReentrantLock()
   /** Held for the whole of [clearLogs], so purges cannot interleave. */
@@ -337,6 +366,23 @@ class LogFileWriter internal constructor(
     val shortfall = !LogSecureFile.createDirectory(directory, platform)
     if (shortfall) note(LogDegradation.PROTECTION)
 
+    // Before anything is opened or trimmed, because the trim truncates: a
+    // second process reaching that with the first one's file would cut bytes
+    // out from under it.
+    acquireExclusiveLock()
+    try {
+      openInitially()
+    } catch (t: Throwable) {
+      // Nothing else will run to give it back — there is no writer to close.
+      releaseExclusiveLock()
+      throw t
+    }
+  }
+
+  /**
+   * Everything after the exclusion is taken, so one `catch` can give it back.
+   */
+  private fun openInitially() {
     // The startup trim happens before the append stream exists, through its own
     // read-write descriptor. iOS reads and truncates through the very
     // descriptor it will write with; here the JDK gives no single handle that
@@ -353,6 +399,89 @@ class LogFileWriter internal constructor(
       )
     }
     onExecutor { sweepRetention() }
+  }
+
+  /**
+   * Takes the process-exclusive claim on this log file, or explains why not.
+   *
+   * A lock on a file of its own rather than on the active log: rotation renames
+   * the active file out from under itself, and a lock follows the inode, so the
+   * exclusion would quietly move to an archive at the first rotation and leave
+   * the live file unguarded.
+   *
+   * Three outcomes, and each is a decision. Acquired is the ordinary one.
+   * Refused means another process is appending to this file right now, and two
+   * processes interleaving mid-record is the collision this whole library is
+   * built to prevent — so that one throws. Impossible — a filesystem with no
+   * locking — notes [LogDegradation.EXCLUSIVITY] and carries on unlocked,
+   * because refusing to log at all would be the worse answer and the caller can
+   * read the bit and decide for itself.
+   */
+  @Throws(LogWriterException::class)
+  private fun acquireExclusiveLock() {
+    val lockFile = File(directory, lockName(baseName))
+
+    // Never through a symlink. `RandomAccessFile` follows one, and following it
+    // would put the lock — and the mode below — on a file nobody chose, and
+    // could quietly make two unrelated paths exclude each other. iOS gets this
+    // atomically from `O_NOFOLLOW`; here it is a check before the open, the same
+    // check-then-open the log file itself uses a few lines down in `reopen`, and
+    // acceptable for the same reason: this is app-private storage no other app
+    // can write to. The answer is the same on both platforms — no exclusion, the
+    // target untouched, logging continues and the bit says so.
+    if (LogSecureFile.isSymbolicLink(lockFile, platform)) {
+      note(LogDegradation.EXCLUSIVITY)
+      return
+    }
+
+    val handle = try {
+      RandomAccessFile(lockFile, "rw")
+    } catch (_: Exception) {
+      note(LogDegradation.EXCLUSIVITY)
+      return
+    }
+
+    // Owner-only like every other file this writer creates. It carries no log
+    // bytes, but it is created in the log directory under a name derived from
+    // the caller's, and there is no reason for it to be the one file in there
+    // that anyone can read.
+    if (!LogSecureFile.secure(lockFile, platform)) note(LogDegradation.PROTECTION)
+
+    val acquired = try {
+      handle.channel.tryLock()
+    } catch (_: OverlappingFileLockException) {
+      // The same conflict as a null return, arriving as an exception because
+      // the JDK tracks locks per JVM per file rather than per channel. Two
+      // writers on one path inside one process is what the registry exists to
+      // prevent, so reaching here means two registries — or two copies of this
+      // library — which is the same problem with a shorter blast radius.
+      null
+    } catch (_: Exception) {
+      runCatching { handle.close() }
+      note(LogDegradation.EXCLUSIVITY)
+      return
+    }
+
+    if (acquired == null) {
+      runCatching { handle.close() }
+      throw LogWriterException(
+        LogWriterException.Kind.LOCKED,
+        "another process is writing this log file"
+      )
+    }
+
+    lockHandle = handle
+    fileLock = acquired
+  }
+
+  /** Gives the claim back. Idempotent; the kernel would do it at exit anyway. */
+  private fun releaseExclusiveLock() {
+    val lock = fileLock
+    val handle = lockHandle
+    fileLock = null
+    lockHandle = null
+    runCatching { lock?.release() }
+    runCatching { handle?.close() }
   }
 
   // MARK: - Reference counting (registry-owned, called under the registry lock)
@@ -907,6 +1036,10 @@ class LogFileWriter internal constructor(
         try {
           terminated = true
           closeCurrentStream()
+          // After the stream, before anyone is told: the claim must outlast
+          // every byte this writer will ever put on disk, or a replacement
+          // process can start appending while the last batch is still landing.
+          releaseExclusiveLock()
           onTerminated?.invoke()
         } finally {
           done.countDown()

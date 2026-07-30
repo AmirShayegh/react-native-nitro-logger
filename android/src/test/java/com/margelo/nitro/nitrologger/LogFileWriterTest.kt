@@ -7,10 +7,12 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
 
@@ -806,6 +808,191 @@ class LogFileWriterTest {
       assertEquals("$artifact is readable by more than its owner",
                    ownerOnlyFile, mode(artifact))
     }
+  }
+
+  // MARK: - One process at a time
+
+  /**
+   * The boundary this exists to enforce.
+   *
+   * Two processes appending to one log file interleave mid-record and run two
+   * rotation schedules over the same names — the collision the registry
+   * prevents inside one process, arriving from outside it, where a registry
+   * cannot see it. Nothing here makes cross-process *writing* work; it makes
+   * the second writer fail loudly instead of quietly corrupting the first
+   * one's file.
+   *
+   * A second `LogFileWriter` in this JVM is the stand-in for a second process:
+   * the JDK refuses an overlapping lock on the same file whether the conflict
+   * is another process or another channel here, and it is the same refusal.
+   */
+  @Test
+  fun `a second writer on the same file is refused`() {
+    writer()
+
+    try {
+      writer()
+      fail("a second writer took a file another one is holding")
+    } catch (expected: LogWriterException) {
+      assertEquals(LogWriterException.Kind.LOCKED, expected.kind)
+    }
+  }
+
+  @Test
+  fun `the file can be taken again once the first writer lets go`() {
+    val first = writer()
+    first.close(1, 1000.0)
+
+    // Not just "does not throw": the replacement has to be able to write.
+    val second = writer()
+    assertTrue(second.write("after\n").accepted)
+  }
+
+  /**
+   * The lock lives on a file of its own, and that is load-bearing.
+   *
+   * A lock follows the inode. Held on the active log file it would ride the
+   * rename into the archive at the first rotation and leave the live file
+   * unguarded — so the exclusion would silently stop excluding at exactly the
+   * moment the file is busiest.
+   */
+  @Test
+  fun `rotation does not carry the lock away with the archived file`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 64.0))
+    repeat(6) { w.write("x".repeat(40) + "\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+    assertTrue("nothing rotated, so this asserted nothing",
+               directory.listFiles()!!.any { LogFileWriter.isArchiveName(it.name, "app.log") })
+
+    try {
+      writer()
+      fail("the lock moved with the archive; the live file is unguarded")
+    } catch (expected: LogWriterException) {
+      assertEquals(LogWriterException.Kind.LOCKED, expected.kind)
+    }
+  }
+
+  /**
+   * A purge deletes every log byte and leaves the lock, which holds none.
+   *
+   * Unlinking it would be worse than useless: an advisory lock lives on the
+   * inode, so removing the name while a writer holds it lets the next process
+   * create a fresh file, lock that one, and append alongside the first.
+   */
+  @Test
+  fun `a purge deletes every artifact and leaves the lock file`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 64.0))
+    repeat(6) { w.write("x".repeat(40) + "\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val outcome = w.clearLogs(2000.0)
+    assertTrue("the purge did not report itself durable", outcome.first.durable)
+
+    val lock = File(directory, LogFileWriter.lockName("app.log"))
+    assertTrue("the purge took the lock file with it", lock.isFile)
+    assertEquals("and it must never have held a byte of log data", 0L, lock.length())
+
+    // And it is still held: a purge is not a release.
+    try {
+      writer()
+      fail("the purge dropped the exclusion")
+    } catch (expected: LogWriterException) {
+      assertEquals(LogWriterException.Kind.LOCKED, expected.kind)
+    }
+  }
+
+  @Test
+  fun `the lock file is not offered to anyone collecting logs`() {
+    val w = writer()
+    w.write("hello\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val name = LogFileWriter.lockName("app.log")
+    assertTrue("the lock file was never created, so this asserted nothing",
+               File(directory, name).isFile)
+    assertFalse("a collector would try to read an empty exclusion file",
+                w.logFilePaths().any { it.endsWith(name) })
+    assertFalse(LogFileWriter.isArchiveName(name, "app.log"))
+    assertFalse("a purge would delete it", LogFileWriter.isArtifactName(name, "app.log"))
+  }
+
+  /**
+   * A writer that never finished being built must not keep the file locked.
+   *
+   * The lock is taken before the append open, so an open that fails leaves a
+   * descriptor with nothing to release it — and a log file locked for the life
+   * of the process by a writer that does not exist is the worst outcome this
+   * whole feature could produce.
+   */
+  @Test
+  fun `a writer that fails to open gives the lock back`() {
+    // A directory where the log file goes. Resolution is happy with it — it is
+    // not a symlink — and the append open is not.
+    assertTrue(File(directory, "app.log").mkdirs())
+
+    try {
+      writer()
+      fail("the writer opened a directory")
+    } catch (expected: LogWriterException) {
+      assertEquals(LogWriterException.Kind.OPEN_FAILED, expected.kind)
+    }
+
+    RandomAccessFile(File(directory, LogFileWriter.lockName("app.log")), "rw").use {
+      assertNotNull("the failed writer is still holding the lock", it.channel.tryLock())
+    }
+  }
+
+  /**
+   * A symlink where the lock file goes is not followed.
+   *
+   * Following it would put the lock — and the mode the writer applies — on a
+   * file nobody chose, and could quietly make two unrelated paths exclude each
+   * other. The answer is no exclusion rather than the wrong exclusion, which is
+   * the same answer iOS reaches from `O_NOFOLLOW`.
+   */
+  @Test
+  fun `a symlinked lock path is not followed`() {
+    val target = File(directory, "elsewhere")
+    Assume.assumeTrue(
+      "this runtime cannot create symlinks",
+      runCatching {
+        Files.createSymbolicLink(
+          File(directory, LogFileWriter.lockName("app.log")).toPath(),
+          target.toPath()
+        )
+      }.isSuccess
+    )
+
+    val w = writer()
+
+    assertTrue("logging must keep working", w.write("still here\n").accepted)
+    assertTrue("and the caller has to be able to find out",
+               w.status(1).degraded and LogDegradation.EXCLUSIVITY != 0)
+    assertFalse("the writer created the symlink's target instead of refusing", target.exists())
+  }
+
+  /**
+   * A filesystem that will not lock is a degradation, not a failure.
+   *
+   * Refusing to log because the storage cannot exclude would be a far worse
+   * answer than logging without the guarantee — so the bit goes up, the caller
+   * can read it, and the writer carries on. Reached here by putting a
+   * *directory* where the lock file goes, which is a real filesystem refusing a
+   * real open; the other route to the same decision is a filesystem whose
+   * `tryLock` fails, which no temp directory on a developer machine will do.
+   */
+  @Test
+  fun `a file that cannot be locked degrades rather than refusing to log`() {
+    assertTrue(File(directory, LogFileWriter.lockName("app.log")).mkdirs())
+
+    val w = writer()
+
+    assertTrue("logging must keep working", w.write("still here\n").accepted)
+    assertTrue("and the caller has to be able to find out",
+               w.status(1).degraded and LogDegradation.EXCLUSIVITY != 0)
   }
 
   /** Compression stages through a `.part` file, which is just as sensitive. */

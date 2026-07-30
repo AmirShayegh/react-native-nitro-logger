@@ -123,8 +123,15 @@ class LogWriterTestCase: XCTestCase {
     return ((try? FileManager.default.contentsOfDirectory(atPath: target.path)) ?? []).sorted()
   }
 
+  /// Everything in the directory that is neither the active file nor the
+  /// exclusion file.
+  ///
+  /// The lock is excluded for the same reason `app.log` is: it is not something
+  /// rotation produced, it holds no log bytes, and no rule about archives —
+  /// pruning, purging, listing for support — applies to it. See
+  /// `LogWriter.lockName`.
   func archiveNames() -> [String] {
-    names().filter { $0 != "app.log" }
+    names().filter { $0 != "app.log" && $0 != LogWriter.lockName("app.log") }
   }
 
   /// Appends and waits for the write to land, so assertions do not race.

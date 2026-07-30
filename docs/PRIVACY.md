@@ -410,6 +410,14 @@ Its reach is the file sink. It does not and cannot clear what other
 destinations did with the same entry; see the paragraph above on `os_log` and
 `logcat`.
 
+One file in the log directory is deliberately not an artifact and survives a
+purge: `<logfile>.lock`, the empty file the writer holds an exclusive lock on so
+a second process cannot append to the same log. It never holds a byte of log
+data, so `durable` keeps exactly the meaning it has everywhere else — and
+deleting it would defeat the exclusion rather than serve it, since a lock lives
+on the inode and unlinking the name lets the next process lock a fresh file and
+write alongside the first.
+
 `durable` means every *pre-purge* artifact is gone and the directory has been
 synced, so the removals hold across a crash. It is not a claim that the log
 directory is left empty: a purge that succeeds and rebinds immediately opens a

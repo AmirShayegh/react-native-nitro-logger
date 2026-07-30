@@ -145,7 +145,9 @@ final class LogRegistryTests: LogWriterTestCase {
     XCTAssertTrue(outcome.durable)
     XCTAssertTrue(outcome.failedPaths.isEmpty)
     XCTAssertGreaterThan(outcome.deletedCount, 3)
-    XCTAssertEqual(names(), ["app.log"], "only the freshly reopened file remains")
+    XCTAssertEqual(
+      names(), ["app.log", LogWriter.lockName("app.log")],
+      "only the freshly reopened file remains — the exclusion file survives on purpose: it holds no log bytes, and unlinking it while this writer holds the lock would let the next process lock a fresh file and append alongside it")
     XCTAssertEqual(contents(), "")
   }
 
@@ -210,7 +212,7 @@ final class LogRegistryTests: LogWriterTestCase {
 
     chflags(stubbornURL.path, 0)
     XCTAssertTrue(handle.clearLogs(deadlineMs: 2000).durable)
-    XCTAssertEqual(names(), ["app.log"])
+    XCTAssertEqual(names(), ["app.log", LogWriter.lockName("app.log")])
     XCTAssertTrue(write(handle, "after\n").accepted)
   }
 
@@ -767,5 +769,168 @@ final class LogRegistryTests: LogWriterTestCase {
     XCTAssertFalse(promised.isEmpty, "the race is only interesting if something was accepted")
     let missing = promised.filter { !written.contains($0) }
     XCTAssertTrue(missing.isEmpty, "accepted but never written: \(missing.prefix(5))")
+  }
+
+  // MARK: - One process at a time
+
+  /// The boundary this exists to enforce.
+  ///
+  /// Two processes appending to one log file interleave mid-record and run two
+  /// rotation schedules over the same names — the collision the registry
+  /// prevents inside one process, arriving from outside it, where a registry
+  /// cannot see it. Nothing here makes cross-process *writing* work; it makes
+  /// the second writer fail loudly instead of quietly corrupting the first
+  /// one's file.
+  ///
+  /// A second registry in this process is the stand-in for a second process:
+  /// `flock` belongs to the open file description, not to the process, so a
+  /// second `open` of the same path is refused here exactly as it would be
+  /// across a process boundary.
+  func testASecondWriterOnTheSameFileIsRefused() throws {
+    _ = try makeHandle()
+
+    let rival = LogWriterRegistry.isolated()
+    XCTAssertThrowsError(try rival.acquire(path: logURL.path, policy: LogRotationPolicy(),
+                                           lineFramed: true)) { error in
+      XCTAssertEqual(error as? LogWriterError, .locked)
+    }
+  }
+
+  func testTheFileCanBeTakenAgainOnceTheFirstWriterLetsGo() throws {
+    let first = try makeHandle()
+    _ = first.close(deadlineMs: 1000)
+
+    // Not just "does not throw": the replacement has to be able to write.
+    let rival = LogWriterRegistry.isolated()
+    let second = try rival.acquire(path: logURL.path, policy: LogRotationPolicy(),
+                                   lineFramed: true)
+    XCTAssertTrue(second.appendBatch("after\n", entryCount: 1).accepted)
+    _ = second.close(deadlineMs: 1000)
+  }
+
+  /// The lock lives on a file of its own, and that is load-bearing.
+  ///
+  /// `flock` follows the inode. Held on the active log file it would ride the
+  /// rename into the archive at the first rotation and leave the live file
+  /// unguarded — so the exclusion would silently stop excluding at exactly the
+  /// moment the file is busiest.
+  func testRotationDoesNotCarryTheLockAwayWithTheArchivedFile() throws {
+    let handle = try makeHandle(policy: LogRotationPolicy(maxFileSizeBytes: 64, maxArchivedFilesCount: 5))
+    for _ in 0..<6 { write(handle, String(repeating: "x", count: 40) + "\n") }
+    XCTAssertFalse(archiveNames().isEmpty, "nothing rotated, so this asserted nothing")
+
+    let rival = LogWriterRegistry.isolated()
+    XCTAssertThrowsError(try rival.acquire(path: logURL.path, policy: LogRotationPolicy(maxFileSizeBytes: 64, maxArchivedFilesCount: 5),
+                                           lineFramed: true)) { error in
+      XCTAssertEqual(error as? LogWriterError, .locked)
+    }
+  }
+
+  /// A purge deletes every log byte and leaves the lock, which holds none.
+  ///
+  /// Unlinking it would be worse than useless: `flock` lives on the inode, so
+  /// removing the name while a writer holds it lets the next process create a
+  /// fresh file, lock that one, and append alongside the first.
+  func testAPurgeLeavesTheExclusionInPlaceAndInForce() throws {
+    let handle = try makeHandle(policy: LogRotationPolicy(maxFileSizeBytes: 64, maxArchivedFilesCount: 5))
+    for _ in 0..<6 { write(handle, String(repeating: "x", count: 40) + "\n") }
+
+    XCTAssertTrue(handle.clearLogs(deadlineMs: 2000).durable)
+
+    let lock = logsDirectory.appendingPathComponent(LogWriter.lockName("app.log"))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: lock.path),
+                  "the purge took the exclusion file with it")
+    XCTAssertEqual((try? Data(contentsOf: lock))?.count, 0,
+                   "and it must never have held a byte of log data")
+
+    let rival = LogWriterRegistry.isolated()
+    XCTAssertThrowsError(try rival.acquire(path: logURL.path, policy: LogRotationPolicy(maxFileSizeBytes: 64, maxArchivedFilesCount: 5),
+                                           lineFramed: true)) { error in
+      XCTAssertEqual(error as? LogWriterError, .locked, "the purge dropped the exclusion")
+    }
+  }
+
+  func testTheLockFileIsNotOfferedToAnyoneCollectingLogs() throws {
+    let handle = try makeHandle()
+    write(handle, "hello\n")
+
+    let name = LogWriter.lockName("app.log")
+    XCTAssertTrue(names().contains(name), "the lock file was never created")
+    XCTAssertFalse(handle.logFilePaths().contains { $0.hasSuffix(name) },
+                   "a collector would try to read an empty exclusion file")
+    XCTAssertFalse(LogWriter.isArchiveName(name, baseName: "app.log"))
+    XCTAssertFalse(LogWriter.isArtifactName(name, baseName: "app.log"),
+                   "a purge would delete it")
+  }
+
+  /// A writer that never finished being built must not keep the file locked.
+  ///
+  /// The lock is taken before the append open, so an open that fails leaves a
+  /// descriptor with nothing to release it — and a log file locked for the life
+  /// of the process by a writer that does not exist is the worst outcome this
+  /// whole feature could produce.
+  ///
+  /// **What this does not prove:** which of the two releases satisfied it. A
+  /// class whose `init` throws after full initialization does get a `deinit`,
+  /// and removing the explicit `defer` leaves this green — measured, not
+  /// assumed. The `defer` is there so the property stops depending on that: one
+  /// stored `let` added below the lock acquisition and `deinit` would no longer
+  /// run, and this test would keep passing right up until it did not.
+  func testAWriterThatFailsToOpenGivesTheLockBack() throws {
+    // A directory where the log file goes. Resolution is happy with it — it is
+    // not a symlink — and the append open is not.
+    try FileManager.default.createDirectory(at: logURL, withIntermediateDirectories: true)
+
+    XCTAssertThrowsError(try makeHandle())
+
+    switch LogWriter.takeExclusiveLock(for: logURL) {
+    case .acquired(let fd, _):
+      flock(fd, LOCK_UN)
+      Darwin.close(fd)
+    case .taken:
+      XCTFail("the failed writer is still holding the lock")
+    case .impossible:
+      XCTFail("the lock could not be taken at all, so this asserted nothing")
+    }
+  }
+
+  /// A symlink where the lock file goes is not followed.
+  ///
+  /// Following it would put the lock — and the mode the writer applies — on a
+  /// file nobody chose, and could quietly make two unrelated paths exclude each
+  /// other. The answer is no exclusion rather than the wrong exclusion.
+  func testASymlinkedLockPathIsNotFollowed() throws {
+    let target = root.appendingPathComponent("elsewhere")
+    try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(
+      at: logsDirectory.appendingPathComponent(LogWriter.lockName("app.log")),
+      withDestinationURL: target)
+
+    let handle = try makeHandle()
+
+    XCTAssertTrue(write(handle, "still here\n").accepted, "logging must keep working")
+    XCTAssertTrue(LogDegradation(rawValue: handle.status().degraded).contains(.exclusivity))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: target.path),
+                   "the writer created the symlink's target instead of refusing")
+  }
+
+  /// A filesystem that will not lock is a degradation, not a failure.
+  ///
+  /// Refusing to log because the storage cannot exclude would be a far worse
+  /// answer than logging without the guarantee — so the bit goes up, the caller
+  /// can read it, and the writer carries on. Reached here by putting a
+  /// *directory* where the lock file goes, which is a real filesystem refusing a
+  /// real open; the other route to the same decision is a mount whose `flock`
+  /// answers `EOPNOTSUPP`, which no local temp directory will do.
+  func testAFileThatCannotBeLockedDegradesRatherThanRefusingToLog() throws {
+    try FileManager.default.createDirectory(
+      at: logsDirectory.appendingPathComponent(LogWriter.lockName("app.log")),
+      withIntermediateDirectories: true)
+
+    let handle = try makeHandle()
+
+    XCTAssertTrue(write(handle, "still here\n").accepted, "logging must keep working")
+    XCTAssertTrue(LogDegradation(rawValue: handle.status().degraded).contains(.exclusivity),
+                  "and the caller has to be able to find out")
   }
 }

@@ -186,7 +186,7 @@ const logFile = new FileDestination(createFileSink(), {
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
-| `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip and protection each have a bit. |
+| `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip, protection and exclusivity each have a bit. |
 | `dispose()` | `void` | Releases the native handle. |
 
 `PurgeOutcome` reports `durable` (every pre-purge artifact is gone) separately
@@ -421,6 +421,30 @@ implicit would be guessing on your behalf about retention. Optional:
 
 `SinkStatus` carries the sink's view of its own health, including the
 degradation mask that `FileDestination.degradation()` surfaces.
+
+| Bit | Name | What stopped working |
+| --- | --- | --- |
+| `1 << 0` | rotation | The active file could not be rotated. |
+| `1 << 1` | gzip | An archive could not be compressed and was kept as plaintext. |
+| `1 << 2` | prune | Retention could not delete something it wanted to. |
+| `1 << 3` | sidecar | The age sidecar could not be written, so age-based rotation is guessing. |
+| `1 << 4` | protection | A file or directory did not get the mode, protection class or backup exclusion it should have. |
+| `1 << 5` | exclusivity | The filesystem would not give this writer an exclusive claim on its file, so nothing stops a second process appending to it. |
+
+The mask is payload-free on purpose: these numbers cross into JavaScript and end
+up in a log file, and a path or an `errno` description is exactly the kind of
+string that carries a username in it.
+
+**One process at a time.** Opening a file sink takes a non-blocking exclusive
+lock on a `<logfile>.lock` file next to the log, and an open that finds another
+process holding it fails rather than appending alongside it — two processes
+interleaving mid-record, running two rotation schedules over the same names, is
+the collision the library exists to prevent. The lock is on a file of its own
+because rotation renames the active file and a lock follows the inode; it is
+never deleted, including by `purge()`, because unlinking a locked name lets the
+next process lock a fresh file and write alongside the first. It holds no log
+bytes. A filesystem that cannot lock raises the `exclusivity` bit and logging
+continues — refusing to log would be the worse answer.
 
 <!-- api: createFileSink, createNativeConsoleSink, FileSink, NativeConsoleSink, FileSinkLike, NativeConsoleSinkLike, RotationConfig, SinkStatus -->
 

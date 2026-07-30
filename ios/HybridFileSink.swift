@@ -212,6 +212,12 @@ final class HybridFileSink: HybridFileSinkSpec {
         withMessage: "FileSink: another destination already opened this file with a different configuration")
     case .symlinkEscape:
       return RuntimeError.error(withMessage: "FileSink: the log path is a symbolic link")
+    case .locked:
+      // Distinct from every other refusal because nothing this process does
+      // will fix it: another OS process is appending to this file, and the
+      // answer is to pick a different path or stop the other one.
+      return RuntimeError.error(
+        withMessage: "FileSink: another process is writing this log file")
     case .stillClosing:
       // Distinct from the others because it is the one worth retrying: a
       // previous destination on this file has not finished shutting down, and

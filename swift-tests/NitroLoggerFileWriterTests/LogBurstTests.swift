@@ -163,7 +163,7 @@ final class LogBurstTests: LogWriterTestCase {
     XCTAssertGreaterThan(archiveNames().count, 3)
 
     XCTAssertTrue(handle.clearLogs(deadlineMs: 5000).durable)
-    XCTAssertEqual(names(), ["app.log"])
+    XCTAssertEqual(names(), ["app.log", LogWriter.lockName("app.log")])
     XCTAssertEqual(handle.status().lostEntries, 0)
 
     for index in 0..<600 { write(handle, line(index)) }

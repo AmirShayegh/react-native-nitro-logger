@@ -103,6 +103,18 @@ object LogDegradation {
   const val PRUNE = 1 shl 2
   const val SIDECAR = 1 shl 3
   const val PROTECTION = 1 shl 4
+
+  /**
+   * This writer holds no exclusive claim on its file, because the filesystem
+   * would not give one.
+   *
+   * Not a failure to write — the log keeps working — but a failure of the
+   * promise that one process at a time owns this file, and the caller is the
+   * only one who can decide whether that matters. Proceeding unlocked is the
+   * deliberate choice: refusing to log because a filesystem does not support
+   * locking would be a worse answer than logging without the guarantee.
+   */
+  const val EXCLUSIVITY = 1 shl 5
 }
 
 enum class LogRejectReason(val wire: String) {
@@ -182,5 +194,13 @@ data class LogClearOutcome(
 )
 
 class LogWriterException(val kind: Kind, message: String) : Exception(message) {
-  enum class Kind { OPEN_FAILED, CONFIG_CONFLICT, SYMLINK_ESCAPE, STILL_CLOSING }
+  enum class Kind {
+    OPEN_FAILED,
+    CONFIG_CONFLICT,
+    SYMLINK_ESCAPE,
+    STILL_CLOSING,
+    /** Another OS process holds this log file. Its own, because it is the one
+     * failure here that no amount of retrying inside this process can fix. */
+    LOCKED
+  }
 }
