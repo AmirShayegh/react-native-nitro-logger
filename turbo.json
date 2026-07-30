@@ -125,15 +125,21 @@
       // `automaticPodsInstallation`, which is also why that file matters here
       // as much as it does for Android.
       //
-      // `Gemfile.lock` is listed but deliberately not committed. It belongs in
-      // the hash whenever it exists, because a developer's resolved CocoaPods
-      // is part of what produced their Pods/ — but the only lockfile this
-      // repository can currently generate comes from the Ruby that ships with
-      // macOS, and one written by its Bundler 1.17.2 makes a modern Bundler
-      // re-exec 1.17.2, which dies calling `String#untaint` (removed in Ruby
-      // 3.2). scripts/check-min-rn-ios.sh already refuses to depend on that
-      // Ruby for the same reason. A lockfile generated on a current Ruby would
-      // be worth committing; that one is worse than none.
+      // `Gemfile.lock` is committed now, so this input has a file to hash on
+      // every machine rather than only where somebody happened to run
+      // `bundle install`: the resolved CocoaPods is part of what produced
+      // Pods/, and a hash that ignored it would reuse a cached build across a
+      // CocoaPods upgrade.
+      //
+      // It was ignored until 0.2.0 because the only lockfile this repository
+      // could generate came from the Ruby that ships with macOS, and one
+      // written by its Bundler 1.17.2 makes a modern Bundler re-exec 1.17.2,
+      // which dies calling `String#untaint` (removed in Ruby 3.2). The
+      // committed one is written by Bundler 2.7.2 on Ruby 3.4, deliberately
+      // not by the newest Bundler available: lockfiles read forward and not
+      // back, and `build-ios` runs on `macos-latest` with whatever Bundler
+      // that image ships. scripts/check-min-rn-ios.sh still refuses to depend
+      // on the system Ruby, for the original reason.
       "inputs": [
         "$TURBO_ROOT$/package.json",
         "$TURBO_ROOT$/nitro.json",
