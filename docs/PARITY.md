@@ -390,17 +390,28 @@ implementation is not expressible.
 
 ## Compatibility, per platform
 
-These claims are deliberately narrower than "React Native ≥ 0.78 on both
-platforms", because only one of them is verified against the bottom of the
-range.
+Both are now verified against the bottom of the range, by a job each. What
+differs is how the verdict gets out of the app, and that difference is worth
+knowing about before trusting either.
 
 | Platform | Claim | How it is backed |
 | -------- | ----- | ---------------- |
 | iOS | React Native ≥ 0.78 | the `min-rn-ios` CI job packs a tarball into a pristine 0.78 app, builds it Release, launches it on a simulator and reads a run-ID-matched verdict out of the app container |
-| Android | verified at the example's React Native version; **0.78 experimental** | `test-android` runs the writer's JUnit suite and `build-android` builds the example, but no equivalent minimum-version consumer job exists yet |
+| Android | React Native ≥ 0.78 | the `min-rn-android` CI job does the same into a pristine 0.78 app, builds it Release for the device's ABI, launches it on an API-34 emulator and reads a run-ID-matched verdict off the `ReactNativeJS` logcat tag |
 
-The Android gap is tracked for v1.1. Narrowing the claim was the deliberate
-alternative to asserting something no job checks.
+The one fidelity difference: iOS reads an artifact the library wrote, Android
+reads what the app said about itself. Reading the file on Android needs
+`run-as`, which needs a debuggable build — and a debug build would not be
+verifying the thing this job exists for, since R8, the bundled JavaScript and
+the packaged `.so` set are exactly what differs in release. A library that
+misreported its own outcome would be believed by the Android job and caught by
+the iOS one. The run ID in the verdict line closes the other hole, where a
+stale logcat buffer signs off a run that never happened.
+
+`min-rn-android` also pins API 34 rather than running a matrix. The minimum-OS
+claim belongs to `test-android-instrumented`, which goes down to API 24; this
+job's variable is the React Native version, and holding the OS still is what
+makes a failure here unambiguous.
 
 `min-rn-ios` is pinned to `macos-15` with Xcode 16.4. React Native 0.78 pins
 fmt 11.0.2 through RCT-Folly and clang from Xcode 26 rejects its

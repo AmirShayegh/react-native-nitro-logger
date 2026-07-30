@@ -338,6 +338,63 @@ jobs:
       - name: Build, launch and exercise on the minimum React Native
         run: ./scripts/check-min-rn-ios.sh
 
+  # The Android half of the same claim. Separate job rather than a matrix leg of
+  # `min-rn-ios`, because the two need different runners: that one is pinned to
+  # macos-15 with Xcode 16 for a toolchain reason that has no Android analogue.
+  #
+  # Also separate from `test-android-reload`, which is the other job that boots
+  # an emulator and installs a release build. That one drives the maintained
+  # example on the newest React Native and reaches into the registry's own test
+  # hooks; this one asks whether a consumer who has never heard of those hooks
+  # can install the package and have it work. Sharing a job would mean one
+  # failure standing for either question.
+  min-rn-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Install JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      # Nothing in this job builds this repository's Android module — it builds
+      # a tarball of the published package inside a scaffolded consumer — but
+      # `yarn prepare` runs from the script and the generated sources have to
+      # exist before it packs them.
+      - name: Generate nitrogen code
+        run: yarn nitrogen
+
+      # The runner image ships KVM but leaves it root-only; without this the
+      # emulator silently falls back to software rendering and times out.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # API 34 only. The minimum-OS claim belongs to
+      # `test-android-instrumented`, which runs its matrix down to API 24; this
+      # job's variable is the React Native version, so pinning the OS is what
+      # makes a failure here unambiguous. The script reads the ABI off the
+      # device rather than taking it from here, so there is one place that
+      # decides it.
+      - name: Build, launch and exercise on the minimum React Native
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: ./scripts/check-min-rn-android.sh
+
   nitrogen-diff:
     runs-on: ubuntu-latest
 
