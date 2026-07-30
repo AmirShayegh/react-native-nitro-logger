@@ -205,7 +205,7 @@ a simulator or an emulator.
 | File age across restarts | `creationDate` from the filesystem | `<base>.meta` sidecar, authoritative once written | see below |
 | At-rest protection | `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion flag, per artifact | `noBackupFilesDir` plus owner-only modes | **not equivalent** — see below |
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
-| Deadlines | `DispatchTime` | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently |
+| Deadlines | `DispatchTime` everywhere a wait or backoff is measured: the writer's queue waits, reopen/rotation backoffs, the purge lock, and the registry's close-drain waits (a `pthread_cond_timedwait_relative_np` condition, since `NSCondition` can only wait against a `Date`) | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently. Through 0.1.2 the registry's three waits were realtime — an NTP step during teardown could stretch a 200 ms close budget to the 30 s ceiling |
 | Console chunk size | 900 bytes per `os_log` entry | 3800 bytes per logcat entry | the platform limits genuinely differ; the behaviour around them — `(i/n)` markers, 8-chunk ceiling, a truncation notice that fits inside its own entry — is identical |
 | Console split boundary | grapheme clusters (`Character`) | code points | iOS also keeps combining sequences whole; Android only guarantees surrogate pairs are not cut. Both prevent replacement characters, which is the corruption that matters — see below |
 

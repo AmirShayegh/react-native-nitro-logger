@@ -241,9 +241,69 @@ internal enum LogSecureFile {
     return true
   }
 
+  /// Test seam: forced into `protect`'s result, **for directories only** and
+  /// **only under an injected root**.
+  ///
+  /// The directory restriction is load-bearing, not tidiness. `protect` also
+  /// runs for the log file, whose shortfall the writer folds into the same
+  /// `.protection` flag — so a fault that applied to both would light that flag
+  /// by the file route no matter what the directory route did, and a test
+  /// asserting the flag would pass with the directory shortfall discarded. That
+  /// is the exact defect being pinned, so the seam must not be able to supply
+  /// the answer.
+  ///
+  /// The root scoping and the lock keep the seam honest under parallel test
+  /// execution: this state is process-wide, and an unscoped fault set by one
+  /// test would degrade whatever directory another test happens to create
+  /// while it is set. Each test injects under its own unique temp root and
+  /// clears only that root in teardown, so tests can neither poison nor
+  /// un-poison each other.
+  ///
+  /// A seam is needed because the failure it stands in for cannot be arranged
+  /// from a test. `protect` fails when the system refuses the protection class
+  /// or the backup exclusion — the first is compiled out on macOS, where these
+  /// tests run, and the second succeeds on any directory `mkdir` just created.
+  /// Making it fail for real would take an immutable flag applied in the gap
+  /// between `mkdir` and this call, and there is no such gap.
+  ///
+  /// That matters because this is the *only* branch that reports `.protection`
+  /// on a directory: a directory found already there goes to `inspect`, which
+  /// reports the mode alone. So without this, the one shortfall the registry
+  /// can observe and the writer must be told about is also the one no test can
+  /// produce — which is how it came to be discarded unnoticed in the first
+  /// place.
+  private static let faultLock = NSLock()
+  private static var directoryProtectionFaults: [String: Shortfall] = [:]
+
+  static func injectDirectoryProtectionFaultForTesting(_ shortfall: Shortfall, under root: URL) {
+    faultLock.lock()
+    directoryProtectionFaults[root.path] = shortfall
+    faultLock.unlock()
+  }
+
+  static func clearDirectoryProtectionFaultsForTesting(under root: URL) {
+    faultLock.lock()
+    directoryProtectionFaults.removeValue(forKey: root.path)
+    faultLock.unlock()
+  }
+
+  /// Path-boundary prefix match: `/a/b` covers `/a/b` and `/a/b/c`, and does
+  /// NOT cover `/a/bc` — a bare `hasPrefix` would, and the UUID roots only make
+  /// that collision unlikely, not impossible.
+  private static func injectedFault(for url: URL) -> Shortfall {
+    faultLock.lock()
+    defer { faultLock.unlock() }
+    var result = Shortfall()
+    for (root, fault) in directoryProtectionFaults
+    where url.path == root || url.path.hasPrefix(root + "/") {
+      result.formUnion(fault)
+    }
+    return result
+  }
+
   /// Data protection plus backup exclusion, reported rather than thrown.
   private static func protect(_ url: URL, isDirectory: Bool) -> Shortfall {
-    var shortfall = Shortfall()
+    var shortfall = isDirectory ? injectedFault(for: url) : Shortfall()
 
     #if os(iOS) || os(tvOS) || os(watchOS)
     // Directories carry a protection class too, and it is what newly created

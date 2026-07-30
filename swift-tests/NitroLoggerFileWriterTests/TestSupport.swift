@@ -36,6 +36,9 @@ class LogWriterTestCase: XCTestCase {
     openHandles.removeAll()
     registry = nil
     if let root {
+      // Only this test's root: the seam is process-wide, and clearing
+      // everything would un-poison a parallel test mid-flight.
+      LogSecureFile.clearDirectoryProtectionFaultsForTesting(under: root)
       TestFlags.clearImmutable(under: root)
       chmod(root.path, 0o700)
       try? FileManager.default.removeItem(at: root)
@@ -71,6 +74,28 @@ class LogWriterTestCase: XCTestCase {
     let release = handle.writerForTesting.stallForTesting()
     stalls.append(release)
     return release
+  }
+
+  /// How many descriptors this process currently holds open on `url`.
+  ///
+  /// Deliberately scoped to one path rather than counting the whole descriptor
+  /// table: XCTest, the temp directory and Foundation open and close their own
+  /// descriptors while a test runs, so a table-wide count is noise that a leak
+  /// of one descriptor hides inside. Asking "how many are on *this* file"
+  /// answers exactly the question a reopen-after-close leak poses.
+  ///
+  /// `F_GETPATH` is the macOS way to map a descriptor back to a path; the
+  /// writer opens realpath-resolved paths and `logURL` is resolved in setup, so
+  /// both sides of the comparison are already in the same form.
+  func openDescriptorCount(for url: URL? = nil) -> Int {
+    let target = (url ?? logURL).path
+    var count = 0
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    for fd in 0..<Int32(getdtablesize()) {
+      guard fcntl(fd, F_GETPATH, &buffer) != -1 else { continue }
+      if String(cString: buffer) == target { count += 1 }
+    }
+    return count
   }
 
   func contents(of url: URL? = nil) -> String {

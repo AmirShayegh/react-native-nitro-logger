@@ -349,6 +349,138 @@ final class LogRegistryTests: LogWriterTestCase {
     _ = second?.close(deadlineMs: 1000)
   }
 
+  /// The directory verdict survives two acquires racing to create the same log.
+  ///
+  /// `resolve` runs *outside* the registry lock, and it is `resolve` that
+  /// creates the directory. So on a fresh path the two halves of the evidence
+  /// can land on different threads: whichever acquire wins the `mkdir` is the
+  /// only one that ever learns the backup exclusion failed, while the other one
+  /// can win the lock and publish the writer with nothing to report. The winner
+  /// then arrives at the reuse branch holding the only verdict there is.
+  ///
+  /// Folding it in only through the constructor loses it in exactly that
+  /// interleaving — which is the same reporting gap C11 fixed for the
+  /// single-acquirer case, reappearing under concurrency.
+  ///
+  /// Deterministic, not timing-hopeful: `afterResolveForTesting` parks the
+  /// mkdir winner in the gap between resolving and locking, and it is only
+  /// released once the other acquire has published a writer.
+  func testADirectoryVerdictSurvivesTwoAcquiresRacingToCreateTheLog() throws {
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: root)
+
+    let registry = LogWriterRegistry.isolated()
+    let parked = DispatchSemaphore(value: 0)
+    let mayProceed = DispatchSemaphore(value: 0)
+
+    // Only the first acquire through — the mkdir winner — is parked. The
+    // second must run to completion while the first is held, or there is no
+    // race to test.
+    var parkedOnce = false
+    let parkLock = NSLock()
+    registry.afterResolveForTesting = {
+      parkLock.lock()
+      let shouldPark = !parkedOnce
+      parkedOnce = true
+      parkLock.unlock()
+      guard shouldPark else { return }
+      parked.signal()
+      mayProceed.wait()
+    }
+
+    var winner: LogFileHandle?
+    let winnerDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      winner = try? registry.acquire(
+        path: self.logURL.path, policy: LogRotationPolicy(), lineFramed: true)
+      winnerDone.signal()
+    }
+
+    XCTAssertEqual(parked.wait(timeout: .now() + .seconds(5)), .success,
+                   "the first acquire never reached the gap after resolve")
+
+    // Second acquire: the directory now exists, so its `createDirectory` hits
+    // EEXIST and it has nothing to report. It publishes the writer.
+    let publisher = try registry.acquire(
+      path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
+
+    mayProceed.signal()
+    XCTAssertEqual(winnerDone.wait(timeout: .now() + .seconds(5)), .success)
+
+    let winningHandle = try XCTUnwrap(winner)
+    XCTAssertTrue(winningHandle.writerForTesting === publisher.writerForTesting,
+                  "both acquires must share one writer, or this tests nothing")
+
+    let flag = LogDegradation.protection.rawValue
+    XCTAssertNotEqual(winningHandle.status().degraded & flag, 0,
+                      "the acquire that won the mkdir lost its own verdict")
+    // Same writer, so the publisher sees it too — which is the point: the app
+    // is told regardless of which destination it asks.
+    XCTAssertNotEqual(publisher.status().degraded & flag, 0,
+                      "the verdict must reach every handle on the writer")
+
+    _ = winningHandle.close(deadlineMs: 1000)
+    _ = publisher.close(deadlineMs: 1000)
+  }
+
+  /// And it survives even when the acquire carrying it is turned away.
+  ///
+  /// The mkdir winner can lose the publication race to a caller wanting a
+  /// *different* policy. It is then rejected with `configConflict` — but it
+  /// still created the directory, and what it learned about that directory is
+  /// true whatever policy it asked for. Folding the verdict in only after the
+  /// configuration guard drops it on exactly the path where this acquire never
+  /// returns, and the live writer is the last thing left that could report it.
+  func testADirectoryVerdictSurvivesAnAcquireThatIsRejectedForItsPolicy() throws {
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: root)
+
+    let registry = LogWriterRegistry.isolated()
+    let parked = DispatchSemaphore(value: 0)
+    let mayProceed = DispatchSemaphore(value: 0)
+
+    var parkedOnce = false
+    let parkLock = NSLock()
+    registry.afterResolveForTesting = {
+      parkLock.lock()
+      let shouldPark = !parkedOnce
+      parkedOnce = true
+      parkLock.unlock()
+      guard shouldPark else { return }
+      parked.signal()
+      mayProceed.wait()
+    }
+
+    // The winner asks for a policy the publisher will not agree to.
+    var winnerError: Error?
+    let winnerDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      do {
+        _ = try registry.acquire(
+          path: self.logURL.path,
+          policy: LogRotationPolicy(maxFileSizeBytes: 4096),
+          lineFramed: true)
+      } catch {
+        winnerError = error
+      }
+      winnerDone.signal()
+    }
+
+    XCTAssertEqual(parked.wait(timeout: .now() + .seconds(5)), .success)
+
+    let publisher = try registry.acquire(
+      path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
+
+    mayProceed.signal()
+    XCTAssertEqual(winnerDone.wait(timeout: .now() + .seconds(5)), .success)
+
+    XCTAssertEqual(winnerError as? LogWriterError, .configConflict,
+                   "the mismatched policy must still be refused")
+    XCTAssertNotEqual(
+      publisher.status().degraded & LogDegradation.protection.rawValue, 0,
+      "the rejected acquire took the directory's only verdict with it")
+
+    _ = publisher.close(deadlineMs: 1000)
+  }
+
   // MARK: - Purge honesty
 
   /// A directory that cannot be read is not an empty one. Reporting a durable

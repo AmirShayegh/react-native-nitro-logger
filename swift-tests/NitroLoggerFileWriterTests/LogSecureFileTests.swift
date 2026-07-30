@@ -89,6 +89,56 @@ final class LogSecureFileTests: LogWriterTestCase {
     XCTAssertTrue(shortfall.isEmpty)
   }
 
+  /// A protection failure on the log directory reaches the app.
+  ///
+  /// This is the shortfall that is easiest to lose, because exactly one call
+  /// can see it. `createDirectory` evaluates the backup exclusion and the
+  /// protection class only where its own `mkdir` won; anything that finds the
+  /// directory already there is answered by `inspect`, which reports the mode
+  /// and nothing else. The registry resolves the path before building the
+  /// writer, and resolving must create the directory first because `realpath`
+  /// only answers for things that exist — so the registry always wins that
+  /// `mkdir` and the writer's own call always lands on `EEXIST`.
+  ///
+  /// The writer therefore cannot rediscover this for itself. If the registry
+  /// drops what it saw, a directory whose backup exclusion silently failed is
+  /// indistinguishable from one where it held, for the life of the process —
+  /// and "this log is excluded from backup" is exactly the kind of claim a
+  /// privacy review relies on.
+  func testADirectoryProtectionFailureReachesTheWriter() throws {
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: root)
+
+    let handle = try makeHandle()
+
+    XCTAssertNotEqual(
+      handle.status().degraded & LogDegradation.protection.rawValue, 0,
+      "the only call that can see a directory protection failure discarded it")
+    // The directory is otherwise fine: this is not a mode problem wearing a
+    // protection label, which is what asserting `degraded != 0` alone would
+    // have allowed.
+    XCTAssertEqual(mode(of: logsDirectory), 0o700)
+    XCTAssertEqual(mode(of: logURL), 0o600)
+  }
+
+  /// The registry is where that shortfall is observed, so pin it there too —
+  /// otherwise the test above passes on any route that happens to set the flag,
+  /// including the writer's own `EEXIST` call reporting something unrelated.
+  func testResolveCarriesTheShortfallItObserved() throws {
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: root)
+
+    let resolved = try LogWriterRegistry.resolve(path: logURL.path)
+
+    XCTAssertTrue(resolved.shortfall.contains(.protection),
+                  "resolve won the mkdir and must hand on what securing found")
+
+    // And the second call — the one the writer makes — genuinely cannot see it,
+    // which is what makes carrying it the only way.
+    LogSecureFile.clearDirectoryProtectionFaultsForTesting(under: root)
+    let second = try LogSecureFile.createDirectory(at: logsDirectory)
+    XCTAssertFalse(second.contains(.protection),
+                   "a directory it did not create is inspected, not re-secured")
+  }
+
   /// The case that defeats a naive "is it already a directory" check.
   ///
   /// `createDirectory` accepts a symlink that resolves to a directory, and

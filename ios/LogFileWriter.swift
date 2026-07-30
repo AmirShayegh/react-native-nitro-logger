@@ -219,7 +219,9 @@ public final class LogWriter {
 
   private let stateLock = NSLock()
   /// Held for the whole of `clearLogs`, so purges cannot interleave.
-  private let purgeLock = NSLock()
+  /// A binary semaphore rather than `NSLock`: the timed acquire in `clearLogs`
+  /// needs a monotonic deadline, and `lock(before:)` only speaks `Date`.
+  private let purgeLock = DispatchSemaphore(value: 1)
   private var reservedBytes = 0
   private var generation: UInt64 = 1
   private var closed = false
@@ -248,13 +250,27 @@ public final class LogWriter {
   /// backoff actually backs off.
   private var rotationAttempts = 0
 
+  /// - Parameter directoryShortfall: what the caller's own `createDirectory`
+  ///   already found. Not an optimisation — it is the only way this writer can
+  ///   learn about a *protection* shortfall on its directory.
+  ///
+  ///   `createDirectory` reports the backup exclusion and the protection class
+  ///   only on the branch where its own `mkdir` succeeded; a directory it found
+  ///   already there is inspected, and `inspect` deliberately reports the mode
+  ///   and nothing else. The registry resolves the path before constructing
+  ///   this writer, and resolving has to create the directory first because
+  ///   `realpath` only answers for things that exist — so the registry always
+  ///   wins the `mkdir`, and the call below always lands on `EEXIST`. Discarding
+  ///   what the registry saw therefore does not lose a duplicate opinion; it
+  ///   loses the only one that was ever formed.
   init(
     fileURL: URL,
     canonicalPath: String,
     policy: LogRotationPolicy,
     lineFramed: Bool,
     rawWrite: RawWrite? = nil,
-    compressor: Compressor? = nil
+    compressor: Compressor? = nil,
+    directoryShortfall: LogSecureFile.Shortfall = []
   ) throws {
     self.fileURL = fileURL
     self.canonicalPath = canonicalPath
@@ -271,7 +287,11 @@ public final class LogWriter {
     self.queue = DispatchQueue(label: "com.nitrologger.filewriter")
     queue.setSpecific(key: queueKey, value: true)
 
+    // Union, not replacement. The local call still has to run — this writer may
+    // be built against a directory nobody resolved, and it re-checks the mode —
+    // but on the registry path it can only ever report what `inspect` reports.
     let shortfall = try LogSecureFile.createDirectory(at: fileURL.deletingLastPathComponent())
+      .union(directoryShortfall)
     if !shortfall.isEmpty { degraded.insert(.protection) }
     guard let opened = Self.openForAppending(at: fileURL) else {
       throw LogWriterError.openFailed("could not open the log file")
@@ -592,6 +612,20 @@ public final class LogWriter {
   /// parameter since the crash-path work; the port dropped it.
   private func writableHandle(ignoringBackoff: Bool = false) -> FileHandle? {
     if let handle { return handle }
+
+    // Past the close barrier there is nothing to reopen INTO. `close()`
+    // released the descriptor and the caller is done with this writer, so
+    // opening a fresh one would leak it for the lifetime of the process and
+    // resurrect a writer that was deliberately shut.
+    //
+    // The guard lives here rather than at each call site because this is the
+    // only place a descriptor is created on demand. `performWrite` and the
+    // purge path already refuse after termination; `syncNow` did not, and it
+    // reaches this with `ignoringBackoff: true`, so a `flush()` arriving after
+    // `close()` returned would quietly reopen. Callers read `nil` as "no
+    // descriptor", which is the truth: a terminated writer cannot sync.
+    if terminated { return nil }
+
     if !ignoringBackoff, let last = lastReopenAttempt,
        Self.steadyMillis() - last < Self.reopenBackoffMs {
       return nil
@@ -602,9 +636,14 @@ public final class LogWriter {
 
   /// Monotonic milliseconds since boot.
   ///
-  /// `DispatchTime` rather than `Date` for every elapsed-time question in this
-  /// file. It cannot be moved by the user or by NTP, which is the whole point:
-  /// a clock that jumps backwards turns a one-second backoff into an outage.
+  /// `DispatchTime` rather than `Date` for every elapsed-time question asked
+  /// within one process lifetime — backoffs, deadlines, the purge lock. It
+  /// cannot be moved by the user or by NTP, which is the whole point: a clock
+  /// that jumps backwards turns a one-second backoff into an outage.
+  ///
+  /// The deliberate exceptions are the questions that span restarts: file age
+  /// and archive-retention cutoffs are measured against filesystem timestamps,
+  /// which have to be calendar time because an uptime clock restarts at zero.
   private static func steadyMillis() -> Int64 {
     Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
   }
@@ -808,6 +847,21 @@ public final class LogWriter {
     totals.bytes += bytes
     loss[handleID] = totals
     stateLock.unlock()
+  }
+
+  /// Folds a directory shortfall observed by a *later* acquire into this
+  /// writer.
+  ///
+  /// Exists because `resolve()` runs outside the registry lock. Two first
+  /// acquires racing on a fresh directory split the evidence: one wins the
+  /// `mkdir` — and with it the only protection verdict the directory ever
+  /// gets — while the other can win the registry lock and publish the writer.
+  /// The verdict then arrives at a writer that already exists, and the reuse
+  /// branch has to fold it in; dropping it there would reopen the exact
+  /// reporting gap the `directoryShortfall` init parameter closes for the
+  /// single-acquirer path.
+  func absorbDirectoryShortfall(_ shortfall: LogSecureFile.Shortfall) {
+    if !shortfall.isEmpty { note(.protection) }
   }
 
   private func note(_ flag: LogDegradation) {
@@ -1096,7 +1150,14 @@ public final class LogWriter {
     // generation, and the first to finish would otherwise report success for a
     // fence the second has already moved — handing its caller permission to
     // write while a deletion is still in flight.
-    guard purgeLock.lock(before: Date().addingTimeInterval(Double(budget) / 1000)) else {
+    //
+    // Waited against `deadline`, the monotonic budget computed above — not a
+    // fresh realtime target. `NSLock.lock(before:)` takes a `Date`, and a
+    // clock step during the wait stretches or collapses the budget; the
+    // semaphore's `DispatchTime` deadline cannot be moved, and reusing
+    // `deadline` also stops the lock wait from quietly restarting the budget
+    // the comment above says starts at entry.
+    guard purgeLock.wait(timeout: deadline) == .success else {
       stateLock.lock()
       let current = generation
       stateLock.unlock()
@@ -1105,7 +1166,7 @@ public final class LogWriter {
         current
       )
     }
-    defer { purgeLock.unlock() }
+    defer { purgeLock.signal() }
 
     stateLock.lock()
     generation &+= 1

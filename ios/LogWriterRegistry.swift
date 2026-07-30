@@ -17,7 +17,7 @@ public final class LogWriterRegistry {
 
   /// A condition rather than a plain lock, because acquisition sometimes has to
   /// *wait* — see `closing` below.
-  private let condition = NSCondition()
+  private let condition = MonotonicCondition()
   private var writers: [String: LogWriter] = [:]
   /// Paths whose writer has been evicted but is still draining and closing.
   ///
@@ -38,6 +38,15 @@ public final class LogWriterRegistry {
   /// finish shutting down before giving up.
   static let closeWaitSeconds: TimeInterval = 5
 
+  /// Test seam: runs after `resolve` and before the registry lock is taken.
+  ///
+  /// That gap is where the mkdir-winner/publication race lives, and nothing
+  /// else can hold an acquire open inside it: the gap contains no lock to
+  /// contend on and no I/O to stall. The race test parks the mkdir-winning
+  /// acquire here while a second acquire publishes the writer, which is the
+  /// interleaving the reuse branch's `absorbDirectoryShortfall` exists for.
+  var afterResolveForTesting: (() -> Void)?
+
   init() {}
 
   /// Acquires a handle on the writer for `path`, creating it if needed.
@@ -55,6 +64,7 @@ public final class LogWriterRegistry {
     compressor: LogWriter.Compressor? = nil
   ) throws -> LogFileHandle {
     let resolved = try LogWriterRegistry.resolve(path: path)
+    afterResolveForTesting?()
 
     condition.lock()
     defer { condition.unlock() }
@@ -65,7 +75,7 @@ public final class LogWriterRegistry {
     // the open is the fail-closed answer: one writer per file is the invariant
     // worth keeping, and a caller that cannot have it should be told so rather
     // than handed a second one.
-    let waitUntil = Date().addingTimeInterval(Self.closeWaitSeconds)
+    let waitUntil = DispatchTime.now() + .milliseconds(Int(Self.closeWaitSeconds * 1000))
     while closing[resolved.canonicalPath] != nil {
       if !condition.wait(until: waitUntil) {
         throw LogWriterError.stillClosing
@@ -74,6 +84,21 @@ public final class LogWriterRegistry {
 
     let writer: LogWriter
     if let existing = writers[resolved.canonicalPath], !existing.isClosed {
+      // BEFORE the configuration check, deliberately. This acquire may be the
+      // one whose `resolve` won the `mkdir` — and with it the only protection
+      // verdict the directory ever gets — while another acquire won THIS lock
+      // and published the writer with nothing to report. `resolve` runs outside
+      // the lock, so the evidence and the writer can arrive on different
+      // threads, and the verdict is folded in wherever it lands rather than
+      // only through the constructor.
+      //
+      // Ordering it after the guard below would lose it for good on the one
+      // path where this acquire never returns: a rejected caller still made the
+      // directory, and what it learned about that directory is true regardless
+      // of the policy it asked for. The live writer is the only thing left to
+      // tell, and `configConflict` would otherwise take the finding with it.
+      existing.absorbDirectoryShortfall(resolved.shortfall)
+
       // A second destination on the same file must agree about how that file is
       // written. Silently honouring the first caller's rotation policy would
       // give the second one a file that behaves nothing like what it asked for,
@@ -89,7 +114,8 @@ public final class LogWriterRegistry {
         policy: policy,
         lineFramed: lineFramed,
         rawWrite: rawWrite,
-        compressor: compressor
+        compressor: compressor,
+        directoryShortfall: resolved.shortfall
       )
       writers[resolved.canonicalPath] = writer
     }
@@ -145,6 +171,16 @@ public final class LogWriterRegistry {
   struct Resolved {
     let url: URL
     let canonicalPath: String
+    /// What creating the directory fell short of.
+    ///
+    /// Carried rather than dropped because this call is the one that creates
+    /// the directory, and `createDirectory` evaluates the backup exclusion and
+    /// the protection class **only** on the branch where its own `mkdir` won.
+    /// Every later caller finds the directory already there and is answered by
+    /// `inspect`, which reports the mode alone. If this value is discarded, a
+    /// directory whose backup exclusion silently failed is indistinguishable
+    /// from one where it held — for the life of the process.
+    let shortfall: LogSecureFile.Shortfall
   }
 
   /// Turns a caller-supplied path into the canonical file it names.
@@ -162,7 +198,7 @@ public final class LogWriterRegistry {
       throw LogWriterError.openFailed("path does not name a file")
     }
 
-    try LogSecureFile.createDirectory(at: directory)
+    let shortfall = try LogSecureFile.createDirectory(at: directory)
 
     guard let canonicalDirectory = realpath(directory.path, nil) else {
       throw LogWriterError.openFailed("could not resolve the log directory")
@@ -180,7 +216,7 @@ public final class LogWriterRegistry {
       throw LogWriterError.symlinkEscape
     }
 
-    return Resolved(url: candidate, canonicalPath: candidate.path)
+    return Resolved(url: candidate, canonicalPath: candidate.path, shortfall: shortfall)
   }
 
   // MARK: - Test support
@@ -230,7 +266,7 @@ public final class LogFileHandle {
   /// own to keep, would blow straight through it. So the purge marks itself
   /// with `purging` and drops the lock; anyone who genuinely cannot proceed
   /// alongside it waits on the condition under their own bound.
-  private let condition = NSCondition()
+  private let condition = MonotonicCondition()
   private var generation: UInt64
   private var state: State = .active
   /// Set for the duration of `clearLogs`, so `close` can tell "a deletion is in
@@ -389,7 +425,7 @@ public final class LogFileHandle {
   /// deadline into a multiple of itself, which on the JS side is a dispose that
   /// blocks the runtime for three times as long as it promised.
   public func close(deadlineMs: Double) -> LogFlushOutcome {
-    let expiry = Date().addingTimeInterval(Double(LogWriter.clampDeadline(deadlineMs)) / 1000)
+    let expiry = DispatchTime.now() + .milliseconds(LogWriter.clampDeadline(deadlineMs))
 
     // Shut the door before doing any waiting: everything below can take the
     // whole budget, and nothing new should be able to start during it.
@@ -419,8 +455,10 @@ public final class LogFileHandle {
 
   /// Milliseconds left, floored at zero — which the writer reads as "do not
   /// wait", not as "wait forever".
-  private static func remaining(until expiry: Date) -> Double {
-    max(0, expiry.timeIntervalSinceNow * 1000)
+  private static func remaining(until expiry: DispatchTime) -> Double {
+    let now = DispatchTime.now()
+    guard expiry > now else { return 0 }
+    return Double(expiry.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000
   }
 
   private func releaseNow(deadlineMs: Double) {
@@ -440,5 +478,66 @@ public final class LogFileHandle {
     condition.lock()
     defer { condition.unlock() }
     return generation
+  }
+}
+
+// MARK: - Monotonic waiting
+
+/// A condition variable whose timeout is measured with a clock nothing can move.
+///
+/// `NSCondition.wait(until:)` takes a `Date`, and `Date` is CLOCK_REALTIME. An
+/// NTP correction or a user changing the device clock mid-wait changes how long
+/// that wait lasts, and backwards is the dangerous direction: the wait does not
+/// end until realtime catches up, so a 200 ms close budget becomes as long as
+/// the step. That is a dispose blocking the JavaScript thread for a minute
+/// because the clock moved. Forwards is quieter and still wrong — the wait ends
+/// at once and a deadline silently becomes no wait at all.
+///
+/// **Slicing a realtime wait into short legs does not fix this.** Each leg is
+/// still a realtime target, so a backward step stretches whichever leg it lands
+/// in by the whole step; slicing bounds the forward case and leaves the one that
+/// matters. The timeout has to not be expressed in realtime at all, which is
+/// what `pthread_cond_timedwait_relative_np` is for: Darwin's relative-timeout
+/// wait, unaffected by changes to the calendar clock. `DispatchTime` is the
+/// deadline type that matches it, and is already what `LogWriter` uses for every
+/// elapsed-time question it asks.
+///
+/// Darwin-only, which this target is: the package builds for iOS and macOS, and
+/// the Android side reaches the same place through its own monotonic clock.
+final class MonotonicCondition {
+  private let mutex = UnsafeMutablePointer<pthread_mutex_t>.allocate(capacity: 1)
+  private let cond = UnsafeMutablePointer<pthread_cond_t>.allocate(capacity: 1)
+
+  init() {
+    pthread_mutex_init(mutex, nil)
+    pthread_cond_init(cond, nil)
+  }
+
+  deinit {
+    pthread_mutex_destroy(mutex)
+    pthread_cond_destroy(cond)
+    mutex.deallocate()
+    cond.deallocate()
+  }
+
+  func lock() { pthread_mutex_lock(mutex) }
+  func unlock() { pthread_mutex_unlock(mutex) }
+  func broadcast() { pthread_cond_broadcast(cond) }
+
+  /// Waits until broadcast or until `deadline`. `false` means the deadline won.
+  ///
+  /// A spurious wakeup returns `true`, exactly as `NSCondition` does — every
+  /// caller re-tests its predicate in a loop. The remaining time is re-derived
+  /// from the monotonic clock on each pass, so repeated wakeups cannot stretch
+  /// the total wait past the deadline.
+  func wait(until deadline: DispatchTime) -> Bool {
+    let now = DispatchTime.now()
+    guard deadline > now else { return false }
+    let remaining = deadline.uptimeNanoseconds - now.uptimeNanoseconds
+    var timeout = timespec(
+      tv_sec: Int(remaining / 1_000_000_000),
+      tv_nsec: Int(remaining % 1_000_000_000)
+    )
+    return pthread_cond_timedwait_relative_np(cond, mutex, &timeout) == 0
   }
 }

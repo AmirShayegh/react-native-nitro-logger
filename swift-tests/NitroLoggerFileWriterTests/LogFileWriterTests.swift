@@ -202,6 +202,60 @@ final class LogFileWriterTests: LogWriterTestCase {
     XCTAssertEqual(contents(), "before\n")
   }
 
+  /// A flush that reaches the writer after the close barrier must not open a
+  /// descriptor nothing will ever close.
+  ///
+  /// `syncNow` asks for a handle with `ignoringBackoff: true` — deliberately,
+  /// because a flush is someone asking for durability now. Without a
+  /// `terminated` check that unconditionally called `attemptReopen()`, so a
+  /// flush landing behind the barrier opened a fresh descriptor on a writer the
+  /// caller had finished with. Nothing holds it and nothing will close it: it
+  /// leaks for the lifetime of the process, and the flush reports success by
+  /// resurrection.
+  ///
+  /// **Why this calls the writer rather than `handle.flush`.** It is reproducing
+  /// one specific interleaving, and going through the handle cannot reach it:
+  ///
+  ///   * `LogFileHandle.flush` checks `liveGeneration()`, drops the lock, and
+  ///     only then calls `writer.flush(handleID:)`. In that window a concurrent
+  ///     `close()` can run to completion — `state = .closing`, its own flush,
+  ///     `releaseNow`, the writer's barrier setting `terminated`. The first
+  ///     thread then resumes and enqueues `syncNow` *behind* that barrier.
+  ///     `handle.flush` called after `close()` returns is refused by the
+  ///     generation check, so it proves nothing about this path.
+  ///   * Nothing enqueued before the barrier can reach it either: the write
+  ///     queue is serial, so everything queued ahead of the barrier runs while
+  ///     `terminated` is still false — including a flush whose deadline expired
+  ///     with its block still pending.
+  ///
+  /// So the only way in is the one the racing thread takes: a handle ID that
+  /// already passed the generation check, handed to `writer.flush` after
+  /// termination. That is what this does, and it is the sole reason the guard
+  /// lives in `writableHandle` rather than at the call sites.
+  func testFlushReachingTheWriterAfterTerminationDoesNotReopen() throws {
+    let handle = try makeHandle()
+    write(handle, "before\n")
+
+    // Single handle, so this drives the writer's refcount to zero: the registry
+    // closes it and the barrier sets `terminated`.
+    _ = handle.close(deadlineMs: 1000)
+    let writer = handle.writerForTesting
+    XCTAssertTrue(writer.isClosed, "the writer must really be terminated for this to test anything")
+
+    // Pin the baseline at zero rather than comparing before with after: if
+    // `close()` itself leaked, a flush that merely reused that descriptor would
+    // satisfy before == after and the test would pass with the leak intact.
+    XCTAssertEqual(openDescriptorCount(), 0, "close left a descriptor open on the log")
+
+    let outcome = writer.flush(handleID: handle.id, deadlineMs: 1000)
+
+    XCTAssertFalse(outcome.durable, "a terminated writer cannot sync anything")
+    XCTAssertEqual(
+      openDescriptorCount(), 0,
+      "flush after termination opened a descriptor that nothing will ever close")
+    XCTAssertEqual(contents(), "before\n")
+  }
+
   // MARK: - Liveness
 
   /// Writes to an unlinked inode succeed forever and land nowhere, with no
