@@ -39,10 +39,17 @@ trap 'rm -rf "$OUT"' EXIT
 # `files` and it ships unchecked; the hardcoded list stays green because it
 # never heard of it. (CHANGELOG.md was exactly that: shipped, never checked.)
 #
-# `--ignore-scripts` because packing must not trigger a build here, and `--json`
-# because the human-readable output is a formatted tree that would have to be
-# scraped. npm rather than yarn: `yarn pack --dry-run` prints its manifest as
-# log lines with no machine-readable mode.
+# `--json` because the human-readable output is a formatted tree that would have
+# to be scraped. npm rather than yarn: `yarn pack --dry-run` prints its manifest
+# as log lines with no machine-readable mode.
+#
+# `--ignore-scripts` asks for the manifest without a build. npm honours it for
+# the dependency lifecycle and *not* for `prepare` on `pack` — verified on npm
+# 10.9.3, where the build runs anyway and prints to stdout, ahead of the JSON.
+# So the stream is not assumed to be a manifest and the manifest is located in
+# it below; a stream with no manifest in it is a failure, never an empty
+# document list, which would report "every shipped document compiles" about
+# nothing at all.
 npm pack --dry-run --json --ignore-scripts > "$OUT/manifest.json"
 
 python3 - "$OUT" "$OUT/manifest.json" <<'PY'
@@ -50,7 +57,59 @@ import json, pathlib, re, sys
 
 out = pathlib.Path(sys.argv[1])
 
-manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
+def is_manifest(value):
+    """Whether a decoded value has the full shape `npm pack --json` produces.
+
+    Every field npm puts there is required, not just `files`. A weaker test —
+    "a list whose first element mentions files" — is satisfied by
+    `[{"files": []}]`, which a lifecycle script could print for its own reasons,
+    and accepting that hands back a document list that is merely short. Short is
+    the failure mode that matters here: the whole point of reading the manifest
+    is that nothing shipped goes unchecked.
+    """
+    if not isinstance(value, list) or not value:
+        return False
+    return all(
+        isinstance(package, dict)
+        and isinstance(package.get('name'), str)
+        and isinstance(package.get('version'), str)
+        and isinstance(package.get('filename'), str)
+        and isinstance(package.get('files'), list)
+        and package['files']
+        and all(isinstance(entry, dict) and isinstance(entry.get('path'), str)
+                for entry in package['files'])
+        for package in value
+    )
+
+
+def manifest_in(stream):
+    """The `npm pack --json` array, wherever a lifecycle script left it.
+
+    Every candidate start is decoded rather than the first one accepted, and
+    *one* has to survive `is_manifest`. Two would mean the stream contains
+    something else shaped exactly like a pack manifest, and picking either would
+    be a guess about which describes the tarball — so that is a failure too,
+    rather than a coin toss that reports a document list nobody checked.
+    """
+    decoder = json.JSONDecoder()
+    found = []
+    for index, character in enumerate(stream):
+        if character != '[':
+            continue
+        try:
+            value, _ = decoder.raw_decode(stream[index:])
+        except ValueError:
+            continue
+        if is_manifest(value):
+            found.append(value)
+    return found
+
+
+candidates = manifest_in(pathlib.Path(sys.argv[2]).read_text())
+if len(candidates) != 1:
+    print(f'FAIL: `npm pack --json` left {len(candidates)} manifests to read, not 1')
+    sys.exit(1)
+manifest = candidates[0]
 docs = sorted(
     entry['path']
     for package in manifest
