@@ -4,6 +4,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -11,6 +12,8 @@ import org.junit.Assume
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * One writer per file, and the fencing that depends on it.
@@ -52,12 +55,14 @@ class LogWriterRegistryTest {
     path: String,
     policy: LogRotationPolicy = LogRotationPolicy.of(),
     lineFramed: Boolean = true,
-    owner: Long? = null
+    owner: Long? = null,
+    rawWrite: LogFileWriter.RawWrite? = null
   ): LogFileHandle = registry.acquire(
     path = path,
     policy = policy,
     lineFramed = lineFramed,
     platform = PlatformIo.Jvm,
+    rawWrite = rawWrite,
     clock = { 1_700_000_000_000L },
     owner = owner
   ).also { handles.add(it) }
@@ -419,6 +424,210 @@ class LogWriterRegistryTest {
     handle.close(1000.0)
 
     assertEquals(0, registry.claimCountForOwnerForTesting(owner))
+  }
+
+  /**
+   * The refusal has to survive the wait, and the wait is where it is hardest.
+   *
+   * An acquisition that finds the path `closing` sleeps on [pathFreed] — and
+   * that **releases the registry lock**. Its owner can die and be swept while it
+   * is in there, and the sweep finds nothing to take, because this claim is not
+   * registered yet. A single liveness check before the wait would let it wake up
+   * and register a handle against a runtime that no longer exists and that
+   * nothing will ever sweep again: C13 through a smaller gap.
+   */
+  @Test
+  fun `an owned acquisition asleep on a closing path is refused when its owner dies`() {
+    val path = File(directory, "app.log").absolutePath
+    val stalled = CountDownLatch(1)
+    try {
+      // A writer whose executor is wedged mid-write. `close` enqueues its
+      // termination barrier behind that wedge, so the barrier — and with it the
+      // `closing` claim on the path — outlives the close call.
+      val first = acquire(path, rawWrite = stallingWrite(stalled))
+      first.appendBatch("wedged\n", 1)
+      first.close(50.0)
+      assertEquals("the close must still be holding the path", 1, registry.closingCountForTesting)
+
+      val owner = ReactInstanceEpoch.begin()
+      ReactInstanceEpoch.releaseOwner = { registry.releaseOwner(it, 0.0) }
+      val verdict = AtomicReference<Any?>()
+      val waiter = acquiringThread(path, LogRotationPolicy.of(), owner, verdict)
+
+      waiter.start()
+      awaitThreadState(waiter, Thread.State.TIMED_WAITING, "the acquisition to reach the wait", verdict)
+
+      // Destroyed while it sleeps. The sweep has nothing to close: this claim
+      // does not exist yet, which is exactly what makes the recheck necessary.
+      ReactInstanceEpoch.end(owner)
+      stalled.countDown()
+      waiter.join(10_000)
+
+      val refusal = verdict.get()
+      if (refusal is LogFileHandle) {
+        refusal.close(500.0)
+        fail("the acquisition was granted a writer for a runtime that no longer exists")
+      }
+      assertTrue("expected a refusal, got $refusal", refusal is LogWriterException)
+      assertEquals(LogWriterException.Kind.OPEN_FAILED, (refusal as LogWriterException).kind)
+      assertEquals("nothing may be claimed for a dead owner", 0, registry.claimCountForOwnerForTesting(owner))
+      assertEquals("and nothing may be built for one", 0, registry.liveWriterCountForTesting)
+    } finally {
+      stalled.countDown()
+    }
+  }
+
+  /**
+   * The middle of a sweep is not a state anyone else can see.
+   *
+   * Ownership removal and eviction happen together, under the registry lock. Do
+   * them apart — drop the claims, unlock, then close — and there is a window in
+   * which the writer is still installed and still retained, so the replacement
+   * runtime's `open` finds a live writer carrying the *dead* runtime's rotation
+   * configuration and is refused `CONFIG_CONFLICT`. That is the reload failure
+   * this whole file exists to fix, arriving one layer down.
+   *
+   * The rival is released into exactly that window and must not get a verdict
+   * out of it: blocked on the lock during, waiting on the path after, and open
+   * once the writer has finished draining.
+   */
+  @Test
+  fun `a replacement configuration cannot see the middle of a sweep`() {
+    val path = File(directory, "app.log").absolutePath
+    val stalled = CountDownLatch(1)
+    try {
+      val owner = ReactInstanceEpoch.begin()
+      val handle = acquire(
+        path,
+        policy = LogRotationPolicy.of(maxFileSizeBytes = 4096.0),
+        owner = owner,
+        rawWrite = stallingWrite(stalled)
+      )
+      handle.appendBatch("wedged\n", 1)
+
+      // A configuration the dying runtime is not holding, so a `CONFIG_CONFLICT`
+      // here can only mean the rival saw the old writer.
+      val verdict = AtomicReference<Any?>()
+      val rival = acquiringThread(path, LogRotationPolicy.of(maxFileSizeBytes = 8192.0), null, verdict)
+
+      registry.duringOwnerReleaseForTesting = {
+        rival.start()
+        // WAITING, not BLOCKED: the registry's lock is a `ReentrantLock`, and
+        // AQS parks rather than contending on a monitor. BLOCKED is what a
+        // `synchronized` block would give.
+        awaitThreadState(rival, Thread.State.WAITING, "the rival to reach the registry lock", verdict)
+        assertNull("the rival got a verdict out of the middle of the sweep: ${verdict.get()}", verdict.get())
+      }
+      registry.releaseOwner(owner, 50.0)
+      registry.duringOwnerReleaseForTesting = null
+
+      // Bookkeeping is done, but the writer is still draining behind the wedge,
+      // so the rival is now waiting out the path rather than being refused.
+      awaitThreadState(rival, Thread.State.TIMED_WAITING, "the rival to wait out the close", verdict)
+      stalled.countDown()
+      rival.join(10_000)
+
+      val opened = verdict.get()
+      if (opened is LogWriterException) {
+        fail("the replacement was refused ${opened.kind}: ${opened.message}")
+      }
+      assertTrue("the replacement never opened: $opened", opened is LogFileHandle)
+      val replacement = opened as LogFileHandle
+      handles.add(replacement)
+      assertTrue("and it owns the file", replacement.appendBatch("after the reload\n", 1).accepted)
+    } finally {
+      registry.duringOwnerReleaseForTesting = null
+      stalled.countDown()
+    }
+  }
+
+  /**
+   * One budget for the sweep, not one per phase.
+   *
+   * `releaseOwner` waits twice — the flush in `finishOwnerRelease`, then the
+   * executor drain in `writer.close` — and a caller asking for 300 ms must not
+   * be made to wait 600. This is the teardown path, where the runtime that would
+   * have cared about durability is already gone and something is waiting on the
+   * main thread for it to be over.
+   *
+   * Read rather than timed: with the executor wedged the flush is guaranteed to
+   * spend the whole budget, so the number handed to the drain is exactly zero,
+   * and asserting that says nothing about how loaded the machine is. Timing the
+   * call would have made a stalled CI worker look like the bug.
+   */
+  @Test
+  fun `a sweep spends a single budget across every wait it does`() {
+    val path = File(directory, "app.log").absolutePath
+    val stalled = CountDownLatch(1)
+    try {
+      val owner = ReactInstanceEpoch.begin()
+      // Wedged for the whole test, so the flush runs out rather than finishing
+      // early and leaving a budget that proves nothing either way.
+      acquire(path, owner = owner, rawWrite = stallingWrite(stalled)).appendBatch("wedged\n", 1)
+
+      val drains = mutableListOf<Double>()
+      registry.ownerDrainBudgetForTesting = { drains.add(it) }
+      registry.releaseOwner(owner, 300.0)
+
+      assertEquals("one writer, so one drain", 1, drains.size)
+      assertEquals("the flush spent the budget; the drain gets what is left", 0.0, drains[0], 0.0)
+    } finally {
+      registry.ownerDrainBudgetForTesting = null
+      stalled.countDown()
+    }
+  }
+
+  /** A write that parks the writer's executor until [gate] opens. */
+  private fun stallingWrite(gate: CountDownLatch) = LogFileWriter.RawWrite { stream, data, offset, length ->
+    gate.await()
+    stream.write(data, offset, length)
+    length
+  }
+
+  /**
+   * An acquisition on its own thread, reporting whatever it got — handle or
+   * exception — into [verdict].
+   */
+  private fun acquiringThread(
+    path: String,
+    policy: LogRotationPolicy,
+    owner: Long?,
+    verdict: AtomicReference<Any?>
+  ) = Thread({
+    try {
+      verdict.set(
+        registry.acquire(
+          path = path,
+          policy = policy,
+          lineFramed = true,
+          platform = PlatformIo.Jvm,
+          clock = { 1_700_000_000_000L },
+          owner = owner
+        )
+      )
+    } catch (t: Throwable) {
+      verdict.set(t)
+    }
+  }, "registry-rival")
+
+  /**
+   * Waits for [thread] to reach [wanted], or for it to answer early.
+   *
+   * An early answer is not a timeout — it is the failure these two tests are
+   * looking for — so it ends the wait and is left for the assertions.
+   */
+  private fun awaitThreadState(
+    thread: Thread,
+    wanted: Thread.State,
+    what: String,
+    verdict: AtomicReference<Any?>
+  ) {
+    val deadline = System.nanoTime() + 10_000L * 1_000_000L
+    while (System.nanoTime() < deadline) {
+      if (thread.state == wanted || verdict.get() != null) return
+      Thread.sleep(5)
+    }
+    fail("timed out waiting for $what; it is ${thread.state}")
   }
 
   /**

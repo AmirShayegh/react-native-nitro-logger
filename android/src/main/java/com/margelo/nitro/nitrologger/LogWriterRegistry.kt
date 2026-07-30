@@ -226,12 +226,7 @@ class LogWriterRegistry {
       // dead *before* it sweeps, so an acquisition either got here first and
       // will be swept, or arrives to find the owner gone. A writer opened for a
       // runtime that has already been destroyed has nobody left to close it.
-      if (owner != null && !ReactInstanceEpoch.isLive(owner)) {
-        throw LogWriterException(
-          LogWriterException.Kind.OPEN_FAILED,
-          "the runtime that asked for this log file has been destroyed"
-        )
-      }
+      refuseIfOwnerIsGone(owner)
 
       // Wait out a close still in progress on this path — but not forever. The
       // claim is cleared by the writer's own executor rather than by whoever
@@ -261,6 +256,14 @@ class LogWriterRegistry {
         }
         budget = TimeUnit.NANOSECONDS.toMillis(waited)
       }
+
+      // Asked again, because the wait above **released this lock**. An owner can
+      // die and be swept while an acquisition of its own is asleep in there —
+      // and the sweep finds nothing to take, because this claim is not
+      // registered yet. Registering it now would leave a writer owned by a
+      // runtime nothing will ever sweep again, which is C13 through a smaller
+      // gap. Everything below this line runs without releasing the lock.
+      refuseIfOwnerIsGone(owner)
 
       val existing = writers[resolved.canonicalPath]
       val writer: LogFileWriter
@@ -322,48 +325,118 @@ class LogWriterRegistry {
   fun releaseOwner(owner: Long, deadlineMs: Double) {
     val doomed = lock.withLock {
       val claims = ownerClaims.remove(owner) ?: return
+      // Also for the handles that turn out to be closing already: their own
+      // close is finishing the job, but the record must not outlive this sweep.
+      //
+      // Before the loop, not after, and not only for tidiness: both maps are
+      // emptied of this owner up front, so [dropClaimLocked] below finds nothing
+      // to unregister and does not mutate `claims` while the loop is walking it.
       claims.keys.forEach { claimOwner.remove(it) }
-      claims.values.toList()
+      duringOwnerReleaseForTesting?.invoke()
+      claims.values.mapNotNull { handle ->
+        // The state flip and the eviction happen together, under this lock, and
+        // that is the whole point of the two phases. Doing the flip out here and
+        // the eviction inside `close` — which is what this used to do — leaves a
+        // window in which the writer is still installed and still retained,
+        // where a replacement runtime's `open` sees a live writer with the dead
+        // runtime's rotation config and is refused `CONFIG_CONFLICT`. That is
+        // the bug this whole file exists to fix, arriving through a smaller gap.
+        val writer = handle.beginOwnerRelease() ?: return@mapNotNull null
+        Doomed(handle, writer, handle.id, dropClaimLocked(writer, handle.id))
+      }
     }
-    // Idempotent by state: a handle whose JavaScript already closed it is not
-    // ACTIVE and returns inert, so a close arriving from both sides is safe.
-    doomed.forEach { it.close(deadlineMs) }
+
+    // Only the parts that wait are out here: the purge wait, the flush, and the
+    // executor drain. By now the path is already marked `closing`, so an
+    // acquisition arriving during any of it waits for the path rather than
+    // colliding with a writer that is on its way out.
+    for (item in doomed) {
+      // One budget across both phases, the same way [LogFileHandle.close] spends
+      // one across its own three waits. Handing `deadlineMs` to the drain as
+      // well would let a caller asking for 200 ms wait 400.
+      val left = item.handle.finishOwnerRelease(deadlineMs)
+      item.path?.let { path -> drain(item, left, path) }
+    }
     afterOwnerReleaseForTesting?.invoke(owner)
+  }
+
+  /**
+   * Refuses an acquisition for a React instance that is already gone.
+   *
+   * **The caller holds [lock]**, and calls this both before and after the
+   * `closing` wait — the wait releases the lock, so one check cannot speak for
+   * both sides of it. The first is a fail-fast; the second is the load-bearing
+   * one.
+   */
+  private fun refuseIfOwnerIsGone(owner: Long?) {
+    if (owner == null || ReactInstanceEpoch.isLive(owner)) return
+    throw LogWriterException(
+      LogWriterException.Kind.OPEN_FAILED,
+      "the runtime that asked for this log file has been destroyed"
+    )
+  }
+
+  /**
+   * The executor drain, on whatever the flush left of the sweep's budget.
+   *
+   * Its own function so the number is stated once. The budget is the entire
+   * point of splitting the close in two, and a second place to write it down is
+   * a second place to write down `deadlineMs` by mistake.
+   */
+  private fun drain(item: Doomed, budget: Double, path: String) {
+    ownerDrainBudgetForTesting?.invoke(budget)
+    item.writer.close(item.id, budget) { finishClosing(path) }
+  }
+
+  /** One handle on its way out, and the path to free if it was the last. */
+  private class Doomed(
+    val handle: LogFileHandle,
+    val writer: LogFileWriter,
+    val id: Long,
+    val path: String?
+  )
+
+  /**
+   * The registry-side bookkeeping for one handle letting go. **The caller holds
+   * [lock].**
+   *
+   * Returns the path to close and free, or null while other claims remain.
+   *
+   * Shared by the two ways a handle can go away — its own [LogFileHandle.close]
+   * and an owner sweep — because the two have to agree exactly about when a
+   * writer stops being installed and when a path starts being `closing`. Two
+   * copies of that decision is two chances for a replacement writer to open a
+   * file the old one is still draining.
+   */
+  private fun dropClaimLocked(writer: LogFileWriter, handleId: Long): String? {
+    claimOwner.remove(handleId)?.let { owner ->
+      ownerClaims[owner]?.let { claims ->
+        claims.remove(handleId)
+        if (claims.isEmpty()) ownerClaims.remove(owner)
+      }
+    }
+    if (writer.releaseOne() > 0) return null
+    val path = writer.canonicalPath
+    if (writers[path] === writer) writers.remove(path)
+    // Claim the path for the duration of the close. An acquire arriving now
+    // waits rather than building a rival writer over a file this one is still
+    // draining.
+    closing[path] = (closing[path] ?: 0) + 1
+    return path
   }
 
   /**
    * Drops one handle's claim, closing and evicting the writer at zero.
    */
   internal fun release(writer: LogFileWriter, handleId: Long, deadlineMs: Double) {
-    val path = writer.canonicalPath
+    // Whichever side lets go first, the claim goes with it — a JavaScript-side
+    // close must not leave a record for a later owner sweep to find.
+    val path = lock.withLock { dropClaimLocked(writer, handleId) } ?: return
 
-    val shouldClose = lock.withLock {
-      // Whichever side closes first, the claim goes with it. Without this a
-      // JavaScript-side close would leave the record behind and the owner sweep
-      // would close the same handle again later — harmless, since close is
-      // state-gated, but it would also keep a dead handle reachable from this
-      // map for as long as its instance lived.
-      claimOwner.remove(handleId)?.let { owner ->
-        ownerClaims[owner]?.let { claims ->
-          claims.remove(handleId)
-          if (claims.isEmpty()) ownerClaims.remove(owner)
-        }
-      }
-      val remaining = writer.releaseOne()
-      if (remaining > 0) return@withLock false
-      if (writers[path] === writer) writers.remove(path)
-      // Claim the path for the duration of the close. An acquire arriving now
-      // waits rather than building a rival writer over a file this one is still
-      // draining.
-      closing[path] = (closing[path] ?: 0) + 1
-      true
-    }
-    if (!shouldClose) return
-
-    // The claim is dropped by the writer's own executor, not when this call
-    // stops waiting. A close that hits its deadline leaves work still
-    // executing; releasing the path then would let a replacement writer open
-    // the same file underneath it.
+    // The path is dropped by the writer's own executor, not when this call stops
+    // waiting. A close that hits its deadline leaves work still executing;
+    // releasing the path then would let a replacement writer open the same file
+    // underneath it.
     writer.close(handleId, deadlineMs) { finishClosing(path) }
   }
 
@@ -398,6 +471,29 @@ class LogWriterRegistry {
    */
   @Volatile var afterAcquireForTesting: ((LogFileHandle) -> Unit)? = null
   @Volatile var afterOwnerReleaseForTesting: ((Long) -> Unit)? = null
+
+  /**
+   * Called from inside [releaseOwner]'s lock, the instant ownership is gone and
+   * before the writer is evicted — **holding [lock]**, which is the point.
+   *
+   * The window this sits in is the one the sweep used to leave open: ownership
+   * dropped, writer still installed and still retained, so a replacement
+   * runtime's `open` found a live writer carrying the dead runtime's rotation
+   * configuration and was refused `CONFIG_CONFLICT`. There is no way to observe
+   * the window from outside — that it cannot be observed is the fix — so a test
+   * that wants to try has to be let in here.
+   */
+  @Volatile var duringOwnerReleaseForTesting: (() -> Unit)? = null
+
+  /**
+   * What each writer's drain is given, as [drain] gives it.
+   *
+   * Reported rather than timed. The property worth pinning is that the sweep's
+   * two waits come out of one budget, and the honest way to ask that is to read
+   * the number the second wait was handed — timing the call instead makes the
+   * test an assertion about how busy the machine is.
+   */
+  @Volatile var ownerDrainBudgetForTesting: ((Double) -> Unit)? = null
 }
 
 /**
@@ -517,6 +613,65 @@ class LogFileHandle internal constructor(
       return LogFlushOutcome(false, false, 0, inertStatus())
     }
     state = State.CLOSING
+    waitOutPurgeLocked(expiry)
+    lock.unlock()
+
+    val outcome = writer.flush(id, remaining(expiry))
+    registry.release(writer, id, remaining(expiry))
+    lock.withLock { state = State.CLOSED }
+    return outcome
+  }
+
+  /**
+   * Phase one of a close the *registry* is driving, for an owner sweep.
+   *
+   * Everything here has to be atomic with the registry's own bookkeeping, and
+   * so none of it may block: the registry calls this while holding its lock, and
+   * evicts the writer in the same breath. Splitting the close this way is what
+   * removes the window in which a handle is spoken for but its writer is still
+   * installed — see `LogWriterRegistry.releaseOwner`.
+   *
+   * Returns the writer this handle was speaking for, or null if it is already
+   * closing, in which case whoever started that owns the rest of it.
+   *
+   * **Lock order: registry then handle, and only ever that way.** This is the
+   * one place the two are nested. [close] takes this handle's lock, gives it
+   * back, and only then calls into the registry — so there is no path that holds
+   * a handle lock while reaching for the registry's, and no cycle to deadlock
+   * on.
+   */
+  internal fun beginOwnerRelease(): LogFileWriter? = lock.withLock {
+    if (state != State.ACTIVE) return null
+    state = State.CLOSING
+    writer
+  }
+
+  /**
+   * Phase two: the parts that wait, once the registry's lock is gone.
+   *
+   * The same waits [close] does, in the same order and against one budget — a
+   * purge still running on this handle, then the flush. What it does *not* do is
+   * call back into the registry: the eviction already happened, under the lock,
+   * before this was reachable.
+   *
+   * Returns what is left of [deadlineMs], because the caller still has the
+   * executor drain to pay for and it comes out of the same budget. Spending the
+   * whole deadline here and handing the whole deadline on would make a sweep
+   * take twice what was asked of it.
+   */
+  internal fun finishOwnerRelease(deadlineMs: Double): Double {
+    val expiry = monotonicMs() + LogFileWriter.clampDeadline(deadlineMs)
+    lock.lock()
+    waitOutPurgeLocked(expiry)
+    lock.unlock()
+
+    writer.flush(id, remaining(expiry))
+    lock.withLock { state = State.CLOSED }
+    return remaining(expiry)
+  }
+
+  /** **Caller holds [lock].** Waits out a purge on this handle, bounded. */
+  private fun waitOutPurgeLocked(expiry: Long) {
     while (purging) {
       val left = maxOf(0L, expiry - monotonicMs())
       if (left <= 0) break
@@ -527,12 +682,6 @@ class LogFileHandle internal constructor(
         break
       }
     }
-    lock.unlock()
-
-    val outcome = writer.flush(id, remaining(expiry))
-    registry.release(writer, id, remaining(expiry))
-    lock.withLock { state = State.CLOSED }
-    return outcome
   }
 
   private fun remaining(expiry: Long): Double =

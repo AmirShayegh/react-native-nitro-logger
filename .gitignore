@@ -35,6 +35,9 @@ project.xcworkspace
 .classpath
 .cxx
 .gradle
+# Kotlin 2.x's per-project compiler session directory, written next to the
+# gradle project rather than under `build/`.
+.kotlin
 .idea
 .project
 .settings
