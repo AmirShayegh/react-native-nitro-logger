@@ -24,19 +24,19 @@ let package = Package(
     .target(
       name: "NitroLoggerFileWriter",
       path: "ios",
-      // The Nitro adapters. Named so SwiftPM stops calling them stray files.
+      // Excluded, and nothing else is. There used to be an explicit `sources:`
+      // list here as well, which quietly made "compiled" an opt-in: a new
+      // `ios/*.swift` was not built, not tested, and reported nothing — the
+      // file simply did not exist as far as this package was concerned, while
+      // shipping to consumers through the podspec's `ios/**/*.swift` glob.
+      //
+      // Now every Swift file in the directory compiles unless it is named
+      // here, and this list is exactly the files that import NitroModules,
+      // which cannot build outside an app. `PackageManifestTests` asserts both
+      // halves of that sentence — including that no `sources:` key comes back.
       exclude: [
         "HybridFileSink.swift",
         "HybridNativeConsoleSink.swift",
-      ],
-      // Explicit: everything else in this directory imports NitroModules.
-      sources: [
-        "LogFileWriter.swift",
-        "LogWriterRegistry.swift",
-        "LogSecureFile.swift",
-        "FileSinkLifecycle.swift",
-        "Gzip.swift",
-        "NativeConsoleWriter.swift",
       ]
     ),
     .testTarget(

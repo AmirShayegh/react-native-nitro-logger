@@ -31,12 +31,46 @@ cd "$(dirname "$0")/.."
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
-python3 - "$OUT" <<'PY'
-import pathlib, re, sys
+# The document list comes from the tarball, not from this file.
+#
+# It used to be five hardcoded paths, which answers the wrong question: what
+# matters is whether the documentation a *consumer receives* compiles, and the
+# two lists drift in the direction that hides the problem. Add a document to
+# `files` and it ships unchecked; the hardcoded list stays green because it
+# never heard of it. (CHANGELOG.md was exactly that: shipped, never checked.)
+#
+# `--ignore-scripts` because packing must not trigger a build here, and `--json`
+# because the human-readable output is a formatted tree that would have to be
+# scraped. npm rather than yarn: `yarn pack --dry-run` prints its manifest as
+# log lines with no machine-readable mode.
+npm pack --dry-run --json --ignore-scripts > "$OUT/manifest.json"
+
+python3 - "$OUT" "$OUT/manifest.json" <<'PY'
+import json, pathlib, re, sys
 
 out = pathlib.Path(sys.argv[1])
-docs = ['README.md', 'docs/PARITY.md', 'docs/PRIVACY.md', 'docs/API.md',
-        'eslint-plugin/README.md']
+
+manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
+docs = sorted(
+    entry['path']
+    for package in manifest
+    for entry in package.get('files', [])
+    if entry['path'].lower().endswith('.md')
+)
+
+# A manifest that produced nothing, or almost nothing, would make every check
+# below pass over an empty set — the failure this whole script exists to avoid,
+# relocated into its own input. Three is below the number this package ships
+# and above the number a broken manifest produces.
+if len(docs) < 3:
+    print(f'the tarball manifest lists {len(docs)} markdown document(s): '
+          f'{docs or "none"}', file=sys.stderr)
+    print('that is not the shipped documentation set; refusing to report a '
+          'pass over it', file=sys.stderr)
+    sys.exit(1)
+
+print('documents from the tarball manifest: ' + ', '.join(docs))
+
 fence = re.compile(r'```ts\n(.*?)```', re.S)
 
 PKG = 'react-native-nitro-logger'

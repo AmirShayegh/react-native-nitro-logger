@@ -41,9 +41,39 @@ const ts = require('typescript');
  * list comes from the TypeScript parser rather than from regexes over the
  * source. See `parseExports`.
  *
- * What this still cannot assert is whether a description is any *good* — only
- * that every export is accounted for, described somewhere specific, and that
- * nothing is described that is gone.
+ * ## What the subsection checks do and do not claim
+ *
+ * The above was the whole of this file through 0.1.2, and it was satisfied by a
+ * document with no documentation in it: `docs/API.md` reduced to a title, its
+ * Index and nineteen bare markers — 82% deleted, every word of prose gone —
+ * passed all ten tests. Both structures were intact, so both comparisons held.
+ *
+ * So the markers are now read as boundaries as well as claims, and each
+ * subsection is checked for content. Precisely:
+ *
+ * - **It has prose.** The subsection is stripped of its heading, code fences,
+ *   HTML and markers, and what remains must reach `MINIMUM_PROSE_WORDS`. This
+ *   is what the gutted file fails, and what a `TODO` placeholder fails.
+ * - **The name is identified inside it.** Every name a marker claims must
+ *   appear in the subsection that marker closes — the heading, a rendered
+ *   signature, or the prose — with the **marker itself excluded**, since
+ *   searching the raw subsection would find the name inside the very comment
+ *   making the claim and the assertion would be tautological.
+ *
+ * Two things are deliberately **not** claimed, and saying so is the point:
+ *
+ * - **Relevance.** A subsection of threshold-length prose that mentions the
+ *   name and describes something else entirely passes. No word count can tell
+ *   the difference, and a gate that implied otherwise would be worse than one
+ *   that admits it.
+ * - **A rendered signature per export.** The plan considered requiring one.
+ *   This document renders signatures where they help and writes sentences where
+ *   they do not — a type alias, a constant, the `Log` singleton — and forcing
+ *   code fences into those places would degrade the page to satisfy a checker.
+ *
+ * Semantic accuracy stays human review. What is mechanical is that every export
+ * is accounted for, described in a specific place, that the place contains
+ * something, and that nothing is described that is gone.
  */
 
 const SOURCE = join(__dirname, '..', 'src', 'index.tsx');
@@ -218,6 +248,125 @@ function markedNames(reference) {
   return names;
 }
 
+/**
+ * The floor a documented subsection's prose has to clear.
+ *
+ * Chosen from the document rather than picked out of the air: the thinnest
+ * subsection that anyone would call documented sits a little above this, and
+ * the two that sat below it when this check was written were thin enough to be
+ * worth rewriting rather than exempting. Raising it further would start
+ * rejecting entries that are short because the thing they describe is simple.
+ */
+const MINIMUM_PROSE_WORDS = 25;
+
+const HEADING = /^#{1,6} /;
+const MARKER = /^<!-- api: ([^>]*?) -->$/;
+
+/**
+ * Each marker paired with the subsection it closes.
+ *
+ * The boundary is explicit rather than inferred from blank lines: a subsection
+ * runs from the nearest preceding heading — or from the previous marker, if one
+ * sits between that heading and this — down to the marker itself. That is what
+ * makes "described here" a claim about a region of the file rather than about
+ * the file.
+ *
+ * `context` widens the search for a *name* by the enclosing `##` section's
+ * preamble, and only that. `LogDestination` is the case: it is the interface
+ * introduced under `## Destinations` and claimed by the `ConsoleDestination`
+ * marker below it, which is where a reader meets it. The preamble is
+ * deliberately not counted toward the prose floor — one section introduction
+ * must not stand in for the subsections under it.
+ */
+function subsections(reference) {
+  const lines = reference.split('\n');
+
+  const sectionStarts = [];
+  lines.forEach((line, index) => {
+    if (/^## /.test(line)) sectionStarts.push(index);
+  });
+
+  /** The `## …` heading above `index`, down to the first heading under it. */
+  const preambleAbove = (index) => {
+    let start = -1;
+    for (const candidate of sectionStarts) {
+      if (candidate <= index) start = candidate;
+    }
+    if (start < 0) return '';
+
+    // Capped at the marker, not just at the first child heading. A marker
+    // sitting directly under a `##` — `## Native sinks` is one — would
+    // otherwise be handed the text that follows it, and a name introduced
+    // after the marker would satisfy a claim the marker had already closed.
+    let end = index;
+    for (let cursor = start + 1; cursor < end; cursor += 1) {
+      if (/^#{2,3} /.test(lines[cursor])) {
+        end = cursor;
+        break;
+      }
+    }
+    return lines.slice(start, end).join('\n');
+  };
+
+  const found = [];
+  let boundary = -1;
+  let heading = null;
+
+  lines.forEach((line, index) => {
+    if (HEADING.test(line)) {
+      heading = line;
+      boundary = index;
+      return;
+    }
+
+    const match = line.match(MARKER);
+    if (!match) return;
+
+    found.push({
+      heading,
+      line: index + 1,
+      names: match[1]
+        .split(',')
+        .map((name) => name.trim())
+        .filter(Boolean),
+      // From the heading inclusive: the heading is where most of these names
+      // are identified, and it is part of the subsection by any reading.
+      subsection: lines.slice(boundary, index).join('\n'),
+      // Without it: a heading is a label, not documentation.
+      body: lines.slice(boundary + 1, index).join('\n'),
+      context: preambleAbove(index),
+    });
+    boundary = index;
+  });
+
+  return found;
+}
+
+/**
+ * What is left of a subsection once everything that is not prose is removed.
+ *
+ * Fenced code goes because a signature is not a description — the gutted-file
+ * failure this exists to catch would otherwise be survivable by pasting the
+ * type back in. Headings go because the title is the claim being tested.
+ * Markers and HTML go because they are machinery. Index-style `- \`Name\``
+ * lines go because an inventory entry is not prose either.
+ */
+function proseOf(text) {
+  return text
+    .replace(/^```[\s\S]*?^```/gm, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/^#{1,6} .*$/gm, ' ')
+    .replace(/^- `[A-Za-z_][A-Za-z0-9_]*`\s*$/gm, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/** The subsection with only its own markers removed — see the header. */
+function searchableOf(text) {
+  return text.replace(/<!--[\s\S]*?-->/g, ' ');
+}
+
 describe('docs/API.md', () => {
   const reference = readFileSync(REFERENCE, 'utf8');
   const { names: exported, unresolvable } = parseExports();
@@ -313,5 +462,57 @@ describe('docs/API.md', () => {
       expect(name).not.toBe('');
       expect(reason.length).toBeGreaterThan(10);
     }
+  });
+
+  describe('the subsections the markers point at', () => {
+    const documented = subsections(reference);
+
+    test('every marker was matched to a subsection', () => {
+      // Guards the parser above the same way the first test guards the others:
+      // a boundary rule that stopped matching would make every assertion below
+      // pass over an empty list.
+      expect(documented.length).toBeGreaterThan(10);
+      // Same markers, same names: the boundary parser and the claim parser
+      // must be reading one document. A marker the boundaries missed would
+      // take its names out of every check below with nothing to notice.
+      expect(documented.flatMap((entry) => entry.names).sort()).toEqual(
+        [...markedWithRepeats].sort()
+      );
+      // Every marker closes something a heading opened. One that did not would
+      // be attached to whatever preceded it.
+      expect(documented.filter((entry) => entry.heading === null)).toEqual([]);
+    });
+
+    test('every subsection contains prose, not just its marker', () => {
+      // The one this file was missing. `docs/API.md` cut down to a title, the
+      // Index and nineteen bare markers passed every other test here.
+      const thin = documented
+        .map((entry) => ({
+          heading: entry.heading,
+          line: entry.line,
+          words: proseOf(entry.body).length,
+        }))
+        .filter((entry) => entry.words < MINIMUM_PROSE_WORDS);
+
+      expect(thin).toEqual([]);
+    });
+
+    test('every name a marker claims is identified in the subsection it closes', () => {
+      // Not in the marker — that is stripped, or this would be a comment
+      // agreeing with itself — and not merely somewhere in the file, which the
+      // Index alone would satisfy for every name on the page.
+      const unidentified = [];
+
+      for (const entry of documented) {
+        const haystack = searchableOf(`${entry.subsection}\n${entry.context}`);
+        for (const name of entry.names) {
+          if (!new RegExp(`\\b${name}\\b`).test(haystack)) {
+            unidentified.push(`${name} (line ${entry.line}: ${entry.heading})`);
+          }
+        }
+      }
+
+      expect(unidentified).toEqual([]);
+    });
   });
 });

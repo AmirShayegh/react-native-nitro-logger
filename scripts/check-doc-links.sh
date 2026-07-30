@@ -252,6 +252,43 @@ else:
 total = (len(absolute) + len(set(relative)) + len(set(anchors))
          + len(dangling))
 print()
+
+# Floors, because "no failures" and "nothing checked" print the same way.
+#
+# Every category above is found by a regex over Markdown. Change how a document
+# writes its links, or break one of those patterns, and this script reports
+# `all 0 documentation links resolve` and exits 0 — a clean pass over an empty
+# set, which is the exact defect it was built to catch in other people's
+# documentation. So the count itself is asserted.
+#
+# Split by category rather than one total: absolute URLs and relative paths are
+# found by different patterns and would fail independently, and a total alone
+# lets one category's links cover for the other's pattern having died. Anchors
+# have no floor — a document legitimately might not link into a heading, and
+# the branch above says so out loud rather than silently.
+MINIMUM_LINKS = 15
+MINIMUM_ABSOLUTE = 5
+MINIMUM_RELATIVE = 3
+
+vacuous = []
+if total < MINIMUM_LINKS:
+    vacuous.append(f'{total} link(s) found in total, below the floor of '
+                   f'{MINIMUM_LINKS}')
+if len(absolute) < MINIMUM_ABSOLUTE:
+    vacuous.append(f'{len(absolute)} absolute URL(s), below the floor of '
+                   f'{MINIMUM_ABSOLUTE}')
+if len(set(relative)) < MINIMUM_RELATIVE:
+    vacuous.append(f'{len(set(relative))} relative link(s), below the floor of '
+                   f'{MINIMUM_RELATIVE}')
+
+if vacuous:
+    for problem in vacuous:
+        print(f'FAIL: {problem}')
+    print('this run checked less than the documentation contains, so a pass '
+          'would mean nothing. Either the link patterns stopped matching or '
+          'the manifest is wrong.')
+    sys.exit(1)
+
 if failures:
     print(f'{failures} of {total} documentation links are broken')
     sys.exit(1)

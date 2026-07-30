@@ -80,8 +80,12 @@ jobs:
       - name: Setup
         uses: ./.github/actions/setup
 
+      # Not a bare `yarn test`. Jest reports success for a run that discovered
+      # nothing — a moved directory, a config change, a `testMatch` that stops
+      # matching — so the count is asserted against a floor and every suite
+      # that is meant to exist has to report. See scripts/check-test-reports.sh.
       - name: Run the TypeScript suite
-        run: yarn test
+        run: yarn check-test-reports js
 
   # The vendored iOS writer, under XCTest rather than on a simulator.
   #
@@ -97,8 +101,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
+      # See test-js above for why this is not a bare `swift test`. Invoked
+      # directly rather than through yarn: this job deliberately has no Setup
+      # step — the Swift package needs no JavaScript toolchain — and the script
+      # needs only bash, swift and python3.
       - name: Run the Swift suite
-        run: swift test
+        run: ./scripts/check-test-reports.sh swift
 
   # The vendored Android writer, on the JVM rather than on an emulator.
   #
@@ -127,10 +135,12 @@ jobs:
       - name: Generate nitrogen code
         run: yarn nitrogen
 
+      # See test-js above. Gradle adds its own version of the problem: a task
+      # it considers UP-TO-DATE does not execute, and the reports left from
+      # last time look exactly like reports from this time. Deleting them first
+      # is what makes the task run and what makes the count mean something.
       - name: Run the Kotlin suite
-        run: |
-          cd example/android
-          ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain
+        run: yarn check-test-reports kotlin
 
   # `AndroidPlatformIo` — the only part of the Android writer that is not
   # JVM-testable, and through 0.1.2 the only part in no test at all.

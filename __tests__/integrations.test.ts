@@ -1,5 +1,6 @@
 import { Logger } from '../src/Logger';
 import {
+  ERROR_METADATA_KEYS,
   installErrorHandler,
   UNCAUGHT_ERROR_MESSAGE,
 } from '../src/integrations/errorHandler';
@@ -200,6 +201,66 @@ describe('installErrorHandler', () => {
       // The count of what was dropped is added after filtering, so it is the
       // one key that cannot be dropped.
       expect(metadata.droppedMetadataCount).toBe(6);
+    });
+  });
+
+  // `ERROR_METADATA_KEYS` is a promise to the reader: put these in your strict
+  // key catalog and crash reports survive it. A catalog is fail-closed — an
+  // unlisted key is dropped, payload and all — so a key emitted here and
+  // missing from that list does not warn, it deletes the field. Which makes
+  // the list exactly as load-bearing as the code that emits, and until this it
+  // was asserted nowhere: it could have named five of the six, or six that no
+  // longer existed, through any number of releases.
+  describe('the advertised metadata keys', () => {
+    /** The keys one uncaught error actually writes. */
+    function emittedKeys(): string[] {
+      const { logger, destination, errorUtils } = wired();
+      installErrorHandler({ logger, errorUtils });
+      errorUtils.throw(new Error('x'), true);
+      return Object.keys(destination.entries[0]!.metadata ?? {});
+    }
+
+    test('are exactly the keys a crash emits, in both directions', () => {
+      // Set equality, not containment. One direction catches a new field the
+      // catalog would silently eat; the other catches a name left behind by a
+      // rename, which tells a reader to allow a key that will never arrive and
+      // is indistinguishable from the field simply never being emitted.
+      expect([...emittedKeys()].sort()).toEqual(
+        [...ERROR_METADATA_KEYS].sort()
+      );
+    });
+
+    test('contain no duplicates', () => {
+      // A repeated entry is invisible to every membership check, and to the
+      // set comparison above once it is sorted into a `toEqual` — the arrays
+      // would differ in length but a reader debugging that failure sees a
+      // missing key, not a doubled one. Named separately so it reports itself.
+      const seen = new Set<string>();
+      const repeated = ERROR_METADATA_KEYS.filter((key) => {
+        if (seen.has(key)) return true;
+        seen.add(key);
+        return false;
+      });
+
+      expect(repeated).toEqual([]);
+    });
+
+    test('every one of them survives a catalog built from the list', () => {
+      // The end-to-end version of the claim the constant makes. The two
+      // assertions above compare names; this checks that following the
+      // documented advice actually leaves a usable crash report, which is what
+      // a reader is being promised.
+      const { logger, destination, errorUtils } = wired();
+      logger.metadataKeyCatalog([...ERROR_METADATA_KEYS]);
+      installErrorHandler({ logger, errorUtils });
+
+      errorUtils.throw(new Error('x'), true);
+
+      const metadata = destination.entries[0]!.metadata!;
+      expect(Object.keys(metadata).sort()).toEqual(
+        [...ERROR_METADATA_KEYS].sort()
+      );
+      expect(metadata.droppedMetadataCount).toBeUndefined();
     });
   });
 

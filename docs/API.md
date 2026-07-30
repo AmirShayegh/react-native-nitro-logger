@@ -135,6 +135,11 @@ destination gets, after markers are resolved and rejected keys removed.
 
 `console.log` with `DefaultFormatter`. Options: `minimumLevel`, `formatter`.
 
+Levels are routed rather than all printed the same way: `error` and `todo` go
+to `console.error` and `warning` to `console.warn`, so LogBox surfaces them in
+development. `flush` is a no-op — `console` writes synchronously, so there is
+nothing buffered to wait for.
+
 <!-- api: ConsoleDestination, LogDestination -->
 
 ### `FileDestination`
@@ -347,8 +352,11 @@ accepting writes.
 
 ### `utf8Length(text)`
 
-UTF-8 byte length, computed without encoding the string. The byte ceilings
-above are in bytes rather than characters, and this is what measures them.
+UTF-8 byte length, computed without encoding the string — no intermediate
+`TextEncoder`, no allocation. The byte ceilings above are in bytes rather than
+characters, and this is what measures them, so batching and console chunking
+agree with the sink about how large a payload is. Surrogate pairs count as the
+four bytes they encode to, not as the two code units JavaScript stores.
 
 <!-- api: utf8Length -->
 

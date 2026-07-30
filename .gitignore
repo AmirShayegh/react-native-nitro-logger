@@ -104,3 +104,9 @@ android/generated
 # SwiftPM build products from the XCTest harness in Package.swift
 .build/
 .swiftpm/
+
+# Machine-readable test results, written by scripts/check-test-reports.sh so it
+# can assert what a run actually discovered. Deleted before each run by that
+# script — tracking them would let a committed report answer for a run that
+# never happened.
+.jest-reports/
