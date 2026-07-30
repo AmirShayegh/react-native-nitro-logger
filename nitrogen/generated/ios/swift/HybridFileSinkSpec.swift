@@ -20,6 +20,7 @@ public protocol HybridFileSinkSpec_protocol: HybridObject {
   func close(deadlineMs: Double) throws -> FlushOutcome
   func getLogFilePaths() throws -> [String]
   func maintain(deadlineMs: Double) throws -> SinkStatus
+  func collectLogs(deadlineMs: Double, maxTotalBytes: Double) throws -> CollectOutcome
   func clearLogs(deadlineMs: Double) throws -> ClearOutcome
 }
 

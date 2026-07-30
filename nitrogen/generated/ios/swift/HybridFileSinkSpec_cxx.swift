@@ -226,6 +226,18 @@ open class HybridFileSinkSpec_cxx {
   }
   
   @inline(__always)
+  public final func collectLogs(deadlineMs: Double, maxTotalBytes: Double) -> bridge.Result_CollectOutcome_ {
+    do {
+      let __result = try self.__implementation.collectLogs(deadlineMs: deadlineMs, maxTotalBytes: maxTotalBytes)
+      let __resultCpp = __result
+      return bridge.create_Result_CollectOutcome_(__resultCpp)
+    } catch (let __error) {
+      let __exceptionPtr = __error.toCpp()
+      return bridge.create_Result_CollectOutcome_(__exceptionPtr)
+    }
+  }
+  
+  @inline(__always)
   public final func clearLogs(deadlineMs: Double) -> bridge.Result_ClearOutcome_ {
     do {
       let __result = try self.__implementation.clearLogs(deadlineMs: deadlineMs)

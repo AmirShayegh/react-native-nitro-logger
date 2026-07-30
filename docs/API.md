@@ -185,6 +185,7 @@ const logFile = new FileDestination(createFileSink(), {
 | `flush(deadlineMs?)` | `BatchFlushOutcome` | `durable` says whether it reached disk. |
 | `maintain(deadlineMs?)` | `number` | Rotation and the retention sweep, on demand. Returns the same mask as `degradation()`, read once the bounded wait is over. |
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
+| `collectForSupport({ maxTotalBytes, deadlineMs? })` | `CollectOutcome` | One gzip bundle of the whole log, for a support upload. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
 | `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip, protection and exclusivity each have a bit. |
@@ -204,11 +205,65 @@ usually is not.
 **`purge()` after `dispose()` returns `durable: false`.** A disposed
 destination cannot see the files, so it cannot honestly claim they are gone.
 
+**`collectForSupport({ maxTotalBytes, deadlineMs? })`** packs the log files into one gzip bundle beside them and returns a
+`CollectOutcome`. `gunzip` on that file gives you the whole log as
+chronological JSON Lines — gzip is a multi-member format, so archives that are
+already compressed are copied in byte for byte and the active file is
+compressed in beside them, on the writer's own queue and after a flush.
+
+```ts
+import { FileDestination as FileDestination3, createFileSink as createFileSink3 } from 'react-native-nitro-logger';
+
+const supportable = new FileDestination3(createFileSink3());
+const bundle = supportable.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+
+if (bundle.complete && bundle.path !== '') {
+  // Upload `bundle.path`, then let the next purge or collect replace it.
+} else if (bundle.complete) {
+  // Nothing to send: this device has no logs.
+}
+```
+
+`CollectForSupportOptions` is that argument object: `maxTotalBytes`, and an
+optional `deadlineMs` that defaults to 10s and bounds each of the two waits —
+the buffer flush and the native collect — rather than their sum.
+
+`CollectOutcome` carries `path` (`''` when no bundle was produced),
+`byteCount`, `sourceFileCount`, `truncated` and `complete`. Read `complete`
+first. `complete: true` with an empty `path` is a device with nothing to
+collect, which is not a failure and should not be shown as one; `complete:
+false` means the collect did not finish and there is no bundle to send — and
+none appears afterwards either. A collect that overran its deadline is stopped
+at the last step rather than mid-copy, so the build it could not wait for
+deletes its own staging file instead of publishing a bundle nobody was told
+about.
+`truncated` is orthogonal and ordinary — the ceiling was reached, and what came
+back is the newest end of the log, because that is the end anybody debugging is
+asking about.
+
+**`maxTotalBytes` has no default, and `Infinity` is refused.** How much of a
+log leaves the device is the app's decision, and a default would be this
+library making it. The value is measured on the source bytes rather than the
+compressed result, so it bounds the work as well as the upload. A negative or
+non-finite value throws a `RangeError` rather than being read as "no ceiling" —
+`NaN` arriving here is an arithmetic bug upstream, and the dangerous way to
+resolve it is to send everything. Zero is legitimate and produces no bundle.
+
+The bundle lands at a fixed name inside the sink's own directory, never a path
+you choose: a support feature is not a reason to ship a write-anywhere
+primitive. At most one exists — each collect replaces the last — and `purge()`
+deletes it along with everything else, because a compliance deletion that left
+a gzipped copy of the log behind would not be a deletion. It is excluded from
+`getLogFilePaths()`, from the retention count and from `maxTotalLogBytes`.
+
+Nothing is uploaded and nothing is encrypted by this library. `docs/PRIVACY.md`
+records why both are the app's call.
+
 `FileDestinationOptions`, beyond the common `label`/`minimumLevel`/`formatter`:
 `path`, `rotation`, `maxEntryBytes`, `batchBytes`, `flushIntervalMs`,
 `maxPendingEntries`, `maxPendingBytes`, `watermarkBytes`.
 
-<!-- api: FileDestination, FileDestinationOptions, PurgeOutcome -->
+<!-- api: FileDestination, FileDestinationOptions, PurgeOutcome, CollectForSupportOptions, CollectOutcome -->
 
 ### `NativeConsoleDestination`
 
@@ -550,6 +605,8 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `BatchFlushOutcome`
 - `BatchTarget`
 - `ClearOutcome`
+- `CollectForSupportOptions`
+- `CollectOutcome`
 - `ConsoleDestination`
 - `createFileSink`
 - `createNativeConsoleSink`

@@ -149,6 +149,27 @@ public struct LogClearOutcome: Sendable {
   public var rebound: Bool = false
 }
 
+/// What `collectLogs` produced. See the `CollectOutcome` spec doc.
+public struct LogCollectOutcome: Sendable, Equatable {
+  /// Absolute path of the bundle, or `""` when none was produced.
+  public var path: String
+  public var byteCount: Double
+  public var sourceFileCount: Double
+  /// Some log files were left out — the ceiling, or one that would not compress.
+  public var truncated: Bool
+  /// The bundle was written and renamed into place.
+  public var complete: Bool
+
+  /// No bundle, nothing left out, nothing finished.
+  ///
+  /// The answer for a writer that has been terminated or a collect whose
+  /// deadline expired. `truncated: false` is deliberate: nothing was dropped
+  /// from a bundle that does not exist, and saying otherwise would have a
+  /// caller apologising to a user for a partial upload that never happened.
+  public static let nothing = LogCollectOutcome(
+    path: "", byteCount: 0, sourceFileCount: 0, truncated: false, complete: false)
+}
+
 public enum LogWriterError: Error, Equatable {
   case openFailed(String)
   case configConflict
@@ -836,6 +857,367 @@ public final class LogWriter {
     return status(handleID: handleID)
   }
 
+  /// Packs the logs into one gzip bundle for a support upload.
+  ///
+  /// gzip is a multi-member format, so the bundle is the members concatenated:
+  /// an existing `.gz` archive is copied in byte for byte and a plaintext one
+  /// — the active file, or an archive whose compression was turned off or
+  /// failed — is compressed through the same compressor rotation uses. That is
+  /// the whole trick, and it is why this can be done without decompressing
+  /// anything or holding a log in memory.
+  ///
+  /// Written OLDEST first, because that is the order somebody reading the
+  /// gunzipped result wants; chosen NEWEST first, because that is the half of
+  /// the log worth keeping when the ceiling cuts it.
+  ///
+  /// The whole thing runs on the queue. Rotation, compression and retention
+  /// all move these files and all run here, so a bundle built from the
+  /// caller's thread could copy in an archive that is being renamed out from
+  /// under it.
+  func collectLogs(handleID: UInt64, deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
+    let expiry = DispatchTime.now() + .milliseconds(Self.clampDeadline(deadlineMs))
+
+    // Everything buffered goes in. A support bundle missing the last few
+    // seconds is missing exactly the part somebody is asking about.
+    _ = flush(handleID: handleID, deadline: expiry)
+
+    let handoff = CollectHandoff()
+    var outcome = LogCollectOutcome.nothing
+    let group = DispatchGroup()
+    group.enter()
+    queue.async { [self] in
+      if !terminated {
+        outcome = buildBundle(handoff: handoff, maxTotalBytes: maxTotalBytes)
+      }
+      group.leave()
+    }
+    // The block cannot be cancelled mid-copy, but it CAN be stopped from
+    // publishing. Without that it would go on to rename a finished bundle into
+    // place seconds after this call reported there was none — a second copy of
+    // the whole log, on a device whose app was told nothing was collected,
+    // outside the retention budget it configured, and skipped by the orphan
+    // sweep because a FINISHED bundle is deliberately kept.
+    guard group.wait(timeout: expiry) == .success else { return handoff.giveUp() }
+    return outcome
+  }
+
+  /// One collect's handoff between the thread waiting on it and the build
+  /// running it.
+  ///
+  /// Per collect, and shared by exactly those two: a writer-wide flag would let
+  /// one caller's timeout abandon another caller's build, and a writer-wide
+  /// "committed" would let one build's success answer another's question. The
+  /// object is the pairing.
+  final class CollectHandoff: @unchecked Sendable {
+    private let lock = NSLock()
+    private var abandoned = false
+    private var claimed = false
+    private var result = LogCollectOutcome.nothing
+
+    /// The waiter's half of the publish barrier.
+    ///
+    /// Either the build has already renamed a bundle into place — in which case
+    /// the caller is told about the bundle that exists, however late — or it has
+    /// not, and this stops it from ever doing so. There is no third answer and
+    /// no timeout: whoever holds the lock decides, and the only thing the loser
+    /// waits for is one rename.
+    func giveUp() -> LogCollectOutcome {
+      lock.lock()
+      defer { lock.unlock() }
+      if claimed { return result }
+      abandoned = true
+      return .nothing
+    }
+
+    /// The build's half. `publish` runs under the lock and reports whether the
+    /// rename succeeded; the outcome it produced is remembered for a waiter
+    /// that has already stopped listening.
+    func commit(_ outcome: LogCollectOutcome, publish: () -> Bool) -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      if abandoned { return false }
+      guard publish() else { return false }
+      result = outcome
+      claimed = true
+      return true
+    }
+  }
+
+  /// One log file on its way into a bundle, and whether it is already a gzip
+  /// member.
+  ///
+  /// Carried rather than inferred from the filename. The active file is always
+  /// plaintext even when the app named it `app.gz`, and copying it in verbatim
+  /// on the strength of its extension would produce a `.support.gz` that no
+  /// tool can open. Only rotation decides whether an archive was compressed,
+  /// so only rotation's own naming answers this.
+  private struct Source {
+    let url: URL
+    let alreadyCompressed: Bool
+  }
+
+  /// Queue only. See `collectLogs`.
+  private func buildBundle(handoff: CollectHandoff, maxTotalBytes: Double) -> LogCollectOutcome {
+    let fm = FileManager.default
+    let directory = fileURL.deletingLastPathComponent()
+    let baseName = fileURL.lastPathComponent
+    let finalURL = directory.appendingPathComponent(Self.supportName(baseName))
+    let stagingURL = directory.appendingPathComponent(Self.supportStagingName(baseName))
+
+    // Both, before anything is written. The previous bundle is replaced rather
+    // than added to, and a staging file from a collect that died mid-write is
+    // not something to append to.
+    try? fm.removeItem(at: stagingURL)
+    try? fm.removeItem(at: finalURL)
+
+    // Newest first: the active file, then archives. `archives` already
+    // excludes `.part` and — because the bundle is not an archive name — the
+    // bundle this call is about to write.
+    var sources: [Source] = []
+    if fm.fileExists(atPath: fileURL.path) {
+      sources.append(Source(url: fileURL, alreadyCompressed: false))
+    }
+    for archive in Self.archives(in: directory, baseName: baseName) {
+      sources.append(
+        Source(url: archive.url, alreadyCompressed: archive.url.lastPathComponent.hasSuffix(".gz")))
+    }
+
+    // Measured on the source bytes. A ceiling that could only be checked after
+    // compressing would not bound the work, and the caller's question — how
+    // much of my log is leaving this device — is about the log, not about how
+    // well it compressed.
+    var budget = Self.byteCap(maxTotalBytes)
+    var chosen: [Source] = []
+    var truncated = false
+    for source in sources {
+      guard let bytes = Self.fileSize(at: source.url) else {
+        // Unmeasurable, so it cannot be charged against the ceiling. Taking it
+        // for free is the wrong direction on a number that says how much may
+        // leave the device.
+        truncated = true
+        continue
+      }
+      // Nothing to contribute. Skipped rather than packed as an empty member,
+      // which is what makes a ceiling of zero produce no bundle even when the
+      // active file has just been opened and is still empty.
+      if bytes == 0 { continue }
+      if bytes > budget {
+        truncated = true
+        continue
+      }
+      budget -= bytes
+      chosen.append(source)
+    }
+    // Nothing to pack is a finished collect, not a failed one. `truncated`
+    // carries the difference between a device with no logs and a ceiling too
+    // small to fit any of the ones it has.
+    guard !chosen.isEmpty else {
+      return LogCollectOutcome(
+        path: "", byteCount: 0, sourceFileCount: 0, truncated: truncated, complete: true)
+    }
+
+    // Not `.nothing` on any path below: selection already ran, and if the
+    // ceiling cut files out that is still true of a bundle that could not be
+    // written.
+    var failed: LogCollectOutcome {
+      LogCollectOutcome(
+        path: "", byteCount: 0, sourceFileCount: 0, truncated: truncated, complete: false)
+    }
+
+    guard fm.createFile(atPath: stagingURL.path, contents: nil),
+          let sink = try? FileHandle(forWritingTo: stagingURL) else {
+      try? fm.removeItem(at: stagingURL)
+      note(.gzip)
+      return failed
+    }
+    if !LogSecureFile.secure(stagingURL).isEmpty { note(.protection) }
+
+    var written = 0
+    var writeFailed = false
+    // Oldest first, so `gunzip` yields the log in the order it happened.
+    for source in chosen.reversed() {
+      // Where this member starts, so a copy that dies halfway can be undone
+      // rather than left in the stream. Half a gzip member followed by a whole
+      // one is not a gzip file, and publishing that as a truncated bundle
+      // would hand somebody a file no tool will open.
+      //
+      // NOT covered by a test, and deliberately kept anyway. Reaching it needs
+      // a read or a write that fails PART WAY through a 256 KB chunk — a
+      // failing flash chip, a volume that filled between two writes — and
+      // there is no seam in this file that can stage one. The member failures
+      // the suite can stage (a compressor that refuses, a source that will not
+      // open) all fail before a byte is written, where this is a no-op.
+      guard let mark = try? sink.offset() else {
+        // Without a starting offset there is nowhere to roll back TO, and
+        // rolling back to zero would throw away the members already written
+        // while `written` still counts them. Nothing is published from here.
+        writeFailed = true
+        break
+      }
+      if appendMember(source, to: sink, scratch: directory) {
+        written += 1
+        continue
+      }
+      truncated = true
+      do {
+        try sink.truncate(atOffset: mark)
+        try sink.seek(toOffset: mark)
+      } catch {
+        // The rollback itself failed, so what is on disk is unknown. Nothing
+        // is published from here.
+        writeFailed = true
+        break
+      }
+    }
+    do {
+      try sink.synchronize()
+      try sink.close()
+    } catch {
+      writeFailed = true
+    }
+
+    guard written > 0, !writeFailed else {
+      try? fm.removeItem(at: stagingURL)
+      if writeFailed { note(.gzip) }
+      return failed
+    }
+
+    // Measured here rather than after the rename. A size the platform will not
+    // answer for is a bundle nothing can be said about, and saying `complete`
+    // with a byte count of zero over a file that is really there would send a
+    // support flow looking for a fault in the upload.
+    guard let bytes = Self.fileSize(at: stagingURL) else {
+      try? fm.removeItem(at: stagingURL)
+      note(.gzip)
+      return failed
+    }
+
+    // The publish barrier, with the rename inside it. Holding the lock across
+    // the rename is what makes "did this publish?" a question with one answer:
+    // a waiter that takes the lock either finds nothing renamed — and marks the
+    // collect abandoned, so nothing ever will be — or finds the finished
+    // outcome waiting for it. Neither side needs a timeout, and the only thing
+    // the loser waits for is one rename.
+    let published = LogCollectOutcome(
+      path: finalURL.path,
+      byteCount: Double(bytes),
+      sourceFileCount: Double(written),
+      truncated: truncated,
+      complete: true
+    )
+    var renameFailed = false
+    let committed = handoff.commit(published) {
+      do {
+        try fm.moveItem(at: stagingURL, to: finalURL)
+        return true
+      } catch {
+        renameFailed = true
+        return false
+      }
+    }
+    guard committed else {
+      try? fm.removeItem(at: stagingURL)
+      if renameFailed { note(.gzip) }
+      return failed
+    }
+    // Outside the barrier, because a mode that could not be applied is a
+    // degradation bit rather than a reason to withhold a bundle that exists.
+    if !LogSecureFile.secure(finalURL).isEmpty { note(.protection) }
+    return published
+  }
+
+  /// Appends one source as a gzip member. Queue only.
+  ///
+  /// An archive rotation already compressed is a member and is copied
+  /// verbatim. Anything else is compressed to a scratch file first and then
+  /// copied, rather than compressed straight into the sink: that reuses the
+  /// compressor rotation uses — the same one a test injects — instead of
+  /// growing a second compression path that nothing else exercises.
+  private func appendMember(_ source: Source, to sink: FileHandle, scratch: URL) -> Bool {
+    let fm = FileManager.default
+    if source.alreadyCompressed {
+      return copy(source.url, into: sink)
+    }
+
+    let temporary = scratch.appendingPathComponent(
+      Self.supportMemberName(fileURL.lastPathComponent))
+    try? fm.removeItem(at: temporary)
+    defer { try? fm.removeItem(at: temporary) }
+    guard compressor(source.url, temporary) else {
+      note(.gzip)
+      return false
+    }
+    // A compressed copy of a log file, so it gets the same protections every
+    // other artifact does for as long as it exists — which is what rotation
+    // does with the identical file.
+    if !LogSecureFile.secure(temporary).isEmpty { note(.protection) }
+    return copy(temporary, into: sink)
+  }
+
+  /// Streams `source` into `sink` in bounded chunks.
+  ///
+  /// Chunked rather than `Data(contentsOf:)` because the caller's ceiling is
+  /// on what leaves the device, not on what this is allowed to allocate: a
+  /// 200 MB archive read whole is a memory spike on the thread of an app that
+  /// was only trying to file a bug report.
+  ///
+  /// A read that throws is a failure, NOT an end of file. `try?` would collapse
+  /// the two and report a member cut off halfway as a member written whole.
+  /// A false return may leave bytes in `sink`; the caller rolls them back.
+  private func copy(_ source: URL, into sink: FileHandle) -> Bool {
+    guard let input = try? FileHandle(forReadingFrom: source) else {
+      note(.gzip)
+      return false
+    }
+    defer { try? input.close() }
+    while true {
+      let chunk: Data?
+      do {
+        chunk = try input.read(upToCount: Self.copyChunkBytes)
+      } catch {
+        note(.gzip)
+        return false
+      }
+      guard let chunk, !chunk.isEmpty else { return true }
+      do {
+        try sink.write(contentsOf: chunk)
+      } catch {
+        note(.gzip)
+        return false
+      }
+    }
+  }
+
+  private static let copyChunkBytes = 256 * 1024
+
+  /// Size in bytes, or nil for anything that cannot be measured.
+  ///
+  /// Nil rather than zero, because they are opposite facts here: an empty file
+  /// contributes nothing and is skipped, while one that cannot be stat'd is a
+  /// file whose absence makes the bundle incomplete. Reading the second as
+  /// zero would let it into the bundle without being charged against the
+  /// caller's ceiling.
+  private static func fileSize(at url: URL) -> UInt64? {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+      return nil
+    }
+    return attributes[.size] as? UInt64
+  }
+
+  /// A byte ceiling from JavaScript, where every number is a Double.
+  ///
+  /// Anything that is not a finite positive number becomes ZERO — nothing
+  /// fits, no bundle, `truncated: true`. The other direction was tempting
+  /// ("a broken ceiling means no ceiling") and is wrong: this number is the
+  /// caller's decision about how much of a log may leave the device, and a
+  /// `NaN` arriving from some arithmetic upstream must not be read as consent
+  /// to send all of it. The TypeScript side refuses these before they get
+  /// here; this is what happens if something else calls the sink directly.
+  private static func byteCap(_ value: Double) -> UInt64 {
+    guard value.isFinite, value > 0 else { return 0 }
+    return value >= Double(UInt64.max) ? UInt64.max : UInt64(value)
+  }
+
   /// The absolute-deadline form, so a caller that has to do more than one
   /// bounded wait can spend a single budget across all of them.
   private func flush(handleID: UInt64, deadline: DispatchTime) -> LogFlushOutcome {
@@ -1170,8 +1552,15 @@ public final class LogWriter {
     // by a crash, or by a process that died mid-rotation — and nothing will
     // ever finish it. Compression runs on this same queue, so a staging file
     // seen from here is never one being written.
+    //
+    // The support bundle's staging file is swept for the same reason and by
+    // the same pass. The finished bundle is not: it is something a caller
+    // asked for and may not have uploaded yet, and deleting it here would make
+    // `collectLogs` a race against the next rotation.
     for name in ((try? fm.contentsOfDirectory(atPath: directory.path)) ?? [])
-    where Self.isStagingName(name, baseName: baseName) {
+    where Self.isStagingName(name, baseName: baseName)
+      || name == Self.supportStagingName(baseName)
+      || name == Self.supportMemberName(baseName) {
       do { try fm.removeItem(at: directory.appendingPathComponent(name)) } catch { failed = true }
     }
 
@@ -1267,6 +1656,34 @@ public final class LogWriter {
   /// An empty file is a cheap thing to leave behind.
   static func lockName(_ baseName: String) -> String { baseName + ".lock" }
 
+  /// The support bundle for `baseName`, `<base>.support.gz`.
+  ///
+  /// One fixed name inside the writer's own directory, so a collect can never
+  /// be talked into writing somewhere else, and so there is at most one bundle
+  /// at a time — a support flow that left one behind per invocation would grow
+  /// a second copy of the log next to the first.
+  ///
+  /// Not an archive: it holds no records rotation produced, retention must not
+  /// count it toward a cap or prune it in place of a real archive, and
+  /// `getLogFilePaths()` must not hand it to a collector as if it were a log
+  /// file. It IS an artifact, so a purge deletes it.
+  static func supportName(_ baseName: String) -> String { baseName + ".support.gz" }
+
+  /// Where a bundle is written before it is renamed into place.
+  static func supportStagingName(_ baseName: String) -> String {
+    supportName(baseName) + ".part"
+  }
+
+  /// The scratch file a plaintext source is compressed to on its way into a
+  /// bundle.
+  ///
+  /// Named rather than left anonymous because it holds a compressed copy of a
+  /// log file: a process that died mid-collect must not leave one behind that
+  /// neither the retention sweep nor a purge knows about.
+  static func supportMemberName(_ baseName: String) -> String {
+    supportStagingName(baseName) + ".member"
+  }
+
   /// Everything this writer can ever put on disk under its directory: the
   /// active file, the sidecar, every archive, every gzip staging file.
   ///
@@ -1278,6 +1695,12 @@ public final class LogWriter {
   static func isArtifactName(_ name: String, baseName: String) -> Bool {
     if name == baseName { return true }
     if name == baseName + ".meta" { return true }
+    // The support bundle and its staging file. A compliance purge that left a
+    // gzipped copy of the whole log next to the files it deleted would not be
+    // a purge, and `durable` would be saying something false.
+    if name == supportName(baseName) { return true }
+    if name == supportStagingName(baseName) { return true }
+    if name == supportMemberName(baseName) { return true }
     return isArchiveName(name, baseName: baseName) || isStagingName(name, baseName: baseName)
   }
 

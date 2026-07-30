@@ -4,6 +4,7 @@ import type { LogFormatter } from '../formatters/types';
 import type {
   AppendResult,
   ClearOutcome,
+  CollectOutcome,
   FlushOutcome,
   RotationConfig,
   SinkStatus,
@@ -30,6 +31,11 @@ export interface FileSinkLike {
    * {@link FileDestination.maintain}.
    */
   maintain(deadlineMs: number): SinkStatus;
+  /**
+   * Pack the log files into one gzip bundle under the sink's own directory
+   * and report what went in. See {@link FileDestination.collectForSupport}.
+   */
+  collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
   flush(deadlineMs: number): FlushOutcome;
   close(deadlineMs: number): FlushOutcome;
   getLogFilePaths(): string[];
@@ -96,10 +102,69 @@ export interface PurgeOutcome {
   readonly discardedBytes: number;
 }
 
+export interface CollectForSupportOptions {
+  /**
+   * Ceiling on the log bytes that go into the bundle. Required, deliberately.
+   *
+   * How much of a log leaves the device is the calling app's decision, and a
+   * default here would be this library making it on their behalf — for a file
+   * whose size is bounded by a rotation policy the app also chose. Measured on
+   * the source bytes, not on the compressed result, and applied newest-first:
+   * a ceiling smaller than the whole log keeps the recent end, which is the
+   * end somebody debugging is asking about.
+   *
+   * Zero is a legitimate value and produces no bundle at all. `Infinity` is
+   * not: "send everything" has to be spelled as a number the caller is willing
+   * to state, and accepting it would also make `NaN` and a genuine overflow
+   * indistinguishable from a deliberate choice.
+   */
+  readonly maxTotalBytes: number;
+  /**
+   * Default 10s. Compression is proportional to the log.
+   *
+   * Bounds each of the two waits this call makes — the buffer flush, then the
+   * native collect — rather than their sum. Splitting one budget across both
+   * would make a slow flush eat the time the bundle needs and report an
+   * incomplete collect for it.
+   */
+  readonly deadlineMs?: number;
+}
+
 const DEFAULT_LABEL = 'file';
 const DEFAULT_FILENAME = 'app.log';
 const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024;
 const DEFAULT_DEADLINE_MS = 2000;
+/**
+ * Longer than {@link DEFAULT_DEADLINE_MS}, because the work is different in
+ * kind: a flush drains a bounded buffer, a collect compresses however many
+ * megabytes of log the retention policy allows. A two-second bound would
+ * routinely report `complete: false` on a bundle that was nearly finished.
+ */
+const DEFAULT_COLLECT_DEADLINE_MS = 10_000;
+
+/** Fixed text, and a `RangeError` rather than a silent zero: `NaN` arriving
+ * here is an arithmetic bug in the caller, and quietly collecting nothing
+ * would hide it behind a support flow that simply never produced a file. */
+const CEILING_MESSAGE =
+  'collectForSupport: maxTotalBytes must be a finite, non-negative number';
+
+/**
+ * Nothing was collected, and no bundle exists to send.
+ *
+ * A factory rather than a shared constant: `CollectOutcome` crosses the Nitro
+ * boundary and its fields are mutable, so handing every failed call the same
+ * object would let one caller's edit change what a later, unrelated call
+ * returns.
+ */
+function collectedNothing(): CollectOutcome {
+  return {
+    path: '',
+    byteCount: 0,
+    sourceFileCount: 0,
+    truncated: false,
+    complete: false,
+  };
+}
 
 /** Fixed text: a diagnostic that interpolates caller data is a log-injection
  * hole and a privacy hole at once. Only counts travel with it. */
@@ -270,6 +335,86 @@ export class FileDestination implements LogDestination {
       // land in whatever scheduled it.
     }
     return this.batcher.degradation();
+  }
+
+  /**
+   * Pack this destination's log files into one gzip bundle a support flow can
+   * upload, and report what went into it.
+   *
+   * `gunzip` on the bundle yields the whole log as chronological JSON Lines,
+   * because gzip is a multi-member format: already-compressed archives are
+   * copied in byte for byte and the active file is compressed in beside them.
+   * That is why this returns a bundle rather than the list of paths
+   * {@link getLogFilePaths} gives — a caller handed paths has to read, order
+   * and combine them itself, and the ordering is not the one the filenames
+   * suggest.
+   *
+   * The buffer is flushed first, so records written a moment ago are in it.
+   *
+   * The bundle always lands at a fixed name inside the sink's own directory,
+   * never a path the caller picks — a support feature is not a reason to ship
+   * a write-a-file-anywhere primitive. At most one exists; each collect
+   * replaces the last, and {@link purge} deletes it along with everything
+   * else, because a compliance deletion that left a gzipped copy of the log
+   * behind would not be a deletion.
+   *
+   * Nothing is uploaded, and nothing is encrypted by this library — see
+   * `docs/PRIVACY.md` for why both are the app's call and not ours.
+   *
+   * Read `complete` before `path`. `complete: true` with an empty `path` is a
+   * device with no logs to collect, which a support flow should report as
+   * "nothing to send" rather than as an error; `complete: false` means the
+   * collect did not finish and there is no bundle. `truncated` is orthogonal
+   * and ordinary: the ceiling was reached, and what came back is the newest
+   * end of the log.
+   *
+   * A fenced or disposed destination collects nothing. A disposed one has
+   * closed its sink; a fenced one is behind a purge, and the files it would
+   * pack belong to whoever holds the writer now — which is the whole reason
+   * the fence exists.
+   *
+   * @throws RangeError if `maxTotalBytes` is negative or not finite.
+   */
+  collectForSupport(options: CollectForSupportOptions): CollectOutcome {
+    const { maxTotalBytes, deadlineMs = DEFAULT_COLLECT_DEADLINE_MS } = options;
+    if (!Number.isFinite(maxTotalBytes) || maxTotalBytes < 0) {
+      throw new RangeError(CEILING_MESSAGE);
+    }
+    if (!this.isEnabled) return collectedNothing();
+
+    // Before the collect, not after: the native side flushes its own queue,
+    // but records sitting in the JS batcher have not reached that queue yet,
+    // and a bundle missing the last few seconds is missing the part somebody
+    // is asking about. A flush that times out is not a reason to abandon the
+    // collect — the bundle is then simply missing the tail it could not
+    // durably write, which is the same thing a crash would have done.
+    this.batcher.flush(deadlineMs);
+
+    let outcome: CollectOutcome;
+    try {
+      outcome = this.sink.collectLogs(deadlineMs, maxTotalBytes);
+    } catch {
+      // A native throw is `complete: false`, not a rethrow. The caller is a
+      // support flow: it needs to know there is no bundle, and it can do
+      // nothing useful with a native error object that it could not do with
+      // that fact.
+      return collectedNothing();
+    }
+
+    // A collect can fail to compress a member or fail to apply a file's
+    // protections, and both raise a degradation bit natively. `CollectOutcome`
+    // carries no status, so without this read the app would be told the sink
+    // is healthy until some unrelated later append happened to notice — which
+    // for a destination nothing is writing to means never. The bit that
+    // matters most here is `protection`: it says a bundle of the whole log is
+    // sitting on disk without the mode it was supposed to get.
+    try {
+      this.batcher.observeStatus(this.sink.getStatus());
+    } catch {
+      // A status read that threw says nothing about the collect, which
+      // already succeeded or failed on its own terms.
+    }
+    return outcome;
   }
 
   /** Losses with no notice in the file yet. */

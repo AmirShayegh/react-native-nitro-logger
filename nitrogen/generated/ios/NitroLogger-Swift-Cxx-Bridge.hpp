@@ -12,6 +12,8 @@
 namespace margelo::nitro::nitrologger { struct AppendResult; }
 // Forward declaration of `ClearOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct ClearOutcome; }
+// Forward declaration of `CollectOutcome` to properly resolve imports.
+namespace margelo::nitro::nitrologger { struct CollectOutcome; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct FlushOutcome; }
 // Forward declaration of `HybridFileSinkSpec` to properly resolve imports.
@@ -34,6 +36,7 @@ namespace NitroLogger { class HybridNativeConsoleSinkSpec_cxx; }
 // Include C++ defined types
 #include "AppendResult.hpp"
 #include "ClearOutcome.hpp"
+#include "CollectOutcome.hpp"
 #include "FlushOutcome.hpp"
 #include "HybridFileSinkSpec.hpp"
 #include "HybridNativeConsoleSinkSpec.hpp"
@@ -179,6 +182,15 @@ namespace margelo::nitro::nitrologger::bridge::swift {
   }
   inline Result_std__vector_std__string__ create_Result_std__vector_std__string__(const std::exception_ptr& error) noexcept {
     return Result<std::vector<std::string>>::withError(error);
+  }
+  
+  // pragma MARK: Result<CollectOutcome>
+  using Result_CollectOutcome_ = Result<CollectOutcome>;
+  inline Result_CollectOutcome_ create_Result_CollectOutcome_(const CollectOutcome& value) noexcept {
+    return Result<CollectOutcome>::withValue(value);
+  }
+  inline Result_CollectOutcome_ create_Result_CollectOutcome_(const std::exception_ptr& error) noexcept {
+    return Result<CollectOutcome>::withError(error);
   }
   
   // pragma MARK: Result<ClearOutcome>

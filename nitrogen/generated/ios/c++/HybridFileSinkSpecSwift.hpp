@@ -22,6 +22,8 @@ namespace margelo::nitro::nitrologger { enum class RejectReason; }
 namespace margelo::nitro::nitrologger { struct SinkStatus; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct FlushOutcome; }
+// Forward declaration of `CollectOutcome` to properly resolve imports.
+namespace margelo::nitro::nitrologger { struct CollectOutcome; }
 // Forward declaration of `ClearOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 
@@ -33,6 +35,7 @@ namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 #include "SinkStatus.hpp"
 #include "FlushOutcome.hpp"
 #include <vector>
+#include "CollectOutcome.hpp"
 #include "ClearOutcome.hpp"
 
 #include "NitroLogger-Swift-Cxx-Umbrella.hpp"
@@ -136,6 +139,14 @@ namespace margelo::nitro::nitrologger {
     }
     inline SinkStatus maintain(double deadlineMs) override {
       auto __result = _swiftPart.maintain(std::forward<decltype(deadlineMs)>(deadlineMs));
+      if (__result.hasError()) [[unlikely]] {
+        std::rethrow_exception(__result.error());
+      }
+      auto __value = std::move(__result.value());
+      return __value;
+    }
+    inline CollectOutcome collectLogs(double deadlineMs, double maxTotalBytes) override {
+      auto __result = _swiftPart.collectLogs(std::forward<decltype(deadlineMs)>(deadlineMs), std::forward<decltype(maxTotalBytes)>(maxTotalBytes));
       if (__result.hasError()) [[unlikely]] {
         std::rethrow_exception(__result.error());
       }

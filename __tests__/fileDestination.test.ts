@@ -281,6 +281,200 @@ describe('FileDestination — maintain', () => {
   });
 });
 
+describe('FileDestination — collectForSupport', () => {
+  test('the buffer is flushed into the bundle before it is packed', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'still buffered' }));
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    // The native side flushes its own queue, but records the batcher has not
+    // handed over yet are not in that queue. A bundle missing the last few
+    // seconds is missing the part somebody is asking about.
+    expect(outcome.complete).toBe(true);
+    expect(sink.collectedBundles).toHaveLength(1);
+    expect(sink.collectedBundles[0]).toContain('still buffered');
+  });
+
+  test('the bundle path is the sinks own, never the callers', () => {
+    const { destination, sink } = build({ path: '/memory/logs/custom.log' });
+    destination.write(entry());
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(outcome.path).toBe('/memory/logs/custom.log.support.gz');
+    expect(sink.bundlePath).toBe('/memory/logs/custom.log.support.gz');
+  });
+
+  test('the ceiling and the deadline reach the sink', () => {
+    const { destination, sink } = build();
+    destination.collectForSupport({ maxTotalBytes: 4096, deadlineMs: 250 });
+    expect(sink.collectCalls).toEqual([
+      { deadlineMs: 250, maxTotalBytes: 4096 },
+    ]);
+  });
+
+  test('the default deadline is longer than a flush deadline', () => {
+    const { destination, sink } = build();
+    destination.collectForSupport({ maxTotalBytes: 4096 });
+
+    // Compressing a log is not draining a buffer. A caller that took the
+    // default and got a 2s bound would see `complete: false` on ordinary logs,
+    // which reads as a broken feature rather than as a bound they chose.
+    expect(sink.collectCalls[0]?.deadlineMs).toBeGreaterThan(2000);
+  });
+
+  test('a ceiling of zero collects nothing, and says it finished doing that', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'secret' }));
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 0 });
+
+    expect(outcome.path).toBe('');
+    expect(outcome.truncated).toBe(true);
+    expect(outcome.complete).toBe(true);
+    expect(sink.collectedBundles).toEqual([]);
+  });
+
+  test.each([
+    [NaN],
+    [-1],
+    [Number.POSITIVE_INFINITY],
+    [Number.NEGATIVE_INFINITY],
+  ])('a ceiling of %p is refused rather than interpreted', (ceiling) => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'secret' }));
+
+    // The dangerous reading of a broken number is "no ceiling", and every one
+    // of these has a plausible path to it: `Infinity` most obviously, `NaN`
+    // through a comparison that is false either way. A throw puts the bug
+    // where the arithmetic is instead of shipping the whole log.
+    expect(() =>
+      destination.collectForSupport({ maxTotalBytes: ceiling })
+    ).toThrow(RangeError);
+    expect(sink.collectCalls).toEqual([]);
+  });
+
+  test('a destination with nothing to collect is not an error', () => {
+    const { destination } = build();
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    // `complete: true` with no path. A support flow showing "collection
+    // failed" to a user whose app simply has not logged anything would send
+    // them chasing a fault that is not there.
+    expect(outcome).toEqual({
+      path: '',
+      byteCount: 0,
+      sourceFileCount: 0,
+      truncated: false,
+      complete: true,
+    });
+  });
+
+  test('a disposed destination collects nothing', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'written' }));
+    destination.dispose();
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(outcome.complete).toBe(false);
+    expect(outcome.path).toBe('');
+    expect(sink.collectCalls).toEqual([]);
+  });
+
+  test('a fenced destination collects nothing', () => {
+    const { destination, sink, writer } = build();
+    const other = writer.attach();
+    destination.write(entry({ message: 'pre-purge' }));
+    destination.flush(1000);
+
+    // Someone else purged underneath it. The files this one would pack are the
+    // new generation's, and a bundle built from them would be a stale read of
+    // somebody else's log.
+    other.clearLogs(1000);
+    destination.write(entry({ message: 'fences it' }));
+    destination.flush(1000);
+    expect(destination.isEnabled).toBe(false);
+
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(outcome.complete).toBe(false);
+    expect(sink.collectCalls).toEqual([]);
+  });
+
+  test('a native throw is reported as an unfinished collect', () => {
+    const { destination, sink } = build();
+    destination.write(entry());
+    sink.collectThrows = true;
+
+    // The caller is a support flow. It can do nothing with a native error
+    // object that it cannot do with "there is no bundle".
+    let outcome!: ReturnType<FileDestination['collectForSupport']>;
+    expect(() => {
+      outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    }).not.toThrow();
+    expect(outcome.complete).toBe(false);
+    expect(outcome.path).toBe('');
+  });
+
+  test('a bit the collect raised is reported by the same call', () => {
+    const { destination, sink, writer } = build();
+    destination.write(entry());
+    expect(destination.degradation()).toBe(0);
+
+    // `CollectOutcome` carries no status, so the destination has to go and read
+    // one. Without that, a bundle written without its file protections would
+    // leave the app believing the sink is healthy until some unrelated later
+    // append happened to notice — which for a quiet destination means never.
+    sink.onCollect = () => {
+      writer.degraded = 0b10000;
+    };
+
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    expect(destination.degradation()).toBe(0b10000);
+  });
+
+  test('a status read that throws does not discard the bundle', () => {
+    const { destination, sink } = build();
+    destination.write(entry());
+    sink.statusThrows = true;
+
+    // The collect already succeeded on its own terms. Losing its result to a
+    // failed follow-up read would throw away a bundle that is on disk.
+    const outcome = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    expect(outcome.complete).toBe(true);
+    expect(outcome.path).not.toBe('');
+  });
+
+  test('two failed collects do not share one outcome object', () => {
+    const { destination } = build();
+    destination.dispose();
+
+    const first = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    first.path = '/tmp/somewhere-else';
+
+    // `CollectOutcome` crosses the Nitro boundary with mutable fields. A shared
+    // constant handed to every failed call would let one caller's edit change
+    // what the next one is told.
+    const second = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    expect(second.path).toBe('');
+  });
+
+  test('collecting twice replaces the bundle rather than adding one', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'first' }));
+    const first = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    destination.write(entry({ message: 'second' }));
+    const second = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(second.path).toBe(first.path);
+    expect(sink.collectedBundles[1]).toContain('second');
+    expect(sink.collectedBundles[1]).toContain('first');
+  });
+});
+
 describe('FileDestination — oversized entries', () => {
   test('a formatter that can shed structure is asked to', () => {
     const { destination, writer } = build({ maxEntryBytes: 200 });

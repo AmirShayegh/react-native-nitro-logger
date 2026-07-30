@@ -177,7 +177,15 @@ on the files, so it does not travel with them —
 [docs/PRIVACY.md](docs/PRIVACY.md#logs-on-disk) has the detail.
 
 ```ts
-file.getLogFilePaths();     // for a consent-gated support upload
+file.getLogFilePaths();     // the individual files, if you would rather send those
+
+// One gzip bundle of the whole log, for a consent-gated support upload.
+// `gunzip` on it gives chronological JSON Lines. `maxTotalBytes` is required:
+// how much of a log leaves the device is your call, not this library's.
+const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+if (bundle.complete && bundle.path !== '') {
+  // Upload `bundle.path`. Nothing is transmitted or encrypted for you.
+}
 
 const outcome = file.purge(5000);   // the compliance purge
 if (!outcome.durable) {

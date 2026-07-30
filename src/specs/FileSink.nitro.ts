@@ -87,6 +87,49 @@ export interface ClearOutcome {
 }
 
 /**
+ * What `collectLogs` produced.
+ *
+ * `complete` and `truncated` are separate facts and a caller needs both.
+ * `truncated` is an ordinary successful outcome — the caller set a byte
+ * ceiling and the logs were bigger than it — while `!complete` means the
+ * operation did not finish and there is no bundle to send.
+ */
+export interface CollectOutcome {
+  /**
+   * Absolute path of the bundle, or `''` when none was produced.
+   *
+   * Always inside the sink's own directory and always the same name, so a
+   * collect can never write anywhere the caller chooses. A general
+   * write-a-file-here primitive is not what a support flow needs and is a
+   * much larger thing to have to defend.
+   */
+  path: string;
+  /** Size of the bundle on disk. Zero when `path` is empty. */
+  byteCount: number;
+  /** How many log files went in. */
+  sourceFileCount: number;
+  /**
+   * Some log files were left out.
+   *
+   * Two causes, both meaning the bundle is not the whole log: the byte
+   * ceiling was reached, or a file could not be compressed into the stream.
+   * Which files went in is answered by `sourceFileCount` against
+   * `getLogFilePaths().length`, not by a reason string that would have to
+   * name a path.
+   */
+  truncated: boolean;
+  /**
+   * The collect ran to the end of what it set out to do.
+   *
+   * False means it was cut short — the deadline expired, the bundle could not
+   * be written — and `path` is empty. True with an empty `path` means there
+   * was nothing to collect, which is a different answer from a failure and
+   * one a support flow should not report as an error.
+   */
+  complete: boolean;
+}
+
+/**
  * Dumb native file sink. All intelligence (batching, backpressure, drop
  * accounting, formatting, redaction) lives in TypeScript; this object only
  * appends pre-batched text, rotates, compresses, and reports counters.
@@ -167,6 +210,38 @@ export interface FileSink extends HybridObject<{
    * the one this package ships.
    */
   maintain(deadlineMs: number): SinkStatus;
+
+  /**
+   * Packs the log files into one gzip bundle for a support upload.
+   *
+   * gzip is a multi-member format: concatenated members decompress as one
+   * stream, so a `.gz` archive can be copied in byte for byte and the active
+   * file compressed in beside it. `gunzip` on the bundle yields the whole log
+   * as chronological JSON Lines, which is what somebody debugging actually
+   * wants — and it is why this returns a bundle rather than a list of paths a
+   * caller would have to read, order and combine itself.
+   *
+   * Runs on the writer's queue, so it cannot see a rotation half-done, and
+   * flushes first, so the newest records are in it. Sources are chosen
+   * newest-first under `maxTotalBytes`, measured on the SOURCE bytes rather
+   * than the compressed result: a ceiling that could only be checked after
+   * compressing is not a ceiling on the work done.
+   *
+   * `maxTotalBytes` has no default here or in TypeScript. Deciding how much
+   * of a log leaves the device is the caller's decision to make explicitly,
+   * and a default would be this library making it for them.
+   *
+   * Written to a staging name and renamed, so an interrupted collect leaves
+   * something the retention sweep recognises rather than a plausible-looking
+   * `.gz` that no tool can open. A collect that overruns `deadlineMs` is
+   * stopped at that rename rather than mid-copy: it reports `complete: false`
+   * and deletes its own staging file, so no bundle appears afterwards for a
+   * call that said there was none. At most one bundle exists at a time; each
+   * collect replaces the last. Both names are artifacts, so `clearLogs`
+   * deletes them — a compliance purge that left a copy of the log behind
+   * would be no purge at all.
+   */
+  collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
 
   /**
    * Registry-serialized purge of the COMPLETE artifact set (current file,

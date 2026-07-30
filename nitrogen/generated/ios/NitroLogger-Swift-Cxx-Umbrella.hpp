@@ -12,6 +12,8 @@
 namespace margelo::nitro::nitrologger { struct AppendResult; }
 // Forward declaration of `ClearOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct ClearOutcome; }
+// Forward declaration of `CollectOutcome` to properly resolve imports.
+namespace margelo::nitro::nitrologger { struct CollectOutcome; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct FlushOutcome; }
 // Forward declaration of `HybridFileSinkSpec` to properly resolve imports.
@@ -28,6 +30,7 @@ namespace margelo::nitro::nitrologger { struct SinkStatus; }
 // Include C++ defined types
 #include "AppendResult.hpp"
 #include "ClearOutcome.hpp"
+#include "CollectOutcome.hpp"
 #include "FlushOutcome.hpp"
 #include "HybridFileSinkSpec.hpp"
 #include "HybridNativeConsoleSinkSpec.hpp"

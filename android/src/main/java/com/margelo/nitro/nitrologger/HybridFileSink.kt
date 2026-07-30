@@ -264,6 +264,23 @@ class HybridFileSink : HybridFileSinkSpec() {
     )
   }
 
+  override fun collectLogs(deadlineMs: Double, maxTotalBytes: Double): CollectOutcome {
+    // No handle, no bundle — and `complete = true`, because a sink that was
+    // never opened has finished collecting everything it has. A support flow
+    // that treated this as an error would show a failure for an app that simply
+    // has no logs yet.
+    val live = current()
+      ?: return CollectOutcome("", 0.0, 0.0, truncated = false, complete = true)
+    val outcome = live.collectLogs(deadlineMs, maxTotalBytes)
+    return CollectOutcome(
+      outcome.path,
+      outcome.byteCount,
+      outcome.sourceFileCount,
+      outcome.truncated,
+      outcome.complete
+    )
+  }
+
   override fun flush(deadlineMs: Double): FlushOutcome {
     // One snapshot, so the handle and the answer to give without one cannot
     // disagree about which instant they describe.

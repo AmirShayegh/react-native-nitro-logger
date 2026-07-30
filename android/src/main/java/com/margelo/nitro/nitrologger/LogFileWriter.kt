@@ -192,6 +192,56 @@ class LogFileWriter internal constructor(
     fun lockName(baseName: String): String = "$baseName.lock"
 
     /**
+     * The support bundle for [baseName], `<base>.support.gz`.
+     *
+     * One fixed name inside the writer's own directory, so a collect can never
+     * be talked into writing somewhere else, and so there is at most one bundle
+     * at a time — a support flow that left one behind per invocation would grow
+     * a second copy of the log next to the first.
+     *
+     * Not an archive: it holds no records rotation produced, retention must not
+     * count it toward a cap or prune it in place of a real archive, and
+     * `getLogFilePaths()` must not hand it to a collector as if it were a log
+     * file. It IS an artifact, so a purge deletes it.
+     */
+    fun supportName(baseName: String): String = "$baseName.support.gz"
+
+    /** Where a bundle is written before it is renamed into place. */
+    fun supportStagingName(baseName: String): String = supportName(baseName) + ".part"
+
+    /**
+     * The scratch file a plaintext source is compressed to on its way into a
+     * bundle.
+     *
+     * Named rather than left anonymous because it holds a compressed copy of a
+     * log file: a process that died mid-collect must not leave one behind that
+     * neither the retention sweep nor a purge knows about.
+     */
+    fun supportMemberName(baseName: String): String = supportStagingName(baseName) + ".member"
+
+    private const val COPY_CHUNK_BYTES = 256 * 1024
+
+    /**
+     * A byte ceiling from JavaScript, where every number is a Double.
+     *
+     * Anything that is not a finite positive number becomes ZERO — nothing
+     * fits, no bundle, `truncated = true`. The other direction was tempting
+     * ("a broken ceiling means no ceiling") and is wrong: this number is the
+     * caller's decision about how much of a log may leave the device, and a
+     * `NaN` arriving from some arithmetic upstream must not be read as consent
+     * to send all of it. The TypeScript side refuses these before they get
+     * here; this is what happens if something else calls the sink directly.
+     */
+    fun byteCap(value: Double): ULong = when {
+      // `isFinite` and not merely `!isNaN`: positive infinity is the most
+      // obvious way for a broken calculation to arrive here, and reading it as
+      // `ULong.MAX_VALUE` is exactly the fail-open this exists to prevent.
+      !value.isFinite() || value <= 0.0 -> 0uL
+      value >= ULong.MAX_VALUE.toDouble() -> ULong.MAX_VALUE
+      else -> value.toULong()
+    }
+
+    /**
      * Everything this writer can ever put on disk under its directory: the
      * active file, the sidecar, every archive, every gzip staging file.
      *
@@ -204,6 +254,12 @@ class LogFileWriter internal constructor(
     fun isArtifactName(name: String, baseName: String): Boolean {
       if (name == baseName) return true
       if (name == "$baseName.meta") return true
+      // The support bundle and its staging file. A compliance purge that left a
+      // gzipped copy of the whole log next to the files it deleted would not be
+      // a purge, and `durable` would be saying something false.
+      if (name == supportName(baseName)) return true
+      if (name == supportStagingName(baseName)) return true
+      if (name == supportMemberName(baseName)) return true
       return isArchiveName(name, baseName) || isStagingName(name, baseName)
     }
 
@@ -985,6 +1041,313 @@ class LogFileWriter internal constructor(
     return status(handleId)
   }
 
+  /**
+   * One collect's handoff between the thread waiting on it and the build
+   * running it.
+   *
+   * Per collect, and shared by exactly those two: a writer-wide flag would let
+   * one caller's timeout abandon another caller's build, and a writer-wide
+   * "committed" would let one build's success answer another's question. The
+   * object is the pairing.
+   */
+  private class CollectHandoff {
+    /** The waiter gave up before anything was published. */
+    var abandoned = false
+    /** The bundle is on disk. [result] is what to tell the caller about it. */
+    var claimed = false
+    var result: LogCollectOutcome = LogCollectOutcome.NOTHING
+  }
+
+  /**
+   * The waiter's half of the publish barrier.
+   *
+   * Either the build has already renamed a bundle into place — in which case
+   * the caller is told about the bundle that exists, however late — or it has
+   * not, and this stops it from ever doing so. There is no third answer and no
+   * timeout: whoever holds the lock decides, and the only thing the loser waits
+   * for is one rename.
+   */
+  private fun CollectHandoff.giveUp(): LogCollectOutcome = synchronized(this) {
+    if (claimed) return result
+    abandoned = true
+    return LogCollectOutcome.NOTHING
+  }
+
+  /**
+   * Packs the logs into one gzip bundle for a support upload.
+   *
+   * gzip is a multi-member format, so the bundle is the members concatenated:
+   * an existing `.gz` archive is copied in byte for byte and a plaintext one —
+   * the active file, or an archive whose compression was turned off or failed —
+   * is compressed through the same compressor rotation uses. That is the whole
+   * trick, and it is why this can be done without decompressing anything or
+   * holding a log in memory.
+   *
+   * Written OLDEST first, because that is the order somebody reading the
+   * gunzipped result wants; chosen NEWEST first, because that is the half of
+   * the log worth keeping when the ceiling cuts it.
+   *
+   * The whole thing runs on the executor. Rotation, compression and retention
+   * all move these files and all run there, so a bundle built from the caller's
+   * thread could copy in an archive that is being renamed out from under it.
+   */
+  fun collectLogs(handleId: Long, deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
+    val expiry = monotonic() + clampDeadline(deadlineMs)
+
+    // Everything buffered goes in. A support bundle missing the last few
+    // seconds is missing exactly the part somebody is asking about.
+    flushUntil(handleId, expiry)
+
+    val handoff = CollectHandoff()
+    var outcome = LogCollectOutcome.NOTHING
+    val done = CountDownLatch(1)
+    try {
+      executor.execute {
+        try {
+          if (!terminated) outcome = buildBundle(handoff, maxTotalBytes)
+        } finally {
+          done.countDown()
+        }
+      }
+      // The task cannot be cancelled mid-copy, but it CAN be stopped from
+      // publishing. Without that it would go on to rename a finished bundle
+      // into place seconds after this call reported there was none — a second
+      // copy of the whole log, on a device whose app was told nothing was
+      // collected, outside the retention budget it configured, and skipped by
+      // the orphan sweep because a FINISHED bundle is deliberately kept.
+      if (!done.await(remaining(expiry), TimeUnit.MILLISECONDS)) return handoff.giveUp()
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+      return handoff.giveUp()
+    } catch (_: RejectedExecutionException) {
+      // Nothing was ever queued, so there is nothing to stop.
+      return LogCollectOutcome.NOTHING
+    }
+    return outcome
+  }
+
+  /**
+   * One log file on its way into a bundle, and whether it is already a gzip
+   * member.
+   *
+   * Carried rather than inferred from the filename. The active file is always
+   * plaintext even when the app named it `app.gz`, and copying it in verbatim
+   * on the strength of its extension would produce a `.support.gz` that no
+   * tool can open. Only rotation decides whether an archive was compressed, so
+   * only rotation's own naming answers this.
+   */
+  private data class Source(val file: File, val alreadyCompressed: Boolean)
+
+  /** Executor only. See [collectLogs]. */
+  private fun buildBundle(handoff: CollectHandoff, maxTotalBytes: Double): LogCollectOutcome {
+    val baseName = file.name
+    val finalFile = File(directory, supportName(baseName))
+    val staging = File(directory, supportStagingName(baseName))
+
+    // Both, before anything is written. The previous bundle is replaced rather
+    // than added to, and a staging file from a collect that died mid-write is
+    // not something to append to.
+    staging.delete()
+    finalFile.delete()
+
+    // Newest first: the active file, then archives. `archives` already excludes
+    // `.part` and — because the bundle is not an archive name — the bundle this
+    // call is about to write.
+    val sources = mutableListOf<Source>()
+    if (file.isFile) sources.add(Source(file, alreadyCompressed = false))
+    for (archive in archives(directory, baseName)) {
+      sources.add(Source(archive.file, alreadyCompressed = archive.file.name.endsWith(".gz")))
+    }
+
+    // Measured on the source bytes. A ceiling that could only be checked after
+    // compressing would not bound the work, and the caller's question — how
+    // much of my log is leaving this device — is about the log, not about how
+    // well it compressed.
+    var budget = byteCap(maxTotalBytes)
+    val chosen = mutableListOf<Source>()
+    var truncated = false
+    for (source in sources) {
+      val bytes = sizeOrNull(source.file)
+      if (bytes == null) {
+        // Unmeasurable, so it cannot be charged against the ceiling. Taking it
+        // for free is the wrong direction on a number that says how much may
+        // leave the device.
+        truncated = true
+        continue
+      }
+      // Nothing to contribute. Skipped rather than packed as an empty member,
+      // which is what makes a ceiling of zero produce no bundle even when the
+      // active file has just been opened and is still empty.
+      if (bytes == 0uL) continue
+      if (bytes > budget) {
+        truncated = true
+        continue
+      }
+      budget -= bytes
+      chosen.add(source)
+    }
+    // Nothing to pack is a finished collect, not a failed one. [truncated]
+    // carries the difference between a device with no logs and a ceiling too
+    // small to fit any of the ones it has.
+    if (chosen.isEmpty()) {
+      return LogCollectOutcome("", 0.0, 0.0, truncated = truncated, complete = true)
+    }
+
+    var written = 0
+    try {
+      FileOutputStream(staging).use { sink ->
+        // Before a byte of log goes in, not after. A staging file that held
+        // records at default permissions for the duration of the copy would be
+        // readable for exactly as long as it takes to build a bundle of the
+        // whole log, which is the longest this directory is ever interesting.
+        if (!LogSecureFile.secure(staging, platform)) note(LogDegradation.PROTECTION)
+        // Oldest first, so `gunzip` yields the log in the order it happened.
+        for (source in chosen.asReversed()) {
+          // Where this member starts, so a copy that dies halfway can be undone
+          // rather than left in the stream. Half a gzip member followed by a
+          // whole one is not a gzip file, and publishing that as a truncated
+          // bundle would hand somebody a file no tool will open.
+          //
+          // NOT covered by a test, and deliberately kept anyway. Reaching it
+          // needs a read or a write that fails PART WAY through a 256 KB chunk
+          // — a failing flash chip, a volume that filled between two writes —
+          // and there is no seam in this file that can stage one. The member
+          // failures the suite can stage (a compressor that refuses, a source
+          // that will not open) all fail before a byte is written, where this
+          // is a no-op.
+          val mark = sink.channel.position()
+          if (appendMember(source, sink)) {
+            written++
+          } else {
+            truncated = true
+            sink.flush()
+            sink.channel.truncate(mark)
+            sink.channel.position(mark)
+          }
+        }
+        sink.flush()
+        sink.fd.sync()
+      }
+    } catch (_: Exception) {
+      staging.delete()
+      note(LogDegradation.GZIP)
+      return LogCollectOutcome("", 0.0, 0.0, truncated = truncated, complete = false)
+    }
+    val failed = LogCollectOutcome("", 0.0, 0.0, truncated = truncated, complete = false)
+    if (written == 0) {
+      staging.delete()
+      return failed
+    }
+
+    // Measured here rather than after the rename. A size the platform will not
+    // answer for is a bundle nothing can be said about, and saying `complete`
+    // with a byte count of zero over a file that is really there would send a
+    // support flow looking for a fault in the upload.
+    val bytes = sizeOrNull(staging)
+    if (bytes == null) {
+      staging.delete()
+      note(LogDegradation.GZIP)
+      return failed
+    }
+
+    // The publish barrier, with the rename inside it. Holding the lock across
+    // the rename is what makes "did this publish?" a question with one answer:
+    // a waiter that takes the lock either finds nothing renamed — and marks the
+    // collect abandoned, so nothing ever will be — or finds the finished
+    // outcome waiting for it. Neither side needs a timeout, and the only thing
+    // the loser waits for is one rename.
+    var published: LogCollectOutcome? = null
+    synchronized(handoff) {
+      if (handoff.abandoned) {
+        staging.delete()
+        return failed
+      }
+      if (!staging.renameTo(finalFile)) {
+        staging.delete()
+        note(LogDegradation.GZIP)
+        return failed
+      }
+      published = LogCollectOutcome(
+        path = finalFile.absolutePath,
+        byteCount = bytes.toDouble(),
+        sourceFileCount = written.toDouble(),
+        truncated = truncated,
+        complete = true
+      )
+      handoff.result = published!!
+      handoff.claimed = true
+    }
+    // Outside the barrier, because a mode that could not be applied is a
+    // degradation bit rather than a reason to withhold a bundle that exists.
+    if (!LogSecureFile.secure(finalFile, platform)) note(LogDegradation.PROTECTION)
+    return published!!
+  }
+
+  /**
+   * Size in bytes, or null for anything that cannot be measured.
+   *
+   * `length()` answers zero both for an empty file and for one it could not
+   * stat, which are opposite facts here — the first contributes nothing and
+   * the second is a file whose absence makes the bundle incomplete. `isFile`
+   * separates them.
+   */
+  private fun sizeOrNull(candidate: File): ULong? =
+    if (candidate.isFile) candidate.length().coerceAtLeast(0L).toULong() else null
+
+  /**
+   * Appends one source as a gzip member. Executor only.
+   *
+   * An archive rotation already compressed is a member and is copied verbatim.
+   * Anything else is compressed to a scratch file first and then copied, rather
+   * than compressed straight into the sink: that reuses the compressor rotation
+   * uses — the same one a test injects — instead of growing a second
+   * compression path that nothing else exercises.
+   */
+  private fun appendMember(source: Source, sink: FileOutputStream): Boolean {
+    if (source.alreadyCompressed) return copyInto(source.file, sink)
+
+    val temporary = File(directory, supportMemberName(file.name))
+    temporary.delete()
+    try {
+      if (!compressor.compress(source.file, temporary)) {
+        note(LogDegradation.GZIP)
+        return false
+      }
+      // A compressed copy of a log file, so it gets the same protections every
+      // other artifact does for as long as it exists — which is what rotation
+      // does with the identical file.
+      if (!LogSecureFile.secure(temporary, platform)) note(LogDegradation.PROTECTION)
+      return copyInto(temporary, sink)
+    } finally {
+      temporary.delete()
+    }
+  }
+
+  /**
+   * Streams [source] into [sink] in bounded chunks.
+   *
+   * Chunked rather than `readBytes()` because the caller's ceiling is on what
+   * leaves the device, not on what this is allowed to allocate: a 200 MB
+   * archive read whole is a memory spike on the thread of an app that was only
+   * trying to file a bug report.
+   *
+   * A false return may leave bytes in [sink]; the caller rolls them back.
+   */
+  private fun copyInto(source: File, sink: FileOutputStream): Boolean = try {
+    source.inputStream().use { input ->
+      val buffer = ByteArray(COPY_CHUNK_BYTES)
+      while (true) {
+        val read = input.read(buffer)
+        if (read < 0) break
+        sink.write(buffer, 0, read)
+      }
+    }
+    true
+  } catch (_: Exception) {
+    note(LogDegradation.GZIP)
+    false
+  }
+
   private fun flushUntil(handleId: Long, expiry: Long): LogFlushOutcome {
     var timedOut = false
 
@@ -1266,7 +1629,18 @@ class LogFileWriter internal constructor(
     // by a crash, or by a process that died mid-rotation — and nothing will
     // ever finish it. Compression runs on this same executor, so a staging file
     // seen from here is never one being written.
-    names.filter { isStagingName(it, baseName) }.forEach { remove(File(directory, it)) }
+    //
+    // The support bundle's staging file is swept for the same reason and by the
+    // same pass. The finished bundle is not: it is something a caller asked for
+    // and may not have uploaded yet, and deleting it here would make
+    // [collectLogs] a race against the next rotation.
+    names
+      .filter {
+        isStagingName(it, baseName) ||
+          it == supportStagingName(baseName) ||
+          it == supportMemberName(baseName)
+      }
+      .forEach { remove(File(directory, it)) }
 
     var archives = archives(directory, baseName)
 

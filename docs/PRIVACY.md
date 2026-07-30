@@ -402,9 +402,10 @@ inaccessible until first unlock, and Android has no per-file counterpart.
 
 **`FileDestination.purge(deadlineMs)` is the compliance primitive.** It is
 synchronous and returns a `PurgeOutcome`. It deletes every artifact the writer
-can produce — active file, age sidecar, archives, and interrupted gzip staging
-files — bumps a generation so nothing in flight can write into the fresh file,
-and `fsync`s the directory so the removals survive a crash.
+can produce — active file, age sidecar, archives, interrupted gzip staging
+files, and any support bundle a `collectForSupport()` left behind — bumps a
+generation so nothing in flight can write into the fresh file, and `fsync`s the
+directory so the removals survive a crash.
 
 Its reach is the file sink. It does not and cannot clear what other
 destinations did with the same entry; see the paragraph above on `os_log` and
@@ -433,10 +434,50 @@ back. `discardedEntries` and `discardedBytes` say what was thrown away from the
 JS buffer, which is deliberately discarded rather than flushed — flushing it
 would write pre-purge records into the file moments before or after deleting it.
 
-`getLogFilePaths()` exists so an app can implement its own consent-gated
-support-log upload. Collecting and transmitting logs is deliberately not in
-this library: that needs a consent flow and an encryption story that belong to
-the application, not to its logger.
+**`FileDestination.collectForSupport({ maxTotalBytes })` packs the logs into
+one gzip bundle, and stops there.** It writes `<logfile>.support.gz` beside the
+log files — inside the sink's own directory, never a path the caller chooses —
+and hands back that path. `gunzip` on it gives the whole log as chronological
+JSON Lines, because gzip is a multi-member format and the bundle is the
+existing archives copied in with the flushed active file compressed in beside
+them.
+
+Three things it deliberately does not do, each because the alternative would be
+this library deciding something that is the application's to decide:
+
+- **It does not upload.** Transmission needs a consent flow, a destination the
+  user has been told about, and a retention policy at the other end. None of
+  those are a logger's to choose, and a library that shipped an uploader would
+  be shipping a default answer to all three.
+- **It does not encrypt the bundle.** Both platforms already encrypt it at
+  rest — it inherits the same owner-only mode and, on iOS, the same protection
+  class as every other artifact — and a key shipped inside the app that reads
+  it is theatre rather than protection. Encryption for *transit* belongs to
+  whatever does the transmitting, which is the previous point.
+- **It does not decide how much leaves the device.** `maxTotalBytes` is
+  required and `Infinity` is refused. That is the consent-shaped decision in
+  the feature, and putting it in the signature is what stops it being made by
+  default.
+
+A collect that runs out of time leaves nothing. The work cannot be cancelled
+part way, so it is stopped at the last step instead: a build whose caller
+stopped waiting deletes its staging file rather than renaming a bundle into
+place. Otherwise a call that reported "no bundle" would leave a second complete
+copy of the log on the device, outside the retention limits the app set and
+invisible to `getLogFilePaths()`.
+
+The bundle is an artifact like any other: `purge()` deletes it, the retention
+sweep collects a staging file left by an interrupted collect, and it is
+excluded from `getLogFilePaths()`, from the archive count and from
+`maxTotalLogBytes` so it can never be mistaken for a log file or crowd one out.
+At most one exists — each collect replaces the last — so a device does not
+accumulate copies of its own log. A bundle that has been collected but not yet
+uploaded is a second copy of the log on disk until something removes it; that
+is the trade for not holding a whole log in memory, and `purge()` is what ends
+it.
+
+`getLogFilePaths()` remains, for an app that would rather assemble its own
+upload from the individual files than send one bundle.
 
 It keeps answering after `dispose()`, and that is deliberate rather than an
 oversight in the teardown path. Disposing releases the native handle; it does

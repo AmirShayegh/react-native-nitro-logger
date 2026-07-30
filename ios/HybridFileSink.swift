@@ -146,6 +146,25 @@ final class HybridFileSink: HybridFileSinkSpec {
     return Self.status(handle.maintain(deadlineMs: deadlineMs))
   }
 
+  func collectLogs(deadlineMs: Double, maxTotalBytes: Double) throws -> CollectOutcome {
+    // No handle, no bundle — and `complete: true`, because a sink that was
+    // never opened has finished collecting everything it has. A support flow
+    // that treated this as an error would show a failure for an app that
+    // simply has no logs yet.
+    guard let handle = current() else {
+      return CollectOutcome(
+        path: "", byteCount: 0, sourceFileCount: 0, truncated: false, complete: true)
+    }
+    let outcome = handle.collectLogs(deadlineMs: deadlineMs, maxTotalBytes: maxTotalBytes)
+    return CollectOutcome(
+      path: outcome.path,
+      byteCount: outcome.byteCount,
+      sourceFileCount: outcome.sourceFileCount,
+      truncated: outcome.truncated,
+      complete: outcome.complete
+    )
+  }
+
   func flush(deadlineMs: Double) throws -> FlushOutcome {
     // One snapshot, so the handle and the answer to give without one cannot
     // disagree about which instant they describe.

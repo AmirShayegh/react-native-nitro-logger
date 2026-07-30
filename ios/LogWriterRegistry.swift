@@ -372,6 +372,17 @@ public final class LogFileHandle {
     return writer.maintain(handleID: id, deadlineMs: deadlineMs)
   }
 
+  /// Packs the logs into one gzip bundle — see `LogWriter.collectLogs`.
+  ///
+  /// Gated on liveness like every other entry point. A released handle
+  /// collecting would read files a live handle is still rotating, and would
+  /// write its bundle into that handle's directory.
+  public func collectLogs(deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
+    guard liveGeneration() != nil else { return .nothing }
+    return writer.collectLogs(
+      handleID: id, deadlineMs: deadlineMs, maxTotalBytes: maxTotalBytes)
+  }
+
   public func flush(deadlineMs: Double) -> LogFlushOutcome {
     guard liveGeneration() != nil else {
       // Not `durable: true`. A released handle did not flush anything, and

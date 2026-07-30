@@ -556,6 +556,18 @@ class LogFileHandle internal constructor(
     return writer.maintain(id, deadlineMs)
   }
 
+  /**
+   * Packs the logs into one gzip bundle — see [LogFileWriter.collectLogs].
+   *
+   * Gated on liveness like every other entry point. A released handle
+   * collecting would read files a live handle is still rotating, and would
+   * write its bundle into that handle's directory.
+   */
+  fun collectLogs(deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
+    if (!isLive) return LogCollectOutcome.NOTHING
+    return writer.collectLogs(id, deadlineMs, maxTotalBytes)
+  }
+
   fun flush(deadlineMs: Double): LogFlushOutcome {
     // Not `durable = true`. A released handle flushed nothing, and saying
     // otherwise invites the caller to treat its pending records as safe.

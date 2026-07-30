@@ -15,6 +15,8 @@ namespace margelo::nitro::nitrologger { enum class RejectReason; }
 namespace margelo::nitro::nitrologger { struct SinkStatus; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct FlushOutcome; }
+// Forward declaration of `CollectOutcome` to properly resolve imports.
+namespace margelo::nitro::nitrologger { struct CollectOutcome; }
 // Forward declaration of `ClearOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 // Forward declaration of `RotationConfig` to properly resolve imports.
@@ -31,6 +33,8 @@ namespace margelo::nitro::nitrologger { struct RotationConfig; }
 #include "FlushOutcome.hpp"
 #include "JFlushOutcome.hpp"
 #include <vector>
+#include "CollectOutcome.hpp"
+#include "JCollectOutcome.hpp"
 #include "ClearOutcome.hpp"
 #include "JClearOutcome.hpp"
 #include "RotationConfig.hpp"
@@ -114,6 +118,11 @@ namespace margelo::nitro::nitrologger {
   SinkStatus JHybridFileSinkSpec::maintain(double deadlineMs) {
     static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JSinkStatus>(double /* deadlineMs */)>("maintain");
     auto __result = method(_javaPart, deadlineMs);
+    return __result->toCpp();
+  }
+  CollectOutcome JHybridFileSinkSpec::collectLogs(double deadlineMs, double maxTotalBytes) {
+    static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JCollectOutcome>(double /* deadlineMs */, double /* maxTotalBytes */)>("collectLogs");
+    auto __result = method(_javaPart, deadlineMs, maxTotalBytes);
     return __result->toCpp();
   }
   ClearOutcome JHybridFileSinkSpec::clearLogs(double deadlineMs) {

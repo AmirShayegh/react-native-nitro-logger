@@ -41,8 +41,8 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=185
-    REQUIRED_SUITES="FileSinkLifecycleTests LogBurstTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
+    MINIMUM=203
+    REQUIRED_SUITES="FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     # `--xunit-output` is the only machine-readable result SwiftPM emits, and
@@ -53,15 +53,15 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=167
-    REQUIRED_SUITES="BridgeNumberTest FileSinkLifecycleTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
+    MINIMUM=185
+    REQUIRED_SUITES="BridgeNumberTest FileSinkLifecycleTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)
     RUN_STATUS=$?
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=808
+    MINIMUM=825
     REQUIRED_SUITES="apiReference batcher consoleDestination defaultFormatter eslintPlugin fileDestination integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination privacy redaction rejectionHandler sanitizeError scope subsystem"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"

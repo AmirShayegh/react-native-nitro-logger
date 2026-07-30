@@ -21,6 +21,8 @@ namespace margelo::nitro::nitrologger { struct AppendResult; }
 namespace margelo::nitro::nitrologger { struct SinkStatus; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct FlushOutcome; }
+// Forward declaration of `CollectOutcome` to properly resolve imports.
+namespace margelo::nitro::nitrologger { struct CollectOutcome; }
 // Forward declaration of `ClearOutcome` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 
@@ -31,6 +33,7 @@ namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 #include "SinkStatus.hpp"
 #include "FlushOutcome.hpp"
 #include <vector>
+#include "CollectOutcome.hpp"
 #include "ClearOutcome.hpp"
 
 namespace margelo::nitro::nitrologger {
@@ -71,6 +74,7 @@ namespace margelo::nitro::nitrologger {
       virtual FlushOutcome close(double deadlineMs) = 0;
       virtual std::vector<std::string> getLogFilePaths() = 0;
       virtual SinkStatus maintain(double deadlineMs) = 0;
+      virtual CollectOutcome collectLogs(double deadlineMs, double maxTotalBytes) = 0;
       virtual ClearOutcome clearLogs(double deadlineMs) = 0;
 
     protected:

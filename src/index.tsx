@@ -27,6 +27,7 @@ export type { LogDestination } from './destinations/types';
 export { ConsoleDestination } from './destinations/ConsoleDestination';
 export { FileDestination } from './destinations/FileDestination';
 export type {
+  CollectForSupportOptions,
   FileDestinationOptions,
   FileSinkLike,
   PurgeOutcome,
@@ -109,6 +110,7 @@ export type {
   AppendResult,
   FlushOutcome,
   ClearOutcome,
+  CollectOutcome,
 } from './specs/FileSink.nitro';
 export type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
 

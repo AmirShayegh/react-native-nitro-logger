@@ -179,6 +179,30 @@ data class LogFlushOutcome(
   val status: LogSinkStatus
 )
 
+/** What [LogFileWriter.collectLogs] produced. See the `CollectOutcome` spec doc. */
+data class LogCollectOutcome(
+  /** Absolute path of the bundle, or `""` when none was produced. */
+  val path: String,
+  val byteCount: Double,
+  val sourceFileCount: Double,
+  /** Some log files were left out — the ceiling, or one that would not compress. */
+  val truncated: Boolean,
+  /** The collect ran to the end of what it set out to do. */
+  val complete: Boolean
+) {
+  companion object {
+    /**
+     * No bundle, nothing left out, nothing finished.
+     *
+     * The answer for a writer that has been terminated or a collect whose
+     * deadline expired. `truncated = false` is deliberate: nothing was dropped
+     * from a bundle that does not exist, and saying otherwise would have a
+     * caller apologising to a user for a partial upload that never happened.
+     */
+    val NOTHING = LogCollectOutcome("", 0.0, 0.0, truncated = false, complete = false)
+  }
+}
+
 data class LogClearOutcome(
   val deletedCount: Int,
   val failedPaths: List<String>,

@@ -1,6 +1,7 @@
 import type {
   AppendResult,
   ClearOutcome,
+  CollectOutcome,
   FlushOutcome,
   RotationConfig,
   SinkStatus,
@@ -151,6 +152,15 @@ interface LossTotals {
   bytes: number;
 }
 
+/** No bundle, and the collect did not finish. */
+const NOTHING_COLLECTED: CollectOutcome = {
+  path: '',
+  byteCount: 0,
+  sourceFileCount: 0,
+  truncated: false,
+  complete: false,
+};
+
 /** One handle on a {@link MemoryWriter}; one `FileDestination` drives one. */
 export class MemoryFileSink implements FileSinkLike {
   readonly defaultLogDirectory = '/memory/logs';
@@ -183,6 +193,20 @@ export class MemoryFileSink implements FileSinkLike {
   maintainCalls: number[] = [];
   /** Runs on the writer queue, where the real sweep runs. */
   onMaintain: (() => void) | undefined;
+  /** Throw out of collectLogs, as a native call can. */
+  collectThrows = false;
+  /** Arguments every collect was called with, in order. */
+  collectCalls: Array<{ deadlineMs: number; maxTotalBytes: number }> = [];
+  /**
+   * What each produced bundle contained, in order.
+   *
+   * The real bundle is gzip; this is the plaintext that went into it, which
+   * is what a JS-side test can actually assert about — that the collect saw
+   * the records the batcher was still holding when it was called.
+   */
+  collectedBundles: string[] = [];
+  /** Runs on the writer queue, where the real bundle is built. */
+  onCollect: (() => void) | undefined;
 
   private generation: number;
 
@@ -238,6 +262,70 @@ export class MemoryFileSink implements FileSinkLike {
     }
     this.onMaintain?.();
     return this.status();
+  }
+
+  /**
+   * The bundle the last successful collect would have written.
+   *
+   * Same shape as both natives: a fixed name beside the log file, never a
+   * path the caller chose.
+   */
+  get bundlePath(): string {
+    return this.openedPath === undefined ? '' : `${this.openedPath}.support.gz`;
+  }
+
+  collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome {
+    this.collectCalls.push({ deadlineMs, maxTotalBytes });
+    if (this.collectThrows) throw new Error('collect unavailable');
+    // The same gate both natives apply. A fenced or closed handle does not
+    // pack the files it used to own; they belong to whoever holds the writer
+    // now, and a bundle built from them would be a stale-generation read of
+    // somebody else's log.
+    if (this.closed || this.generation !== this.writer.generation) {
+      return { ...NOTHING_COLLECTED };
+    }
+
+    this.onCollect?.();
+    const contents = this.writer.file.join('');
+    const bytes = utf8Length(contents);
+    // A ceiling that is not a number is zero, never "no ceiling". This mirrors
+    // `byteCap` on both natives; the destination rejects those values before
+    // they reach a sink, and the double still has to fail the same way, or a
+    // future caller that skips the check meets a double that sends everything.
+    const cap =
+      Number.isFinite(maxTotalBytes) && maxTotalBytes > 0 ? maxTotalBytes : 0;
+
+    // Nothing to pack is a finished collect, not a failed one — a device with
+    // no logs is not an error a support flow should show.
+    if (bytes === 0) {
+      return {
+        path: '',
+        byteCount: 0,
+        sourceFileCount: 0,
+        truncated: false,
+        complete: true,
+      };
+    }
+    // One file, so the ceiling is all-or-nothing here; newest-first selection
+    // across several is the natives' behaviour and is pinned there.
+    if (bytes > cap) {
+      return {
+        path: '',
+        byteCount: 0,
+        sourceFileCount: 0,
+        truncated: true,
+        complete: true,
+      };
+    }
+
+    this.collectedBundles.push(contents);
+    return {
+      path: this.bundlePath,
+      byteCount: bytes,
+      sourceFileCount: 1,
+      truncated: false,
+      complete: true,
+    };
   }
 
   flush(deadlineMs: number): FlushOutcome {
