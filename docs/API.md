@@ -40,7 +40,7 @@ down to be useful ends up not being used at the layers that need it most.
 | `resetSubsystem(name)` | `this` | Drop a per-subsystem floor. |
 | `privacyDefault(value)` | `this` | `'public'` or `'private'`. First call wins, and later calls may only tighten. |
 | `redactAllMetadata()` | `this` | Redact every value regardless of marker. Not reversible. |
-| `metadataKeyCatalog(keys)` | `this` | Approve key names. **Mandatory under `'private'`** — see [PRIVACY.md](PRIVACY.md#metadata-keys). |
+| `metadataKeyCatalog(keys)` | `this` | Approve key names. Calls intersect; one bad key approves none. **Mandatory under `'private'`** — see [PRIVACY.md](PRIVACY.md#metadata-keys). |
 | `consoleLogging(enabled)` | `this` | Toggle the built-in console destination. |
 | `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. |
 | `removeDestination(label)` | `this` | Unregister and dispose. |
@@ -51,6 +51,17 @@ down to be useful ends up not being used at the layers that need it most.
 `flush()` deliberately returns `void`. Whether bytes reached disk is a question
 only the file sink can answer, so ask it: `FileDestination.flush(deadlineMs)`
 returns a `BatchFlushOutcome` with `durable` on it.
+
+`metadataKeyCatalog` is tighten-only and implements that by **intersecting**:
+the second call keeps only the keys the first one also approved and can never
+add one back, so two calls naming two different groups approve their overlap
+rather than their union. The list is validated as a whole, too — one entry that
+is not a string or does not match `^[A-Za-z0-9._-]{1,64}$`, or an argument that
+is not iterable at all, approves *nothing* instead of skipping the bad entry.
+Call it once, from the entry point, with every key the app logs under. Both
+mistakes are otherwise silent under `'private'`, so a development build warns
+when a call leaves fewer keys approved than it found, or when the first call
+approves none — counts only, never the key names themselves.
 
 <!-- api: Logger -->
 
@@ -128,8 +139,14 @@ destination gets, after markers are resolved and rejected keys removed.
 
 ## Destinations
 
-`LogDestination` is the interface: `label`, `isEnabled`, `write(entry)`,
-`flush(deadlineMs?)`, `dispose()`. Implement it to add your own.
+`LogDestination` is the interface: `label`, the optional `minimumLevel`,
+`isEnabled`, `write(entry)`, `flush(deadlineMs?)`, `dispose()`. Implement it to
+add your own.
+
+`minimumLevel` is a per-destination floor, and the `Logger` applies it *before*
+evaluating a `LazyMessage` — so a destination that declares one does not pay for
+messages it will not write. Omit it and the destination sees everything the
+global and per-subsystem floors let through.
 
 ### `ConsoleDestination`
 
@@ -176,7 +193,12 @@ const logFile = new FileDestination(createFileSink(), {
 from `rebound` (the destination is writable again), because a complete deletion
 can still be followed by a failed reopen, and a caller that resumed on
 `durable` alone would write into a destination with nowhere to put anything.
-It also carries `deletedCount`, `failedPaths` and `discardedEntries`.
+It also carries `deletedCount`, `failedPaths`, and `discardedEntries` with
+`discardedBytes` — buffered records thrown away by the purge, plus earlier
+losses whose counts no `flush` result will now report, since the destination
+they were queued for no longer exists. Two numbers rather than one because a
+retention or upload budget is measured in bytes and an alerting threshold
+usually is not.
 
 **`purge()` after `dispose()` returns `durable: false`.** A disposed
 destination cannot see the files, so it cannot honestly claim they are gone.
@@ -202,12 +224,27 @@ README section tabulates them with their defaults.
 
 ## Formatters
 
-`LogFormatter` is `{ framing?: 'line'; format(entry): string }`.
+`LogFormatter` is
+`{ framing?: 'line'; format(entry): string; formatWithin?(entry, maxBytes): string }`.
 
-Declaring `framing: 'line'` is a promise that one entry is one line with no
-embedded newlines, which is what lets the native writer trim a torn record
-after a crash. A formatter that declares it and then emits a newline breaks
-recovery, so declare it only if it holds.
+Declaring `framing: 'line'` is a promise that one entry renders as one
+LF-delimited record, which is what lets the native writer trim a torn record
+after a crash. It is a promise about `\n` and about nothing else:
+`JsonLinesFormatter` passes U+2028, U+2029 and the C1 range through as
+themselves, for byte parity, so a reader has to split on LF and parse each
+record *before* any line-oriented presentation logic —
+[PARITY.md](PARITY.md) states that obligation in full. A formatter that
+declares `framing` and then emits a `\n` breaks recovery, so declare it only if
+it holds.
+
+`formatWithin` is optional, and is how a formatter sheds content to fit a
+UTF-8 byte budget *structurally* — dropping whole fields, truncating one at
+code-point boundaries — so the result is still well-formed in that format. Best
+effort: it may come back over budget, since a record has a floor below which it
+identifies nothing, and the caller measures rather than assumes. A formatter
+that omits it is never sliced to fit — an entry over the destination's
+`maxEntryBytes` is replaced whole by a fixed notice, because cutting a rendered
+record to length is how a log file stops being parseable.
 
 ### `JsonLinesFormatter`
 

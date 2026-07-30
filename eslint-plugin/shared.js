@@ -2136,6 +2136,8 @@ module.exports = {
   LEVEL_METHODS,
   LOGGER_OWN_METHODS,
   LOG_METHODS,
+  METADATA_OPTION_FIELDS,
+  OPTIONS_METHODS,
   RECEIVER_OPTION_PROPERTIES,
   classifyConstruction,
   classifyReceiver,

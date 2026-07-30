@@ -114,25 +114,42 @@ export class Logger {
    * literal key like `patient123` is still PHI — so the catalog checks exact
    * membership at runtime.
    *
-   * Tighten-only: repeat calls intersect with the existing catalog rather
-   * than replacing it. Mandatory under a `'private'` privacy default, where
-   * an unconfigured catalog approves nothing and all metadata drops.
+   * **Tighten-only, and that means every call intersects.** The second call
+   * does not replace the first, it narrows it — so passing two different
+   * groups of keys in two calls approves their *overlap*, which is usually
+   * empty. One call, with the whole set, is the only shape that does what it
+   * reads like. Mandatory under a `'private'` privacy default, where an
+   * unconfigured catalog approves nothing and all metadata drops.
    *
-   * Input is not trusted: a non-iterable, a throwing iterator, a non-string
-   * or malformed entry, or an over-long iterable all yield an empty catalog
-   * rather than an exception or a hung JS thread.
+   * **A malformed entry empties the whole catalog**, rather than being skipped
+   * — see {@link buildCatalog}. Input is not trusted: a non-iterable, a
+   * throwing iterator, a non-string or invalid key, or an over-long iterable
+   * all yield an empty set rather than an exception or a hung JS thread.
+   * Fail-closed is right, and it is also silent: one typo among fifty valid
+   * keys drops all fifty, and under `'private'` every field of every entry
+   * then renders `<private>` with nothing saying why.
+   *
+   * Which is what the development-only warning below is for. It fires when a
+   * call makes the effective catalog *smaller* — the case that is nearly
+   * always a mistake — and when the first call approves nothing at all. Never
+   * with a key name: the keys are the thing this whole subsystem exists to
+   * keep out of the log.
    */
   metadataKeyCatalog(keys: Iterable<string>): this {
     const incoming = buildCatalog(keys);
-    if (this.keyCatalog === undefined) {
+    const current = this.keyCatalog;
+
+    if (current === undefined) {
       this.keyCatalog = incoming;
     } else {
       const intersection = new Set<string>();
-      for (const key of this.keyCatalog) {
+      for (const key of current) {
         if (incoming.has(key)) intersection.add(key);
       }
       this.keyCatalog = intersection;
     }
+
+    warnIfCatalogShrank(current, incoming, this.keyCatalog);
     return this;
   }
 
@@ -402,6 +419,61 @@ export class Logger {
 function defaultRegistrations(): Registration[] {
   const console_ = new ConsoleDestination();
   return [{ destination: console_, label: console_.label }];
+}
+
+/**
+ * Says so, in development, when a catalog call approved less than it looks
+ * like it did.
+ *
+ * Two mistakes are silent and both end the same way — every metadata field
+ * rendering `<private>` with nothing to explain it:
+ *
+ * - **A malformed key empties the whole catalog.** `buildCatalog` is
+ *   fail-closed on purpose, so one typo among fifty valid keys approves none
+ *   of the fifty.
+ * - **Repeat calls intersect.** Two calls with two different groups of keys
+ *   approve their overlap, which is usually nothing. The method reads like it
+ *   replaces; it narrows.
+ *
+ * The condition is that the **effective** catalog got smaller, not that the
+ * intersection is smaller than one of its operands: calling again with a
+ * superset is a legitimate no-op and firing on it would train people to
+ * ignore this.
+ *
+ * **Counts only, never key names.** Approved key names are application
+ * vocabulary and a rejected one may be the PHI-shaped literal — `patient123`
+ * — that the catalog exists to keep out of the log. A diagnostic that printed
+ * it would put it exactly where it must never be.
+ *
+ * Development only. This is guidance while the catalog is being configured,
+ * and a release build has nobody to read it.
+ */
+function warnIfCatalogShrank(
+  previous: ReadonlySet<string> | undefined,
+  incoming: ReadonlySet<string>,
+  effective: ReadonlySet<string>
+): void {
+  if (typeof __DEV__ === 'undefined' || !__DEV__) return;
+
+  if (previous === undefined) {
+    // The first call. Nothing narrowed, so the only failure visible here is a
+    // catalog that came back with nothing in it — a malformed key, an input
+    // that was not iterable, or an empty one.
+    if (incoming.size > 0) return;
+    warnFixed(
+      '[nitro-logger] metadataKeyCatalog() approved 0 keys, so every ' +
+        'metadata key will be dropped. One invalid key empties the whole ' +
+        'catalog; check that each is 1-64 characters of [A-Za-z0-9._-].'
+    );
+    return;
+  }
+
+  if (effective.size >= previous.size) return;
+  warnFixed(
+    `[nitro-logger] metadataKeyCatalog() narrowed the approved keys from ` +
+      `${previous.size} to ${effective.size}. Calls intersect rather than ` +
+      `replace, so pass every key in a single call.`
+  );
 }
 
 /** Fixed-text diagnostic; never interpolates caller-controlled data. */

@@ -69,10 +69,20 @@ general application use. Apps handling regulated data should switch to the
 strict one in their entry point, before anything logs:
 
 ```ts
-import { Log, pub, priv } from 'react-native-nitro-logger';
+import {
+  Log,
+  pub,
+  priv,
+  ERROR_METADATA_KEYS,
+} from 'react-native-nitro-logger';
 
 Log.privacyDefault('private');
-Log.metadataKeyCatalog(['requestId', 'statusCode', 'durationMs']);
+Log.metadataKeyCatalog([
+  ...ERROR_METADATA_KEYS, // the crash handler's own six — see below
+  'requestId',
+  'statusCode',
+  'durationMs',
+]);
 
 function onRequestFinished(id: string) {
   Log.info('request finished', {
@@ -81,6 +91,13 @@ function onRequestFinished(id: string) {
   });
 }
 ```
+
+That is one `metadataKeyCatalog` call listing every key the app logs under, and
+it is meant to stay one: calls **intersect** rather than replace, so a second
+one naming different keys approves the overlap of the two, and a single
+malformed key approves nothing at all. Under `'private'` either mistake shows
+up only as metadata that has quietly gone — a development build warns, and
+[docs/PRIVACY.md](docs/PRIVACY.md#metadata-keys) has the rest.
 
 **In a release build** (`__DEV__` false):
 
@@ -151,10 +168,13 @@ const file = new FileDestination(createFileSink(), {
 Log.addDestination(file);
 ```
 
-Logs live in app-private storage — `noBackupFilesDir` on Android, `Library/Logs`
-on iOS. Owner-only modes are applied to every artifact; where the platform
-refuses, the sink reports a `protection` degradation and keeps logging rather
-than failing shut.
+By default logs live in app-private storage — `noBackupFilesDir` on Android,
+`Library/Logs` on iOS. Owner-only modes are applied to every artifact; where the
+platform refuses, the sink reports a `protection` degradation and keeps logging
+rather than failing shut. Passing your own `path` keeps the modes, but Android's
+backup exclusion comes from that default directory rather than from anything set
+on the files, so it does not travel with them —
+[docs/PRIVACY.md](docs/PRIVACY.md#logs-on-disk) has the detail.
 
 ```ts
 file.getLogFilePaths();     // for a consent-gated support upload
@@ -242,6 +262,14 @@ the class name reduced to a built-in or a fixed token, and stack frames reduced
 to a position in a file whose name was already known. It flushes on fatal
 errors, then chains to whatever handler was installed before it. Both functions
 return idempotent uninstall handles.
+
+It logs under six metadata keys of its own, exported as `ERROR_METADATA_KEYS`.
+Under `privacyDefault('private')` those keys go through the same catalog as
+yours, so a catalog that does not list them leaves crash reports arriving with
+their metadata stripped — which is why the privacy snippet above spreads the
+constant rather than transcribing the six. Spreading also survives a key being
+added in a later version; a hand-written list would start dropping it without
+saying so.
 
 ## Output format
 

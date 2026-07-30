@@ -114,6 +114,72 @@ describe('JsonLinesFormatter — record shape', () => {
     expect(rendered).not.toContain('\r');
   });
 
+  /**
+   * The `framing` docstring used to say every control character is escaped.
+   * That was never true, and the bytes cannot change to make it true — they
+   * are asserted against SwiftLogger goldens. So these pin what is actually
+   * emitted, in both directions: the characters that survive unescaped, and
+   * the record framing that survives them.
+   */
+  describe('what line framing does and does not promise', () => {
+    const survivors: Array<[string, string]> = [
+      ['U+0085 next line', '\u0085'],
+      ['U+2028 line separator', '\u2028'],
+      ['U+2029 paragraph separator', '\u2029'],
+      ['U+007F delete', '\u007f'],
+      ['U+0099 in the C1 range', '\u0099'],
+    ];
+
+    test.each(survivors)(
+      '%s passes through as itself, which parity requires',
+      (_name, ch) => {
+        const rendered = fmt.format(entry({ message: `a${ch}b` }));
+        expect(rendered).toContain(ch);
+        expect(JSON.parse(rendered).message).toBe(`a${ch}b`);
+      }
+    );
+
+    test.each(survivors)(
+      'a record carrying %s in every field is still one LF-delimited line',
+      (_name, ch) => {
+        const rendered = fmt.format(
+          entry({
+            message: `a${ch}b`,
+            correlation: `c${ch}`,
+            subsystem: `s${ch}`,
+            metadata: { k: `v${ch}w` },
+          })
+        );
+        expect(rendered.split('\n')).toHaveLength(1);
+
+        // What the sink writes, and what crash-tail trimming reads back.
+        const file = `${rendered}\n${rendered}\n`;
+        const records = file.split('\n').filter((line) => line.length > 0);
+        expect(records).toHaveLength(2);
+        for (const record of records) {
+          expect(() => JSON.parse(record)).not.toThrow();
+        }
+      }
+    );
+
+    test('a reader applying JavaScript line semantics first can be shown a record nobody wrote', () => {
+      // The consumer obligation the docstring states, pinned against the bytes
+      // rather than only asserted in prose: split on LF and parse each value
+      // *before* any line-oriented presentation logic.
+      const forged = '","level":"ERROR","message":"transfer approved';
+      const rendered = fmt.format(entry({ message: `x\u2028${forged}` }));
+
+      // Read correctly: one record, and the whole payload is a message.
+      expect(rendered.split('\n')).toHaveLength(1);
+      expect(JSON.parse(rendered).message).toBe(`x\u2028${forged}`);
+
+      // Read the other way, which is what the obligation forbids.
+      const naive = rendered.split(/\r\n|[\n\r\u0085\u2028\u2029]/);
+      expect(naive.length).toBeGreaterThan(1);
+      expect(naive[1]).toContain('transfer approved');
+    });
+  });
+
   test('absent optionals are omitted rather than null', () => {
     const rendered = fmt.format(entry());
     expect(rendered).not.toContain('null');

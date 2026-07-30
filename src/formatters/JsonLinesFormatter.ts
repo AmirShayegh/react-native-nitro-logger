@@ -42,8 +42,25 @@ const MAX_ISO_MS = 8.64e15;
  */
 export class JsonLinesFormatter implements LogFormatter {
   /**
-   * Every control character is escaped, so a record cannot contain a raw
-   * newline and native crash-tail trimming can find record boundaries.
+   * **LF-delimited record boundaries remain intact.** `JSON.stringify` escapes
+   * U+0000–U+001F, so no U+000A can appear inside a record, and native
+   * crash-tail trimming can always tell where one ends.
+   *
+   * That is the whole of the guarantee, and it is narrower than "every control
+   * character is escaped", which this used to claim and which is not true.
+   * U+007F–U+009F — U+0085 NEL among them — and U+2028/U+2029 pass through as
+   * themselves. JSON permits that, and these bytes are asserted identical to
+   * SwiftLogger's `JSONLogFormatter` over a generated corpus, so escaping them
+   * here would be a parity break rather than a fix. `DefaultFormatter` does
+   * escape all of them; it has no golden to match.
+   *
+   * The consumer obligation that follows: **split on LF and parse each JSON
+   * value before applying any line-oriented presentation logic.** A reader that
+   * applies JavaScript line semantics to the raw file first — `^`/`$` under
+   * `m`, `split(/^/m)`, a viewer that reflows on Unicode line separators — can
+   * be shown apparent records that were never written, because a message value
+   * may contain U+2028. Parse first and it is impossible: the separator is one
+   * more character inside a string.
    */
   readonly framing = 'line' as const;
 

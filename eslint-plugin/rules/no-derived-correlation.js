@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  OPTIONS_METHODS,
   RECEIVER_OPTION_PROPERTIES,
   correlationArguments,
   describeLogCall,
@@ -166,9 +167,18 @@ module.exports = {
 
         const call = describeLogCall(context, node);
         if (!call) return;
-        if (call.spreadArgs && (call.method === 'log' || call.opaqueMethod)) {
+        if (
+          call.spreadArgs &&
+          (OPTIONS_METHODS.has(call.method) || call.opaqueMethod)
+        ) {
           // `Log.log(...['m', { correlation: patientId }])` — the options
           // object, and the correlation inside it, are out of reach.
+          //
+          // The set, not a literal `'log'`. `logMessage` takes the same
+          // options object and was spelled out of this check, so
+          // `Log.logMessage(...args)` reported nothing at all: the one method
+          // whose second argument is *always* the options shape was the one
+          // the guard did not cover.
           context.report({ node, messageId: 'unanalyzable' });
           return;
         }

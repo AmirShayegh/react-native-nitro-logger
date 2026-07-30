@@ -211,6 +211,82 @@ describe('metadata keys', () => {
     logger.info('m', { anything: 'at all' });
     expect(md(dest)).toEqual({ anything: 'at all' });
   });
+
+  /**
+   * Both ways of getting a catalog wrong are silent, and both end with every
+   * field rendering `<private>`. The warning is the only thing between a typo
+   * and a crash report with nothing in it.
+   */
+  describe('the development warning when a catalog narrows', () => {
+    let warnings: string[];
+    let warn: jest.SpyInstance;
+
+    beforeEach(() => {
+      warnings = [];
+      warn = jest
+        .spyOn(console, 'warn')
+        .mockImplementation((message: string) => {
+          warnings.push(String(message));
+        });
+    });
+
+    afterEach(() => warn.mockRestore());
+
+    test('one malformed key empties the catalog, and says so', () => {
+      setDev(true);
+      const { logger } = makeLogger();
+      logger.metadataKeyCatalog(['fine', 'also fine?', 'good']);
+
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('approved 0 keys');
+    });
+
+    test('a second call with different keys reports the narrowing', () => {
+      setDev(true);
+      const { logger } = makeLogger();
+      logger.metadataKeyCatalog(['a', 'b']);
+      expect(warnings).toEqual([]);
+
+      logger.metadataKeyCatalog(['b', 'c']);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('from 2 to 1');
+    });
+
+    /**
+     * The case a naive check gets wrong. Calling again with a superset is a
+     * legitimate no-op — the intersection is smaller than the *incoming* set
+     * but the effective catalog did not move — and warning here would train
+     * people to ignore the warning that matters.
+     */
+    test('calling again with a superset is silent', () => {
+      setDev(true);
+      const { logger } = makeLogger();
+      logger.metadataKeyCatalog(['a', 'b']);
+      logger.metadataKeyCatalog(['a', 'b', 'c', 'd']);
+
+      expect(warnings).toEqual([]);
+    });
+
+    test('it never names a key', () => {
+      setDev(true);
+      const { logger } = makeLogger();
+      logger.metadataKeyCatalog(['patient123', 'mrn']);
+      logger.metadataKeyCatalog(['mrn']);
+
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).not.toContain('patient123');
+      expect(warnings[0]).not.toContain('mrn');
+    });
+
+    test('nothing is said in a release build', () => {
+      setDev(false);
+      const { logger } = makeLogger();
+      logger.metadataKeyCatalog(['fine', 'also fine?']);
+      logger.metadataKeyCatalog(['nothing', 'in', 'common']);
+
+      expect(warnings).toEqual([]);
+    });
+  });
 });
 
 describe('value validation at emit', () => {

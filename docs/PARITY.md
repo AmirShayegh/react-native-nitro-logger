@@ -162,6 +162,18 @@ with the goldens.
 The distinction is that a console line is read by a terminal, and a JSON line
 is read by a parser.
 
+Which puts an obligation on whatever reads the file: **split on `\n`, parse
+each JSON value, and only then apply line-oriented presentation logic.** A
+reader that applies JavaScript line semantics to the raw bytes first — `^`/`$`
+under `m`, `split(/^/m)`, a viewer that reflows on Unicode line separators —
+can be shown an apparent record nobody wrote, because a message value may
+contain U+2028. The guarantee here is that **LF-delimited record boundaries
+remain intact**, which is narrower than "records cannot be forged"; the
+remainder is an accepted compatibility risk, taken to keep byte parity with the
+goldens. Parsing first removes it, since the separator is then one more
+character inside a string. `__tests__/jsonLinesFormatter.test.ts` pins both
+halves — the characters that pass through, and the framing that survives them.
+
 This package escaped none of these fields until the parity matrix was written.
 The structured-field gap was found by comparing against the Swift
 implementation; the message gap was found in review of that fix, on the
@@ -210,6 +222,7 @@ part of either platform's coverage that is not free.
 | Crash-tail trim | through the same descriptor it will append with | a separate `RandomAccessFile` opened before the append stream exists | the trim and the writes provably concern one inode on iOS; on Android that rests on there being no other descriptor yet |
 | File age across restarts | `creationDate` from the filesystem | `<base>.meta` sidecar, authoritative once written | see below |
 | At-rest protection | `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion flag, per artifact | `noBackupFilesDir` plus owner-only modes | **not equivalent** — see below |
+| Backup exclusion | an attribute the writer sets on each artifact, so it follows the files to whatever `path` you choose | structural: the *default* directory is `noBackupFilesDir`, which Auto Backup skips. Nothing is set on the artifacts | **the Android guarantee covers the default path and stops there.** Supply your own `path` and backup eligibility becomes a property of the directory you chose and the app's `data_extraction_rules` — some are excluded already, `filesDir` is not. The writer has no per-artifact attribute to set either way |
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
 | Deadlines | `DispatchTime` everywhere a wait or backoff is measured: the writer's queue waits, reopen/rotation backoffs, the purge lock, and the registry's close-drain waits (a `pthread_cond_timedwait_relative_np` condition, since `NSCondition` can only wait against a `Date`) | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently. Through 0.1.2 the registry's three waits were realtime — an NTP step during teardown could stretch a 200 ms close budget to the 30 s ceiling |
 | Sink lifecycle | `FileSinkLifecycle` (`ios/FileSinkLifecycle.swift`), which carries the transition table | `FileSinkLifecycle.kt`, the same states and transitions | **intended to be identical, and pinned by matching transition-table suites** — not identical *by construction*: these are two hand-written implementations of one table and can drift, which is what the paired suites exist to catch. A row added to one belongs in the other. Through 0.1.2 the rules lived in the two adapters instead, with no test on either, and they disagreed: with no live handle, `flush` and `close` reported `durable: true` on iOS and `false` on Android, in **both** the never-opened and the closed-after-open state. Now both answer `true` only where the claim is vacuous |

@@ -1039,6 +1039,23 @@ describe('no-derived-correlation', () => {
           code: `${IMPORT_LOG} Log.log.apply(Log, ['m', { correlation: patientId }]);`,
           errors: [{ messageId: 'unanalyzable' }],
         },
+        // `logMessage` takes the same options object and was spelled out of
+        // the spread branch, which tested for the literal method name `log`.
+        // These three reported nothing at all — and `logMessage` is the method
+        // whose second argument is *always* the options shape, so it is the
+        // one the guard could least afford to miss.
+        {
+          code: `${IMPORT_LOG} Log.logMessage(...['m', { correlation: patientId }]);`,
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        {
+          code: `${IMPORT_LOG} Log.logMessage.apply(Log, ['m', { correlation: patientId }]);`,
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        {
+          code: `${IMPORT_LOG} Log.logMessage.call(Log, ...['m', { correlation: patientId }]);`,
+          errors: [{ messageId: 'unanalyzable' }],
+        },
         {
           code: 'Log.scoped(patient.newCorrelationId());',
           errors: [{ messageId: 'derived' }],
@@ -1475,6 +1492,92 @@ describe('plugin configs', () => {
       }
     }
     expect([...NOT_EMITTING].filter((n) => !defined.has(n))).toEqual([]);
+  });
+
+  /**
+   * `OPTIONS_METHODS` and `METADATA_OPTION_FIELDS` against the types they
+   * describe, for the same reason `LOGGER_OWN_METHODS` is pinned above.
+   *
+   * Both are the plugin's model of a shape it does not own. `OPTIONS_METHODS`
+   * says which methods take a `LogOptions` second argument — get it wrong in
+   * one direction and a rule reads `arguments[1]` as metadata when it is
+   * options; wrong in the other and a whole method's options object goes
+   * unchecked, which is exactly what `logMessage` did in the spread branch of
+   * `no-derived-correlation`. `METADATA_OPTION_FIELDS` says which fields of
+   * that object reach redaction, and a field added to `LogOptions` and not
+   * here is caller data nothing lints.
+   *
+   * Read from the TypeScript AST rather than restated, so the assertion is
+   * against the source and not against a second copy of the same guess.
+   */
+  test('the options model matches the LogOptions it describes', () => {
+    const ts = require('typescript');
+    const { readFileSync } = require('fs');
+    const { join } = require('path');
+    const {
+      METADATA_OPTION_FIELDS,
+      OPTIONS_METHODS,
+    } = require('../eslint-plugin/shared');
+
+    const path = join(__dirname, '..', 'src', 'Logger.ts');
+    const file = ts.createSourceFile(
+      path,
+      readFileSync(path, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS
+    );
+
+    /** `{ name: renderedType }` for every member of `interface LogOptions`. */
+    const optionFields = new Map();
+    /** Methods on `class Logger` whose second parameter is `LogOptions`. */
+    const optionsMethods = new Set();
+
+    for (const statement of file.statements) {
+      if (
+        ts.isInterfaceDeclaration(statement) &&
+        statement.name.text === 'LogOptions'
+      ) {
+        for (const member of statement.members) {
+          if (!ts.isPropertySignature(member) || !member.type) continue;
+          optionFields.set(
+            member.name.getText(file),
+            member.type.getText(file)
+          );
+        }
+      }
+
+      if (
+        ts.isClassDeclaration(statement) &&
+        statement.name?.text === 'Logger'
+      ) {
+        for (const member of statement.members) {
+          if (!ts.isMethodDeclaration(member)) continue;
+          const second = member.parameters[1];
+          if (!second?.type) continue;
+          if (second.type.getText(file).replace(/\s/g, '') === 'LogOptions') {
+            optionsMethods.add(member.name.getText(file));
+          }
+        }
+      }
+    }
+
+    // Guards the parse: a rename that made both loops find nothing would
+    // otherwise satisfy every comparison below.
+    expect(optionFields.size).toBeGreaterThan(3);
+    expect(optionsMethods.size).toBeGreaterThan(0);
+
+    expect([...optionsMethods].sort()).toEqual([...OPTIONS_METHODS].sort());
+
+    // The metadata fields are identified by their type, not by their name: a
+    // field is caller metadata exactly when it is typed `LogMetadata`, and
+    // that is the property the plugin needs to track.
+    const carriesMetadata = [...optionFields]
+      .filter(([, type]) => type.replace(/\s/g, '') === 'LogMetadata')
+      .map(([name]) => name)
+      .sort();
+
+    expect(carriesMetadata).toEqual([...METADATA_OPTION_FIELDS].sort());
   });
 
   test('every rule declares the options it reads', () => {

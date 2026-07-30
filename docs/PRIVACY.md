@@ -28,17 +28,22 @@ thing the default in the builds that ship, and cannot make it the only thing.
 
 The default is the OSS-friendly one. Switching the *metadata* default to
 fail-closed is one method call; the rest of the telehealth profile is not.
-Regulated use also requires enabling the ESLint configuration in your own
-setup and running it in CI, and — where your key vocabulary can carry an
-identifier — registering an approved-key catalog. `privacyDefault('private')`
-does neither of those for you.
+`privacyDefault('private')` also makes an approved-key catalog **mandatory** —
+with none configured, no key is approved and every metadata key drops — and it
+does nothing at all for message text, correlation IDs and subsystems, which
+have no runtime redaction and are held to literals only by the bundled ESLint
+configuration, which you have to enable in your own setup and run in CI.
 
 ```ts
 import { Log } from 'react-native-nitro-logger';
 
-// In the app's entry point, before anything logs.
+// In the app's entry point, before anything logs. On its own this line drops
+// every metadata key you supply; it needs the catalog below to be useful.
 Log.privacyDefault('private');
 ```
+
+The complete strict setup — both calls, in one place — is under
+[Metadata keys](#metadata-keys).
 
 **In a release build** (`__DEV__` false):
 
@@ -100,11 +105,7 @@ yield the placeholder.
 
 Keys must match `^[A-Za-z0-9._-]{1,64}$` at runtime. That stops a key from
 carrying a payload, but it does not stop `patient123` from being a key — which
-is why the strict profile adds an **approved-key catalog**:
-
-```ts
-Log.metadataKeyCatalog(['requestId', 'statusCode', 'durationMs', 'retryCount']);
-```
+is why the strict profile adds an **approved-key catalog**.
 
 With a catalog set, an unrecognised key is dropped and counted, in both direct
 and scoped metadata. Fail-closed, and the only mechanism here that stops a
@@ -118,7 +119,9 @@ supplied — only the injected `droppedMetadataCount`, which is exactly the
 signal that this is what happened. Loud, and in the safe direction; not a
 silent failure open.
 
-The practical consequence is that the strict profile takes two calls, not one:
+So the runtime side of the strict profile is two calls, and the catalog has to
+be **exactly one** of them: a single `metadataKeyCatalog` naming every key the
+app will ever log under. This snippet, and no second call elsewhere in the app:
 
 ```ts
 import { Log, ERROR_METADATA_KEYS } from 'react-native-nitro-logger';
@@ -133,6 +136,33 @@ Log.metadataKeyCatalog([
 ]);
 ```
 
+**Repeat calls narrow; they never widen.** `metadataKeyCatalog` is
+tighten-only, and it enforces that by intersecting: a second call keeps only
+the keys the first one also approved, and can never add one back. Two calls
+naming two different groups of keys approve their *overlap*, which is usually
+nothing at all — so a per-feature call in each module reads like registration
+and behaves like revocation. Pass the whole set once, from the entry point.
+
+**One malformed entry empties the whole catalog.** The check is fail-closed
+over the entire input rather than per key: a value that is not a string, a key
+that fails the pattern above, an argument that is not iterable, an iterator
+that throws, or an implausibly long one each yield an approved set of
+*nothing*, not an exception and not a partial catalog. One typo among fifty
+good keys approves none of the fifty.
+
+Both mistakes land in the same place — every metadata field of every entry
+rendering `<private>`, and the log itself saying nothing about why. So a debug
+build says it out loud: `metadataKeyCatalog` warns on the console when a call
+leaves fewer keys approved than were approved before it — carrying the size
+before and the size after — and when the very first call approves none at all.
+**Counts, never a key name.**
+An approved name is application vocabulary, and a rejected one may be the
+PHI-shaped literal the catalog exists to keep out of the log, so a diagnostic
+that printed it would put it in exactly the place it must never reach. It is
+development-only for the same reason the reveal is: a release build has nobody
+to read a console, and `droppedMetadataCount` is the signal that survives into
+one.
+
 The catalog governs metadata the library itself emits, not only yours. The
 crash handler logs under six keys of its own, and under `'private'` an
 uncatalogued one means crash reports arrive with their metadata stripped —
@@ -141,10 +171,22 @@ for you to transcribe. Spreading the constant also survives a key being added
 in a future version, where a hand-written list would silently start dropping
 one.
 
-Their *values* are already `pub()`-marked at the call site, because this
-package generates every one of them and none can carry caller data; but a
-`pub()` value does not exempt a key from the catalog, since the catalog exists
-to police key *names*.
+Their *values* are already `pub()`-marked at the call site. Five of the six are
+generated here and can carry nothing of yours: a class name reduced to a
+built-in or a fixed token, frame positions in files whose names were already
+known, two counts and a boolean.
+
+`errorMessage` is the exception, and it is the same exception as everywhere
+else in this document. Outside a dev build it is the fixed redaction token, so
+the `pub()` marking is exact. **In a dev build it is the thrown message
+verbatim** — the first line of application code can put anything in there —
+and `pub()` means it renders even under `'private'`. That is the reveal branch
+doing what it is documented to do, not a hole in it: a build where a private
+payload can render in the clear is a build for synthetic data, and this key is
+one more reason why. See [The compliance boundary](#the-compliance-boundary).
+
+A `pub()` value does not exempt a key from the catalog either way, since the
+catalog exists to police key *names*.
 
 `droppedMetadataCount` is the exception and needs no entry. It is added after
 filtering rather than passing through it, and is rejected as an incoming key,
@@ -264,11 +306,25 @@ what the boundary above is for.
 
 ### Logs on disk
 
-The file sink writes to app-private storage — `noBackupFilesDir` on Android,
-`Library/Logs` on iOS. Owner-only modes (0700 directories, 0600 files) are
-applied to every artifact, and on iOS each artifact also gets
+By default the file sink writes to app-private storage — `noBackupFilesDir` on
+Android, `Library/Logs` on iOS. Owner-only modes (0700 directories, 0600 files)
+are applied to every artifact, and on iOS each artifact also gets
 `NSFileProtectionCompleteUntilFirstUserAuthentication` and a backup-exclusion
 flag.
+
+**On Android the backup exclusion is a property of that default path, not of
+the writer.** `noBackupFilesDir` is a directory Auto Backup and device-to-device
+transfer skip; nothing is applied to the artifacts to make them skippable. So
+the writer's guarantee covers the default path and stops there. Supply your own
+`path` and whether those logs are backed up is a question about the directory
+you chose and the app's backup rules — some directories are excluded already
+(the cache directory is, and so is anything else under `noBackupFilesDir`), and
+a log file under `filesDir` is as eligible as any other app file. What the
+writer *cannot* do either way is make the artifacts themselves skippable; there
+is no such attribute to set. iOS is the other way around: its exclusion is set
+per artifact, so it does follow the files wherever you point them. If you choose
+an Android log directory and back-ups matter, settle it in the app's
+`data_extraction_rules` (and `full_backup_content` below API 31).
 
 **A log directory the writer did not create is inspected, never changed.** The
 log path is yours to choose, and nothing stops it being a directory your app
@@ -286,7 +342,8 @@ three. *Files* are different and always get all three: a log file at the log
 path is one the writer is about to append to, rotate and purge, so it counts as
 its own even if it was already there — and a `0644` log file left by an earlier
 version is exactly the thing worth tightening. Android has nothing to scope —
-its equivalent is structural (`noBackupFilesDir`), and its `restrictToOwner`
+its equivalent is structural — a property of where the default path is rather
+than of anything applied to the artifacts, as above — and its `restrictToOwner`
 only sets modes.
 
 The practical consequence: **if you supply your own log directory, create it
