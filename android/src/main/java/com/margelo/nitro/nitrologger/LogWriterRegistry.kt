@@ -150,6 +150,21 @@ class LogWriterRegistry {
   private var nextHandleId = 1L
 
   /**
+   * Which React instance each live handle was acquired for.
+   *
+   * Only handles acquired with an owner appear here. A null owner — a JVM test,
+   * a host where `NitroLoggerLifecycle` never ran — is recorded against nobody
+   * and behaves exactly as it did before any of this existed.
+   *
+   * Two maps rather than one, because both directions are asked for: a sweep
+   * needs every handle of one owner, and [release] needs the owner of one
+   * handle so a normal JavaScript-side close does not leave a claim behind for
+   * the sweep to close a second time.
+   */
+  private val ownerClaims = HashMap<Long, MutableMap<Long, LogFileHandle>>()
+  private val claimOwner = HashMap<Long, Long>()
+
+  /**
    * Acquires a handle on the writer for [path], creating it if needed.
    *
    * Acquisition happens entirely under the lock, so two runtimes opening the
@@ -190,12 +205,34 @@ class LogWriterRegistry {
      * is no canonical name to give, and the caller's spelling is not a
      * substitute for one.
      */
-    onResolve: ((String) -> Unit)? = null
+    onResolve: ((String) -> Unit)? = null,
+    /**
+     * The React instance this handle belongs to — see [ReactInstanceEpoch].
+     *
+     * A handle acquired for an instance is released when that instance is
+     * destroyed, because nothing on the JavaScript side will ever run again to
+     * release it. Null means nobody is claiming it, which is what a JVM test
+     * and any host without `NitroLoggerLifecycle` pass, and that keeps exactly
+     * the old behaviour.
+     */
+    owner: Long? = null
   ): LogFileHandle {
     val resolved = resolve(path, platform)
     onResolve?.invoke(resolved.canonicalPath)
 
     lock.withLock {
+      // Refused before anything is built, and inside this lock, which is what
+      // makes the reload race safe: `ReactInstanceEpoch.end` marks the token
+      // dead *before* it sweeps, so an acquisition either got here first and
+      // will be swept, or arrives to find the owner gone. A writer opened for a
+      // runtime that has already been destroyed has nobody left to close it.
+      if (owner != null && !ReactInstanceEpoch.isLive(owner)) {
+        throw LogWriterException(
+          LogWriterException.Kind.OPEN_FAILED,
+          "the runtime that asked for this log file has been destroyed"
+        )
+      }
+
       // Wait out a close still in progress on this path — but not forever. The
       // claim is cleared by the writer's own executor rather than by whoever
       // called close, so wedged storage means it may never clear at all.
@@ -258,8 +295,40 @@ class LogWriterRegistry {
       writer.retain()
       val id = nextHandleId
       nextHandleId += 1
-      return LogFileHandle(id, writer, this)
+      val handle = LogFileHandle(id, writer, this)
+      if (owner != null) {
+        ownerClaims.getOrPut(owner) { HashMap() }[id] = handle
+        claimOwner[id] = owner
+      }
+      afterAcquireForTesting?.invoke(handle)
+      return handle
     }
+  }
+
+  /**
+   * Releases every handle a destroyed React instance was holding.
+   *
+   * **The claim is the unit of release, not the writer.** Two destinations can
+   * share one writer, and they can belong to different instances — a live one
+   * and the one being torn down. Closing the writer would take the log file out
+   * from under the survivor; dropping one claim leaves it open at a lower
+   * refcount, which is what every other release path here already does.
+   *
+   * Snapshot under the lock, close outside it. `LogFileHandle.close` flushes and
+   * waits on the write executor, and holding the registry lock across that would
+   * stall every other file in the process — including the replacement instance's
+   * own open, which is the one thing that must not be blocked here.
+   */
+  fun releaseOwner(owner: Long, deadlineMs: Double) {
+    val doomed = lock.withLock {
+      val claims = ownerClaims.remove(owner) ?: return
+      claims.keys.forEach { claimOwner.remove(it) }
+      claims.values.toList()
+    }
+    // Idempotent by state: a handle whose JavaScript already closed it is not
+    // ACTIVE and returns inert, so a close arriving from both sides is safe.
+    doomed.forEach { it.close(deadlineMs) }
+    afterOwnerReleaseForTesting?.invoke(owner)
   }
 
   /**
@@ -269,6 +338,17 @@ class LogWriterRegistry {
     val path = writer.canonicalPath
 
     val shouldClose = lock.withLock {
+      // Whichever side closes first, the claim goes with it. Without this a
+      // JavaScript-side close would leave the record behind and the owner sweep
+      // would close the same handle again later — harmless, since close is
+      // state-gated, but it would also keep a dead handle reachable from this
+      // map for as long as its instance lived.
+      claimOwner.remove(handleId)?.let { owner ->
+        ownerClaims[owner]?.let { claims ->
+          claims.remove(handleId)
+          if (claims.isEmpty()) ownerClaims.remove(owner)
+        }
+      }
       val remaining = writer.releaseOne()
       if (remaining > 0) return@withLock false
       if (writers[path] === writer) writers.remove(path)
@@ -297,6 +377,27 @@ class LogWriterRegistry {
 
   val liveWriterCountForTesting: Int get() = lock.withLock { writers.size }
   val closingCountForTesting: Int get() = lock.withLock { closing.size }
+
+  /**
+   * How many handles this instance is still holding.
+   *
+   * The number `C13ReloadLeakTest` watches go to zero, and the only way to ask
+   * that question from outside: a live writer count cannot answer it, because a
+   * writer shared with another instance is *supposed* to survive the sweep.
+   */
+  fun claimCountForOwnerForTesting(owner: Long): Int =
+    lock.withLock { ownerClaims[owner]?.size ?: 0 }
+
+  /**
+   * Test seams, called from inside the acquisition lock and after a sweep.
+   *
+   * Both exist because the states worth asserting are momentary: a claim
+   * registered against an instance that is about to be destroyed, and the
+   * instant the last of its claims is gone. Polling for either is how a test
+   * ends up asserting whatever came next.
+   */
+  @Volatile var afterAcquireForTesting: ((LogFileHandle) -> Unit)? = null
+  @Volatile var afterOwnerReleaseForTesting: ((Long) -> Unit)? = null
 }
 
 /**

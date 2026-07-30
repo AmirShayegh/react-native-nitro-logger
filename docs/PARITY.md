@@ -226,7 +226,7 @@ part of either platform's coverage that is not free.
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
 | Deadlines | `DispatchTime` everywhere a wait or backoff is measured: the writer's queue waits, reopen/rotation backoffs, the purge lock, and the registry's close-drain waits (a `pthread_cond_timedwait_relative_np` condition, since `NSCondition` can only wait against a `Date`) | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently. Through 0.1.2 the registry's three waits were realtime — an NTP step during teardown could stretch a 200 ms close budget to the 30 s ceiling |
 | Sink lifecycle | `FileSinkLifecycle` (`ios/FileSinkLifecycle.swift`), which carries the transition table | `FileSinkLifecycle.kt`, the same states and transitions | **intended to be identical, and pinned by matching transition-table suites** — not identical *by construction*: these are two hand-written implementations of one table and can drift, which is what the paired suites exist to catch. A row added to one belongs in the other. Through 0.1.2 the rules lived in the two adapters instead, with no test on either, and they disagreed: with no live handle, `flush` and `close` reported `durable: true` on iOS and `false` on Android, in **both** the never-opened and the closed-after-open state. Now both answer `true` only where the claim is vacuous |
-| Releasing a sink nobody closed | `deinit`, which is deterministic: the descriptor and the registry slot come back whether or not JavaScript ran | nothing equivalent — `finalize()` exists but cannot run (see below) | on Android `close()` or `dispose()` is load-bearing, not a tidy-up |
+| Releasing a sink nobody closed | `deinit`, which is deterministic: the descriptor and the registry slot come back whether or not JavaScript ran | no per-object equivalent — `finalize()` exists but cannot run — so the release comes from outside the object, when the React instance that opened it is destroyed (see below) | on Android `close()` or `dispose()` is still the right thing to call: the instance sweep covers a runtime dying, not a sink you dropped while it lives |
 | Console chunk size | 900 bytes per `os_log` entry | 3800 bytes per logcat entry | the platform limits genuinely differ; the behaviour around them — `(i/n)` markers, 8-chunk ceiling, a truncation notice that fits inside its own entry — is identical |
 | Console split boundary | grapheme clusters (`Character`) | code points | iOS also keeps combining sequences whole; Android only guarantees surrogate pairs are not cut. Both prevent replacement characters, which is the corruption that matters — see below |
 | Console category | a field of the `os_log` object, and no part of the entry's payload | the logcat tag, which shares the entry with the message | Android caps the stored tag at 256 bytes and subtracts its length from the message budget; iOS needs neither, because a long category there costs the message nothing. Through 0.1.3 Android stored the caller's category verbatim against a fixed 3800-byte chunk size, so a long one silently truncated the tail of every entry — the failure the chunker exists to prevent |
@@ -248,22 +248,39 @@ never collected. `CxxPart` also holds the sink strongly. Only
 `HybridData.resetNative()` breaks the cycle, and the only thing that reaches it
 is `dispose()`.
 
-Two consequences worth designing around:
+So **`close()` — or `dispose()` — is part of the contract on Android**, not
+housekeeping. `FileDestination` does this for you; a raw sink does not.
 
-- **`close()` — or `dispose()` — is part of the contract on Android**, not
-  housekeeping. `FileDestination` does this for you; a raw sink does not.
-- **A development reload leaks a writer.** Metro tears the JavaScript context
-  down without running any of it, so nothing closes the sink. The writer keeps
-  the registry slot and the descriptor until the process ends, and the next
-  `open` with a *different* rotation config is refused `CONFIG_CONFLICT`
-  against a sink nothing can reach. Reopening with the same config is fine —
-  the registry shares the existing writer — so this bites when you edit
-  rotation settings and reload. Restarting the app clears it.
+### What a reload does
 
-This is a known gap, deliberately not papered over: the mechanisms that would
-release the claim without an observable termination signal can produce two live
-writers for one path, which is worse than the leak. `SPIKE-C13.md` in the
-repository records what would close it.
+Through 0.1.3 a reload leaked the writer outright. Metro tears the JavaScript
+context down without running any of it, nothing closed the sink, and the writer
+kept the registry slot and the descriptor for the life of the process — so the
+next `open` with a *different* rotation config was refused `CONFIG_CONFLICT`
+against a sink nothing could reach. File logging was gone until the app
+restarted.
+
+It is released now, and by something outside the object, because nothing can
+reach the object. Each handle records which React instance acquired it; when
+that instance is destroyed — a reload, a `ReactHost.reload()`, any teardown —
+its claims are released. The signal is `NativeModule.invalidate()`, which fires
+on exactly instance destruction on both architectures, and the release is
+per *claim* rather than per writer: a writer shared with a still-live instance
+survives at a lower refcount instead of being closed under it.
+
+Two things follow that are worth knowing:
+
+- **A handle acquired for an instance that is already gone is refused**, rather
+  than granted a writer nothing would ever close.
+- **In a host that never registers the module, nothing changes.** The claim is
+  recorded against nobody and behaves exactly as it did before — the fail-open
+  direction, on the grounds that a logger which stops working in an unfamiliar
+  host is worse than one that leaks a writer there.
+
+`SPIKE-C13.md` records the investigation, including the signal it originally
+proposed and why that one was wrong. The proof is `C13ReloadLeakTest`, which
+drives a real `ReactHost.reload()` on a device — it landed red, one commit
+before the fix.
 
 ## Why the console split boundary differs
 

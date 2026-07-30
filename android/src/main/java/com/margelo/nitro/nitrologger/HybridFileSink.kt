@@ -27,6 +27,21 @@ class HybridFileSink : HybridFileSinkSpec() {
    */
   private val lifecycle = FileSinkLifecycle()
 
+  /**
+   * The React instance whose JavaScript built this sink.
+   *
+   * Captured at construction rather than at [open], and that is the point: the
+   * runtime that constructed the hybrid is the runtime whose death has to
+   * release it. By the time `open` runs on a reload the instance may already be
+   * the *next* one, and a handle recorded against that one would outlive
+   * exactly the teardown it exists to survive.
+   *
+   * Null wherever no instance was ever registered — a JVM test, or a host that
+   * does not install `NitroLoggerLifecycle` — and null means the old behaviour,
+   * unchanged. See [ReactInstanceEpoch].
+   */
+  private val owner: Long? = ReactInstanceEpoch.currentOrNull()
+
   private fun current(): LogFileHandle? = lifecycle.current()
 
   /**
@@ -52,19 +67,27 @@ class HybridFileSink : HybridFileSinkSpec() {
    * `dispose()`. So an object nobody disposes is immortal, and its finalizer
    * never runs.
    *
-   * Which matters because a Metro reload tears the JavaScript context down
+   * Which mattered because a Metro reload tears the JavaScript context down
    * without running any of it: no `close()`, no `dispose()`. The writer
-   * survives holding the registry slot and the descriptor, and the next `open`
-   * with a different rotation config fails `CONFIG_CONFLICT` against a sink
-   * nothing can reach — an every-reload failure during development, and it is
-   * still open. iOS has no equivalent problem: `deinit` is not a finalizer and
-   * runs deterministically.
+   * survived holding the registry slot and the descriptor, and the next `open`
+   * with a different rotation config failed `CONFIG_CONFLICT` against a sink
+   * nothing could reach — file logging gone for the life of the process, every
+   * reload. iOS never had the problem: `deinit` is not a finalizer and runs
+   * deterministically.
    *
-   * Left in place rather than deleted because the alternatives are worse than
-   * the leak — a claim that expires on a timer or on the next `open` produces
-   * *two* live writers for one path — and because the day Nitro breaks that
-   * cycle this becomes correct with no other change. Removing it would take
-   * the reasoning with it.
+   * **That leak is now closed, and not by this method.** The release comes from
+   * outside the object entirely: [ReactInstanceEpoch] records which React
+   * instance each handle was acquired for, and `NitroLoggerLifecycle.invalidate`
+   * — which fires on exactly instance teardown — releases that instance's
+   * claims. Nothing has to reach this hybrid to do it, which is the point,
+   * because nothing can. `C13ReloadLeakTest` drives a real `ReactHost.reload()`
+   * and watches it happen.
+   *
+   * Left in place rather than deleted because it is still the right hook for
+   * the case the epoch cannot see — a hybrid dropped by JavaScript while its
+   * instance keeps running — and because the day Nitro breaks that cycle this
+   * becomes correct with no other change. Removing it would take the reasoning
+   * with it.
    */
   @Suppress("removal", "DEPRECATION")
   protected fun finalize() {
@@ -146,7 +169,8 @@ class HybridFileSink : HybridFileSinkSpec() {
         // tell a torn one from an intentional newline.
         lineFramed = lineFramed ?: false,
         platform = AndroidPlatformIo,
-        onResolve = { resolvedPath = it }
+        onResolve = { resolvedPath = it },
+        owner = owner
       )
     } catch (e: Throwable) {
       // Failed attempts have to release the claim, or a retry is refused

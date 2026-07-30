@@ -8,9 +8,11 @@ import com.margelo.nitro.nitrologger.AndroidPlatformIo
 import com.margelo.nitro.nitrologger.LogRotationPolicy
 import com.margelo.nitro.nitrologger.LogWriterException
 import com.margelo.nitro.nitrologger.LogWriterRegistry
+import com.margelo.nitro.nitrologger.ReactInstanceEpoch
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -33,10 +35,17 @@ import org.junit.runner.RunWith
  * has actually constructed the hybrid. So the harness lives here, in the
  * example app, where both are real.
  *
- * **This test is expected to fail until the fix lands, and that failure is the
- * point.** A harness that quietly fails to reproduce the bug it was built for
- * is worth nothing, so it goes in first, on its own commit, and the red run it
- * produces is the evidence that it reproduces at all.
+ * **This landed red, one commit before the fix, and that is the evidence it is
+ * worth anything.** A harness that quietly fails to reproduce the bug it was
+ * built for proves nothing by passing afterwards. With the fix absent it
+ * reported:
+ *
+ *     timed out after 60000 ms waiting for the reloaded runtime's launch.
+ *     nonces on disk: [ms7g0cti-1ghmp]
+ *     live writers:   1
+ *
+ * and the app's own logcat named the mechanism — the reloaded runtime's
+ * `OPEN_FAILED … this file is already open with a different configuration`.
  *
  * ### What each phase establishes
  *
@@ -97,11 +106,28 @@ class C13ReloadLeakTest {
       val first = awaitNonce(after = emptySet(), what = "the harness's first launch")
       assertRivalRefused("while the first runtime is live")
 
+      // Reading this at all is an assertion: the epoch only has a current token
+      // because `NitroLoggerLifecycle` was created and initialized, which
+      // happens only under `needsEagerInit`. Nothing in JavaScript calls that
+      // module, so lazily it would never exist and this would be null.
+      val firstEpoch = ReactInstanceEpoch.currentOrNull()
+      assertNotNull("no React instance registered itself; the module never ran", firstEpoch)
+      assertEquals(
+        "the harness's destination should be claimed by the runtime that opened it",
+        1,
+        LogWriterRegistry.shared.claimCountForOwnerForTesting(firstEpoch!!)
+      )
+
       // ---- Phase 2: destroy the runtime that opened it -------------------
       val application = ApplicationProvider.getApplicationContext<MainApplication>()
       InstrumentationRegistry.getInstrumentation().runOnMainSync {
         application.reactHost.reload("C13 phase 2")
       }
+
+      // The claims of the destroyed instance are gone. Waited for rather than
+      // asserted outright: `invalidate()` runs on React Native's own teardown
+      // thread, so "already" is not a thing this can assume.
+      awaitClaimsReleased(firstEpoch)
 
       // ---- Phase 3: exactly one replacement ------------------------------
       // The new runtime opens the same path with a rotation configuration of
@@ -116,7 +142,32 @@ class C13ReloadLeakTest {
         1,
         LogWriterRegistry.shared.liveWriterCountForTesting
       )
+
+      val secondEpoch = ReactInstanceEpoch.currentOrNull()
+      assertNotNull("the replacement instance registered nothing", secondEpoch)
+      assertNotEquals("the epoch must be a new one, not the corpse of the old", firstEpoch, secondEpoch)
+      assertEquals(
+        "and the file is claimed by the runtime that is actually running",
+        1,
+        LogWriterRegistry.shared.claimCountForOwnerForTesting(secondEpoch!!)
+      )
     }
+  }
+
+  /** Bounded, with the same state dump as every other wait here. */
+  private fun awaitClaimsReleased(owner: Long) {
+    val deadline = System.nanoTime() + AWAIT_NANOS
+    while (System.nanoTime() < deadline) {
+      if (LogWriterRegistry.shared.claimCountForOwnerForTesting(owner) == 0) return
+      Thread.sleep(POLL_MS)
+    }
+    fail(
+      "timed out after ${AWAIT_NANOS / 1_000_000} ms waiting for the destroyed" +
+        " runtime's claims to be released.\n" +
+        "  claims left:   ${LogWriterRegistry.shared.claimCountForOwnerForTesting(owner)}\n" +
+        "  live writers:  ${LogWriterRegistry.shared.liveWriterCountForTesting}\n" +
+        "  closing paths: ${LogWriterRegistry.shared.closingCountForTesting}"
+    )
   }
 
   /**

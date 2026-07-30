@@ -25,6 +25,18 @@ buildscript {
   }
 }
 
+/**
+ * Whether the consuming app is on the new architecture.
+ *
+ * Read the same way `react-native-nitro-modules` reads it, so the two cannot
+ * disagree about the app they are both in. It decides one thing here: whether
+ * `NitroLoggerLifecycle` is registered as a TurboModule, which is how the app's
+ * module system decides to create it at all.
+ */
+def isNewArchitectureEnabled() {
+  return rootProject.hasProperty("newArchEnabled") && rootProject.getProperty("newArchEnabled") == "true"
+}
+
 def reactNativeArchitectures() {
   def value = rootProject.getProperties().get("reactNativeArchitectures")
   return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
@@ -48,6 +60,8 @@ android {
     // needs a device: it exercises the `android.system.Os` implementation of
     // `PlatformIo`, whose whole job is the syscalls a JVM cannot make.
     testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+    buildConfigField "boolean", "IS_NEW_ARCHITECTURE_ENABLED", isNewArchitectureEnabled().toString()
 
     externalNativeBuild {
       cmake {
@@ -103,6 +117,7 @@ android {
 
   buildFeatures {
     prefab true
+    buildConfig true
   }
 
   compileOptions {

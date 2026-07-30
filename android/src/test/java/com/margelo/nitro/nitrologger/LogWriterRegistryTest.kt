@@ -40,18 +40,26 @@ class LogWriterRegistryTest {
     handles.forEach { runCatching { it.close(500.0) } }
     handles.clear()
     directory.deleteRecursively()
+    // The epoch is process-wide, and the owner tests below mint tokens in it.
+    // A token left live would be a token another test's sweep could find.
+    ReactInstanceEpoch.releaseOwner = defaultRelease
+    ReactInstanceEpoch.resetForTesting()
   }
+
+  private val defaultRelease = ReactInstanceEpoch.releaseOwner
 
   private fun acquire(
     path: String,
     policy: LogRotationPolicy = LogRotationPolicy.of(),
-    lineFramed: Boolean = true
+    lineFramed: Boolean = true,
+    owner: Long? = null
   ): LogFileHandle = registry.acquire(
     path = path,
     policy = policy,
     lineFramed = lineFramed,
     platform = PlatformIo.Jvm,
-    clock = { 1_700_000_000_000L }
+    clock = { 1_700_000_000_000L },
+    owner = owner
   ).also { handles.add(it) }
 
   // Two streams appending to one file from different threads interleave
@@ -311,5 +319,121 @@ class LogWriterRegistryTest {
     assertTrue(second.appendBatch("still here\n", 1).accepted)
     assertTrue(second.logFilePaths().isNotEmpty())
     assertTrue(second.flush(1000.0).durable)
+  }
+
+  /* ----- Owner claims: what a destroyed React instance leaves behind ----- */
+
+  /**
+   * The sweep closes what that instance opened.
+   *
+   * This is C13 in one test. A React instance is destroyed and its JavaScript
+   * dies without closing anything; on Android nothing else can, because
+   * `finalize()` never runs. Before this, the writer stayed live forever and the
+   * *next* instance could not open its own log file — the file was still held,
+   * with the old instance's rotation configuration.
+   */
+  @Test
+  fun `releasing an owner closes the handles it acquired`() {
+    val owner = ReactInstanceEpoch.begin()
+    val path = File(directory, "app.log").absolutePath
+    acquire(path, owner = owner)
+
+    assertEquals(1, registry.claimCountForOwnerForTesting(owner))
+    assertEquals(1, registry.liveWriterCountForTesting)
+
+    registry.releaseOwner(owner, 1000.0)
+
+    assertEquals(0, registry.claimCountForOwnerForTesting(owner))
+    assertEquals("the writer goes with the runtime that opened it", 0, registry.liveWriterCountForTesting)
+  }
+
+  /**
+   * And the path is free afterwards — which is the thing the app actually
+   * needed. A registry that dropped its bookkeeping but left the file claimed
+   * would satisfy the counts above and still fail the reload.
+   */
+  @Test
+  fun `the path a swept owner held can be opened with a new configuration`() {
+    val owner = ReactInstanceEpoch.begin()
+    val path = File(directory, "app.log").absolutePath
+    acquire(path, policy = LogRotationPolicy.of(maxFileSizeBytes = 4096.0), owner = owner)
+
+    registry.releaseOwner(owner, 1000.0)
+
+    // A *different* configuration, because the same one would be handed the
+    // existing writer whether or not the sweep did anything.
+    val replacement = acquire(path, policy = LogRotationPolicy.of(maxFileSizeBytes = 8192.0))
+    assertTrue(replacement.appendBatch("after the reload\n", 1).accepted)
+  }
+
+  /**
+   * **The unit of release is the claim, not the writer.**
+   *
+   * Two destinations can share one writer and belong to different instances.
+   * Closing the writer when one of them dies would take the log file out from
+   * under the survivor — a live handle whose every append is refused.
+   */
+  @Test
+  fun `a writer shared with a live owner survives the sweep`() {
+    val dying = ReactInstanceEpoch.begin()
+    val path = File(directory, "app.log").absolutePath
+    acquire(path, owner = dying)
+    val survivor = acquire(path)
+
+    registry.releaseOwner(dying, 1000.0)
+
+    assertEquals(1, registry.liveWriterCountForTesting)
+    assertTrue("the surviving destination still owns the file", survivor.appendBatch("mine\n", 1).accepted)
+  }
+
+  /**
+   * An acquisition for an instance that is already gone is refused rather than
+   * granted a writer nobody will ever close. See `ReactInstanceEpoch.end`: the
+   * token is dead before the sweep runs, so this is the branch a racing open
+   * takes.
+   */
+  @Test
+  fun `acquiring for a destroyed owner is refused`() {
+    val owner = ReactInstanceEpoch.begin()
+    ReactInstanceEpoch.releaseOwner = { }
+    ReactInstanceEpoch.end(owner)
+
+    try {
+      acquire(File(directory, "app.log").absolutePath, owner = owner)
+      fail("expected the acquisition to be refused")
+    } catch (expected: LogWriterException) {
+      assertEquals(LogWriterException.Kind.OPEN_FAILED, expected.kind)
+    }
+    assertEquals("nothing was built for it", 0, registry.liveWriterCountForTesting)
+  }
+
+  /**
+   * A JavaScript-side close takes the claim with it, so the later sweep has
+   * nothing of its own to close.
+   */
+  @Test
+  fun `closing a handle drops its claim`() {
+    val owner = ReactInstanceEpoch.begin()
+    val handle = acquire(File(directory, "app.log").absolutePath, owner = owner)
+
+    handle.close(1000.0)
+
+    assertEquals(0, registry.claimCountForOwnerForTesting(owner))
+  }
+
+  /**
+   * Nobody claiming means nothing changes. Every JVM test above this section,
+   * and every host that does not install `NitroLoggerLifecycle`, acquires with a
+   * null owner — and a sweep must not be able to reach those.
+   */
+  @Test
+  fun `handles with no owner are untouched by a sweep`() {
+    val owner = ReactInstanceEpoch.begin()
+    val unowned = acquire(File(directory, "app.log").absolutePath)
+
+    registry.releaseOwner(owner, 1000.0)
+
+    assertEquals(1, registry.liveWriterCountForTesting)
+    assertTrue(unowned.appendBatch("still here\n", 1).accepted)
   }
 }

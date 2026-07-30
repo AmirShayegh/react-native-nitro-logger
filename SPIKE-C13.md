@@ -119,3 +119,47 @@ nothing — which is the failure mode this whole review cycle exists to avoid.
   registry-level fix is gated properly.
 
 Neither is 0.1.3 work.
+
+---
+
+## Reopened, and closed — 2026-07-30
+
+Both conditions above were met at once. The instrumented host now exists —
+`example/android/app/src/androidTest/.../C13ReloadLeakTest.kt`, launching a
+`C13HarnessActivity` and driving a real `ReactHost.reload()` against the
+release build — so the three-phase test is writable, and it gated the fix.
+
+**One correction to this document.** It proposed
+`ReactContext.addLifecycleEventListener` as the termination signal. That is the
+wrong hook: it carries *Activity* lifecycle — `onHostResume`, `onHostPause`,
+`onHostDestroy` — and a reload fires none of them, because the Activity survives
+and only the instance underneath it is replaced. The signal that fires on
+exactly instance teardown is `NativeModule.invalidate()`: bridgeless,
+`ReactInstance` destruction calls `TurboModuleManager.invalidate()`, which
+invalidates every module it instantiated; on the bridge, `CatalystInstance
+.destroy()` reaches the same callback. Had the listener been used, the harness
+would have gone green on a reload that released nothing — the failure this
+spike's own gate was written to prevent.
+
+**What shipped.** `ReactInstanceEpoch` mints a token per instance;
+`NitroLoggerLifecycle` begins one in `initialize()` and ends it in
+`invalidate()`; `LogWriterRegistry` records each handle against the instance
+that acquired it and releases that instance's claims when it ends. The unit of
+release is the claim, not the writer, so a writer shared with a live instance
+survives at a lower refcount. The token is marked dead *before* the sweep runs,
+and the registry checks liveness inside the lock it registers claims under, so
+an acquisition racing a teardown either lands first and is swept, or is refused.
+
+The alternatives this document rejected are still rejected, and for the same
+reason: none of them is a termination signal. What changed is that a real one
+turned out to exist.
+
+**The gate this spike failed on — "observable termination signal proven" — is
+met by a recorded red run.** The harness landed one commit before the fix and
+timed out with `live writers: 1`, and the app's own logcat showed the reloaded
+runtime being refused its log file. The same harness passes with the fix.
+
+Still not proven, and stated in the test and the job script rather than here
+alone: the old architecture's teardown (the `invalidate()` contract is the same
+on both, which is an argument and not a test), a process with more than one
+`ReactHost`, and `finalize()` running — which it still cannot.
