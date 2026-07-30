@@ -171,6 +171,16 @@ for you to transcribe. Spreading the constant also survives a key being added
 in a future version, where a hand-written list would silently start dropping
 one.
 
+`installRejectionHandler` is the same story with the same answer:
+`REJECTION_METADATA_KEYS`, spread alongside. Five of its six names are the
+crash handler's, so the two constants overlap and spreading both is not a
+mistake; the sixth is `rejectionId`, the tracker's own counter, which is how
+the entry saying a rejection went unhandled and the entry taking that back name
+the same rejection. A rejection *reason* is caller data by construction —
+`Promise.reject(new Error(patient.mrn))` is an ordinary line to write — so it
+goes through the same sanitiser an uncaught error does, before privacy sees it
+at all.
+
 Their *values* are already `pub()`-marked at the call site. Five of the six are
 generated here and can carry nothing of yours: a class name reduced to a
 built-in or a fixed token, frame positions in files whose names were already

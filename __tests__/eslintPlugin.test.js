@@ -17,6 +17,8 @@ const IMPORT_INSTALL =
   "import { installErrorHandler } from 'react-native-nitro-logger';";
 const IMPORT_FLUSH =
   "import { flushOnBackground } from 'react-native-nitro-logger';";
+const IMPORT_REJECT =
+  "import { installRejectionHandler } from 'react-native-nitro-logger';";
 
 const ruleTester = new RuleTester({
   languageOptions: {
@@ -1166,6 +1168,8 @@ describe('literal-subsystem', () => {
       `${IMPORT_INSTALL} installErrorHandler({ subsystem: 'crash' });`,
       `${IMPORT_INSTALL} installErrorHandler();`,
       `${IMPORT_INSTALL} installErrorHandler({ fatalFlushMs: budget });`,
+      `${IMPORT_REJECT} installRejectionHandler({ subsystem: 'crash' });`,
+      `${IMPORT_REJECT} installRejectionHandler({ logHandledLate: false });`,
       // No subsystem field on this one, so nothing to demand a literal of.
       `${IMPORT_FLUSH} flushOnBackground({ deadlineMs: budget });`,
       // And a spread hides nothing when there is nothing to hide. Which
@@ -1233,6 +1237,17 @@ describe('literal-subsystem', () => {
       {
         code: `${IMPORT_INSTALL} installErrorHandler({ subsystem: \`p-\${id}\` });`,
         errors: [{ messageId: 'dynamic' }],
+      },
+      // The second free function to carry a subsystem, and the reason the table
+      // is pinned against the source: it reaches the log on every rejection
+      // entry, and nothing but that table makes it visible here.
+      {
+        code: `${IMPORT_REJECT} installRejectionHandler({ subsystem: patientId });`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_REJECT} installRejectionHandler(...args);`,
+        errors: [{ messageId: 'unanalyzable' }],
       },
       // Aliasing changes the local spelling and nothing else, so the table is
       // keyed on the imported name.

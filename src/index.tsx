@@ -46,6 +46,17 @@ export type {
   ErrorUtilsLike,
   Uninstall,
 } from './integrations/errorHandler';
+export { installRejectionHandler } from './integrations/rejectionHandler';
+export {
+  REJECTION_METADATA_KEYS,
+  UNHANDLED_REJECTION_MESSAGE,
+  REJECTION_HANDLED_LATE_MESSAGE,
+} from './integrations/rejectionHandler';
+export type {
+  RejectionHandlerOptions,
+  RejectionTrackingLike,
+  RejectionTrackingOptions,
+} from './integrations/rejectionHandler';
 export { flushOnBackground } from './integrations/appState';
 export type {
   FlushOnBackgroundOptions,

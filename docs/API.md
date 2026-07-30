@@ -306,6 +306,69 @@ assert on it without hardcoding a string.
 
 <!-- api: installErrorHandler, ERROR_METADATA_KEYS, UNCAUGHT_ERROR_MESSAGE, ErrorHandlerOptions, ErrorUtilsLike, Uninstall -->
 
+### `installRejectionHandler(options?)`
+
+Logs unhandled promise rejections, and — unless you turn it off — logs again
+when one that was reported unhandled turns out to be handled after all. Returns
+an idempotent `Uninstall`.
+
+**In a release build this is the only way a rejection reaches the log.** React
+Native installs a rejection tracker in development and none in production, so an
+`async` function that throws with nobody awaiting it is silent in the builds you
+ship.
+
+The rejection reason is sanitised exactly as a thrown error is, and for the same
+reason: `Promise.reject(new Error(patient.mrn))` is ordinary application code, so
+the message is dropped outside dev, the class name reduced to a built-in or a
+fixed token, and frames reduced to positions in files whose names were already
+known.
+
+`RejectionHandlerOptions` extends `SanitizeErrorOptions` with `logger`, `chain`,
+`subsystem`, `logHandledLate` and `tracking`. That last one takes a
+`RejectionTrackingLike` — the `enable(options)` shape Hermes and React Native's
+polyfill both use, described by `RejectionTrackingOptions` — so the handler can
+be driven in a test without a runtime to install into.
+
+The late entry is only written by the handler that reported the rejection in the
+first place — an entry retracting something this log never said would be worse
+than none — and the ids it remembers are bounded, so a rejection handled after a
+few hundred further reports gets no retraction. The failure direction is a
+missing one, never a false one.
+
+Two things this does not do. It does not flush: nothing is dying, unlike an
+uncaught error, and the next ordinary flush carries these entries out. And it
+cannot chain to a tracker somebody else installed — `enable()` replaces the
+tracker wholesale and offers no way to read back what was there — so `chain`
+links calls to this function and nothing else. Installing it in development
+replaces LogBox's rejection popup; the entry still reaches every destination,
+console included.
+
+`REJECTION_METADATA_KEYS` is the six keys it logs under. Five are spelled the
+same as `ERROR_METADATA_KEYS`, so one catalog entry covers both; the sixth,
+`rejectionId`, is the tracker's own counter and joins the two entries about the
+same rejection:
+
+```ts
+import {
+  Log as Logger3,
+  ERROR_METADATA_KEYS,
+  REJECTION_METADATA_KEYS,
+  installRejectionHandler,
+} from 'react-native-nitro-logger';
+
+Logger3.metadataKeyCatalog([
+  ...ERROR_METADATA_KEYS,
+  ...REJECTION_METADATA_KEYS,
+]);
+const uninstallRejections = installRejectionHandler({ subsystem: 'crash' });
+```
+
+`UNHANDLED_REJECTION_MESSAGE` and `REJECTION_HANDLED_LATE_MESSAGE` are the
+literal messages it uses, exported so a test can assert on them without
+hardcoding a string.
+
+<!-- api: installRejectionHandler, REJECTION_METADATA_KEYS, UNHANDLED_REJECTION_MESSAGE, REJECTION_HANDLED_LATE_MESSAGE, RejectionHandlerOptions, RejectionTrackingLike, RejectionTrackingOptions -->
+
 ### `flushOnBackground(options?)`
 
 Flushes when the app backgrounds. Best-effort and deadline-bounded: it returns
@@ -438,6 +501,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `FlushOnBackgroundOptions`
 - `FlushOutcome`
 - `installErrorHandler`
+- `installRejectionHandler`
 - `JsonLinesFormatter`
 - `JsonLinesFormatterOptions`
 - `JsonTimestampStyle`
@@ -469,6 +533,11 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `REDACTED_FRAME`
 - `REDACTED_MESSAGE`
 - `RedactedMetadata`
+- `REJECTION_HANDLED_LATE_MESSAGE`
+- `REJECTION_METADATA_KEYS`
+- `RejectionHandlerOptions`
+- `RejectionTrackingLike`
+- `RejectionTrackingOptions`
 - `RejectReason`
 - `RotationConfig`
 - `SanitizedError`
@@ -477,6 +546,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `ScopedLogger`
 - `SinkStatus`
 - `UNCAUGHT_ERROR_MESSAGE`
+- `UNHANDLED_REJECTION_MESSAGE`
 - `Uninstall`
 - `UNKNOWN_ERROR_NAME`
 - `UNREADABLE_VALUE`

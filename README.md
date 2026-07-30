@@ -251,17 +251,22 @@ the chunk sizes and why the split boundary differs between them.
 ## Crash handling and backgrounding
 
 ```ts
-import { installErrorHandler, flushOnBackground } from 'react-native-nitro-logger';
+import {
+  installErrorHandler,
+  installRejectionHandler,
+  flushOnBackground,
+} from 'react-native-nitro-logger';
 
 const uninstallHandler = installErrorHandler();
+const uninstallRejections = installRejectionHandler();
 const uninstallFlush = flushOnBackground();
 ```
 
 The error handler logs uncaught errors with the message dropped outside dev,
 the class name reduced to a built-in or a fixed token, and stack frames reduced
 to a position in a file whose name was already known. It flushes on fatal
-errors, then chains to whatever handler was installed before it. Both functions
-return idempotent uninstall handles.
+errors, then chains to whatever handler was installed before it. All three
+functions return idempotent uninstall handles.
 
 It logs under six metadata keys of its own, exported as `ERROR_METADATA_KEYS`.
 Under `privacyDefault('private')` those keys go through the same catalog as
@@ -270,6 +275,18 @@ their metadata stripped — which is why the privacy snippet above spreads the
 constant rather than transcribing the six. Spreading also survives a key being
 added in a later version; a hand-written list would start dropping it without
 saying so.
+
+The rejection handler does the same for unhandled promise rejections, and this
+one is worth installing even if you think you have it covered: React Native
+tracks rejections in development and **not at all in a release build**, so an
+`async` function that throws with nobody awaiting it is silent in exactly the
+builds that ship. It does not flush — nothing is dying — and it logs a second
+entry, at `info`, when a rejection reported unhandled turns out to be handled
+after all, so the log takes back what a timer made it say too early.
+
+Its keys are `REJECTION_METADATA_KEYS`, the constant above's twin, and spreading
+both into one catalog is not a mistake: five of the six names are shared, and
+the sixth is `rejectionId`, which joins the two entries about one rejection.
 
 ## Output format
 

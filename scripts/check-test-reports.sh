@@ -61,8 +61,8 @@ case "$MODE" in
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=744
-    REQUIRED_SUITES="apiReference batcher consoleDestination defaultFormatter eslintPlugin fileDestination integrations jsonLinesFormatter levels logger nativeConsoleDestination privacy redaction sanitizeError scope subsystem"
+    MINIMUM=777
+    REQUIRED_SUITES="apiReference batcher consoleDestination defaultFormatter eslintPlugin fileDestination integrations jsonLinesFormatter levels logger nativeConsoleDestination privacy redaction rejectionHandler sanitizeError scope subsystem"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     npx jest --ci --json --outputFile="$REPORTS/jest.json"
