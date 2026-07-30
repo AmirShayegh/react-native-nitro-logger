@@ -111,6 +111,11 @@ namespace margelo::nitro::nitrologger {
       return __vector;
     }(__result);
   }
+  SinkStatus JHybridFileSinkSpec::maintain(double deadlineMs) {
+    static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JSinkStatus>(double /* deadlineMs */)>("maintain");
+    auto __result = method(_javaPart, deadlineMs);
+    return __result->toCpp();
+  }
   ClearOutcome JHybridFileSinkSpec::clearLogs(double deadlineMs) {
     static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JClearOutcome>(double /* deadlineMs */)>("clearLogs");
     auto __result = method(_javaPart, deadlineMs);

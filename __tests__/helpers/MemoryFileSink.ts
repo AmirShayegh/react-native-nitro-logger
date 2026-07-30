@@ -177,6 +177,12 @@ export class MemoryFileSink implements FileSinkLike {
   closed = false;
   /** Throw out of getStatus. */
   statusThrows = false;
+  /** Throw out of maintain, as a native call can. */
+  maintainThrows = false;
+  /** Deadlines `maintain` was called with, in order. */
+  maintainCalls: number[] = [];
+  /** Runs on the writer queue, where the real sweep runs. */
+  onMaintain: (() => void) | undefined;
 
   private generation: number;
 
@@ -218,6 +224,19 @@ export class MemoryFileSink implements FileSinkLike {
   getStatus(): SinkStatus {
     this.statusCalls += 1;
     if (this.statusThrows) throw new Error('status unavailable');
+    return this.status();
+  }
+
+  maintain(deadlineMs: number): SinkStatus {
+    this.maintainCalls.push(deadlineMs);
+    if (this.maintainThrows) throw new Error('maintenance unavailable');
+    // Both natives gate this on the handle still being live and answer a
+    // zeroed status otherwise — the sweep belongs to whoever holds the writer
+    // now, not to a handle a purge fenced.
+    if (this.closed || this.generation !== this.writer.generation) {
+      return { queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0 };
+    }
+    this.onMaintain?.();
     return this.status();
   }
 

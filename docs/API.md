@@ -183,6 +183,7 @@ const logFile = new FileDestination(createFileSink(), {
 | `isEnabled` | `boolean` | False once disposed or fenced. |
 | `lineFramed` | `boolean` | Whether the formatter opted into crash-tail trimming. |
 | `flush(deadlineMs?)` | `BatchFlushOutcome` | `durable` says whether it reached disk. |
+| `maintain(deadlineMs?)` | `number` | Rotation and the retention sweep, on demand. Returns the same mask as `degradation()`, read once the bounded wait is over. |
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
@@ -381,6 +382,49 @@ last being an `AppStateLike` for the same testability reason as
 
 <!-- api: flushOnBackground, FlushOnBackgroundOptions, AppStateLike -->
 
+### `scheduleMaintenance(options)`
+
+Rotation and retention only ever run from a write: the native writer rotates
+when a record makes the file too big or too old *as it is being appended*, and
+sweeps retention when it opens or rotates. A sink nobody is logging to keeps
+whatever it had when the last record landed — an age rotation that never fires,
+an expired archive that is never deleted, a `maxTotalLogBytes` cap that goes on
+being exceeded. `flush()` does not stand in for it; it drains what is buffered
+and moves no files.
+
+This is the timer that runs `FileDestination.maintain()` for you.
+
+```ts
+import {
+  FileDestination as FileDestination2,
+  createFileSink as createFileSink2,
+  scheduleMaintenance,
+} from 'react-native-nitro-logger';
+
+const maintained = new FileDestination2(createFileSink2());
+const stopMaintenance = scheduleMaintenance({
+  destination: maintained,
+  intervalMs: 10 * 60 * 1000,
+});
+```
+
+`ScheduleMaintenanceOptions` takes `destination`, `intervalMs` (default 5
+minutes, clamped up to `MINIMUM_MAINTENANCE_INTERVAL_MS`, which is 30 seconds),
+`deadlineMs` (default 1000) and `appState`. `destination` is typed as
+`MaintainableDestination` — anything with `maintain(deadlineMs)` — so a
+destination this package does not ship can be swept the same way.
+
+The interval stops when the app leaves the foreground and starts again when it
+returns, with one catch-up sweep on the way in; an interval frozen for six hours
+has six hours of expired archives waiting. Installing while the app is already
+in the foreground does **not** sweep, because opening the sink has just run one.
+
+The timer lives in JavaScript rather than in the writer, so it freezes with the
+JS thread and the policy — how often, how long, whether at all — stays with the
+caller. Nothing in the native sink schedules work on its own.
+
+<!-- api: scheduleMaintenance, MINIMUM_MAINTENANCE_INTERVAL_MS, ScheduleMaintenanceOptions, MaintainableDestination -->
+
 ### `sanitizeError(error, options?)`
 
 The sanitiser on its own, returning a `SanitizedError` — `name`, `message`,
@@ -541,8 +585,10 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `LogPrimitive`
 - `LogValue`
 - `LossCounts`
+- `MaintainableDestination`
 - `MAX_CATALOG_SIZE`
 - `METADATA_KEY_PATTERN_SOURCE`
+- `MINIMUM_MAINTENANCE_INTERVAL_MS`
 - `NativeConsoleDestination`
 - `NativeConsoleDestinationOptions`
 - `NativeConsoleSink`
@@ -567,6 +613,8 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `SanitizedError`
 - `sanitizeError`
 - `SanitizeErrorOptions`
+- `scheduleMaintenance`
+- `ScheduleMaintenanceOptions`
 - `ScopedLogger`
 - `SinkStatus`
 - `UNCAUGHT_ERROR_MESSAGE`

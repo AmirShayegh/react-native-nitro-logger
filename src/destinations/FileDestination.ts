@@ -24,6 +24,12 @@ export interface FileSinkLike {
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
   appendBatch(batch: string, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
+  /**
+   * Run rotation and the retention sweep now, bounded by `deadlineMs`, and
+   * report the status once that wait is over. See
+   * {@link FileDestination.maintain}.
+   */
+  maintain(deadlineMs: number): SinkStatus;
   flush(deadlineMs: number): FlushOutcome;
   close(deadlineMs: number): FlushOutcome;
   getLogFilePaths(): string[];
@@ -227,6 +233,43 @@ export class FileDestination implements LogDestination {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Run the housekeeping that otherwise only ever happens on a write, and
+   * report what has stopped working underneath.
+   *
+   * Rotation and retention are driven from the write path alone: nothing
+   * age-rotates, expires an archive or enforces `maxTotalLogBytes` until the
+   * next record arrives. A sink that has gone quiet — an app left open on one
+   * screen, a subsystem that only logs when something goes wrong — therefore
+   * keeps whatever it had when the last record landed, indefinitely.
+   * {@link flush} is not a substitute: it drains what is buffered and moves no
+   * files. `scheduleMaintenance` is the thing that calls this on a timer.
+   *
+   * Returns the same bitmask {@link degradation} returns, read after the
+   * native call's bounded wait — so a prune that has started failing shows up
+   * in the answer to the call that tried it, rather than on the next append.
+   * A sweep still running when `deadlineMs` expires is not in that answer yet;
+   * it finishes on the writer's queue, and any status read after it completes
+   * carries what it found — which is not necessarily the very next one, since
+   * nothing stops a caller reading again while the sweep is still going.
+   *
+   * A destination that is fenced or disposed does nothing and reports the mask
+   * it already had. A disposed one has closed its sink; a fenced one is behind
+   * a purge, and the files it would sweep belong to whoever holds the writer
+   * now.
+   */
+  maintain(deadlineMs: number = DEFAULT_DEADLINE_MS): number {
+    if (!this.isEnabled) return this.batcher.degradation();
+    try {
+      this.batcher.observeStatus(this.sink.maintain(deadlineMs));
+    } catch {
+      // A sweep that threw leaves the cached mask where it stood. Maintenance
+      // runs on a timer with nobody watching, and a throw out of here would
+      // land in whatever scheduled it.
+    }
+    return this.batcher.degradation();
   }
 
   /** Losses with no notice in the file yet. */

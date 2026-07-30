@@ -2144,6 +2144,7 @@ const FREE_FUNCTION_OPTION_CHANNELS = {
   installErrorHandler: { subsystem: ['subsystem'] },
   installRejectionHandler: { subsystem: ['subsystem'] },
   flushOnBackground: {},
+  scheduleMaintenance: {},
 };
 
 /**

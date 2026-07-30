@@ -202,6 +202,85 @@ describe('FileDestination — degradation reporting', () => {
   });
 });
 
+describe('FileDestination — maintain', () => {
+  test('the sweep reaches the sink with the deadline it was given', () => {
+    const { destination, sink } = build();
+    destination.maintain(250);
+    expect(sink.maintainCalls).toEqual([250]);
+  });
+
+  test('a bit the sweep raised is reported by that same call', () => {
+    const { destination, sink, writer } = build();
+    expect(destination.degradation()).toBe(0);
+
+    // The prune that maintenance exists to run is the one that fails, and it
+    // fails inside this call — so the mask has to be read after the sweep, not
+    // before. Reading it first would report the sweep's own findings one call
+    // late, which for a destination nothing is writing to means never.
+    sink.onMaintain = () => {
+      writer.degraded = 0b100;
+    };
+
+    expect(destination.maintain(1000)).toBe(0b100);
+    expect(destination.degradation()).toBe(0b100);
+  });
+
+  test('it moves no records and reports no loss', () => {
+    const { destination, writer } = build();
+    destination.write(entry({ message: 'buffered' }));
+    destination.maintain(1000);
+
+    // Maintenance is not a flush. A caller that used it as one would find its
+    // records still in the buffer, so this pins that it is not one.
+    expect(writer.lines()).toEqual([]);
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
+  });
+
+  test('a disposed destination sweeps nothing and keeps the mask it had', () => {
+    const { destination, sink, writer } = build();
+    writer.degraded = 0b010;
+    destination.flush(1000);
+    destination.dispose();
+
+    // The sink is closed; asking it to sweep would get the zeroed status a
+    // released handle answers with, and folding that in would quietly retract
+    // a degradation the app has already been told about.
+    expect(destination.maintain(1000)).toBe(0b010);
+    expect(sink.maintainCalls).toEqual([]);
+  });
+
+  test('a fenced destination sweeps nothing and keeps the mask it had', () => {
+    const { destination, sink, writer } = build();
+    const other = writer.attach();
+    writer.degraded = 0b001;
+    destination.write(entry({ message: 'pre-purge' }));
+    destination.flush(1000);
+    expect(destination.degradation()).toBe(0b001);
+
+    // Someone else purged underneath it. The files this one would sweep are
+    // the new generation's.
+    other.clearLogs(1000);
+    destination.write(entry({ message: 'fences it' }));
+    destination.flush(1000);
+    expect(destination.isEnabled).toBe(false);
+
+    const before = sink.maintainCalls.length;
+    expect(destination.maintain(1000)).toBe(destination.degradation());
+    expect(sink.maintainCalls).toHaveLength(before);
+  });
+
+  test('a sweep that throws leaves the mask where it stood', () => {
+    const { destination, sink, writer } = build();
+    writer.degraded = 0b100;
+    destination.flush(1000);
+    sink.maintainThrows = true;
+
+    // Nothing is watching a timer tick, so a native throw has to stop here.
+    expect(() => destination.maintain(1000)).not.toThrow();
+    expect(destination.degradation()).toBe(0b100);
+  });
+});
+
 describe('FileDestination — oversized entries', () => {
   test('a formatter that can shed structure is asked to', () => {
     const { destination, writer } = build({ maxEntryBytes: 200 });

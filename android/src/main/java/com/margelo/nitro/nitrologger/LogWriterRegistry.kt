@@ -544,6 +544,18 @@ class LogFileHandle internal constructor(
     return writer.status(id)
   }
 
+  /**
+   * Housekeeping on demand — see [LogFileWriter.maintain].
+   *
+   * Gated on the handle still being live for the same reason every other entry
+   * point here is: a released handle must not move files a writer another
+   * handle now owns.
+   */
+  fun maintain(deadlineMs: Double): LogSinkStatus {
+    if (!isLive) return inertStatus()
+    return writer.maintain(id, deadlineMs)
+  }
+
   fun flush(deadlineMs: Double): LogFlushOutcome {
     // Not `durable = true`. A released handle flushed nothing, and saying
     // otherwise invites the caller to treat its pending records as safe.

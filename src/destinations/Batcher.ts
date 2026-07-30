@@ -14,6 +14,7 @@ import { utf8Length } from '../utf8';
 export interface BatchTarget {
   appendBatch(batch: string, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
+  maintain(deadlineMs: number): SinkStatus;
   flush(deadlineMs: number): FlushOutcome;
 }
 
@@ -282,6 +283,19 @@ export class Batcher {
 
   isFenced(): boolean {
     return this.fenced;
+  }
+
+  /**
+   * Fold a status the owner obtained itself into these counters.
+   *
+   * The cursors advance off append results, so a status read through some
+   * other call — a maintenance sweep, which appends nothing — would otherwise
+   * be invisible here and {@link degradation} would go on reporting the mask
+   * from before the sweep. Same folding rules as an append result: losses take
+   * the maximum, the mask is taken as given.
+   */
+  observeStatus(status: SinkStatus): void {
+    this.observeCounts(status.lostEntries, status.lostBytes, status.degraded);
   }
 
   // ── Draining ────────────────────────────────────────────────────────────

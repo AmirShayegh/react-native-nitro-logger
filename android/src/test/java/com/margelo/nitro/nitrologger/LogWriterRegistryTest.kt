@@ -29,8 +29,19 @@ class LogWriterRegistryTest {
   private lateinit var registry: LogWriterRegistry
   private val handles = mutableListOf<LogFileHandle>()
 
+  /**
+   * The clock every writer here reads, movable by hand.
+   *
+   * Started at the real one rather than a constant, because age rotation
+   * compares it against the creation time the filesystem stamps: a clock fixed
+   * in the past makes every file look like it was created in the future, and
+   * nothing ever ages.
+   */
+  private var now = System.currentTimeMillis()
+
   @Before
   fun setUp() {
+    now = System.currentTimeMillis()
     directory = File.createTempFile("nitro-registry-test", "").let {
       it.delete()
       File(it.absolutePath + "-dir").apply { mkdirs() }
@@ -63,7 +74,7 @@ class LogWriterRegistryTest {
     lineFramed = lineFramed,
     platform = PlatformIo.Jvm,
     rawWrite = rawWrite,
-    clock = { 1_700_000_000_000L },
+    clock = { now },
     owner = owner
   ).also { handles.add(it) }
 
@@ -305,6 +316,48 @@ class LogWriterRegistryTest {
     val rejected = handle.appendBatch("late\n", 1)
     assertFalse(rejected.accepted)
     assertEquals(LogRejectReason.CLOSED, rejected.rejectReason)
+  }
+
+  /**
+   * Maintenance is the one entry point that moves files without writing any,
+   * so a released handle running it deletes and renames under whichever handle
+   * now owns the writer — with the policy the released one was opened with.
+   */
+  @Test
+  fun `a closed handle maintains nothing`() {
+    val path = File(directory, "app.log").absolutePath
+    val policy = LogRotationPolicy.of(maxFileAgeSeconds = 60.0)
+    val keeper = acquire(path, policy)
+    val released = acquire(path, policy)
+    assertTrue(keeper.appendBatch("hello\n", 1).accepted)
+    keeper.flush(1000.0)
+
+    released.close(1000.0)
+    now += 61_000
+
+    // The control: the file is old enough to rotate, and a live handle would
+    // rotate it — the assertion below is about who is asking, not about whether
+    // there is anything to do.
+    assertTrue(archiveNames(path).isEmpty())
+
+    val status = released.maintain(1000.0)
+    assertEquals(0, status.degraded)
+    assertEquals(0L, status.queuedBytes)
+    assertTrue(
+      "a released handle rotated a file the keeper still owns",
+      archiveNames(path).isEmpty()
+    )
+
+    // And the live handle is unaffected: the guard is on the handle, not on
+    // the writer, so the writer it shared still does the work when asked.
+    keeper.maintain(1000.0)
+    assertEquals(1, archiveNames(path).size)
+  }
+
+  private fun archiveNames(path: String): List<String> {
+    val file = File(path)
+    val listing = file.parentFile?.list() ?: return emptyList()
+    return listing.filter { LogFileWriter.isArchiveName(it, file.name) }
   }
 
   /**

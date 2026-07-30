@@ -248,6 +248,22 @@ class HybridFileSink : HybridFileSinkSpec() {
     )
   }
 
+  override fun maintain(deadlineMs: Double): SinkStatus {
+    // Same shape as [getStatus], deliberately: a sink nobody has opened has no
+    // files to rotate and no archives to sweep, so "nothing to do" is the whole
+    // answer and a zeroed status describes it exactly. A closed one is the same
+    // — its writer is gone, and the artifacts it left are the registry's to
+    // sweep the next time somebody opens that path.
+    val live = current() ?: return SinkStatus(0.0, 0.0, 0.0, 0.0)
+    val status = live.maintain(deadlineMs)
+    return SinkStatus(
+      status.queuedBytes.toDouble(),
+      status.lostBytes.toDouble(),
+      status.lostEntries.toDouble(),
+      status.degraded.toDouble()
+    )
+  }
+
   override fun flush(deadlineMs: Double): FlushOutcome {
     // One snapshot, so the handle and the answer to give without one cannot
     // disagree about which instant they describe.

@@ -360,6 +360,18 @@ public final class LogFileHandle {
     return writer.status(handleID: id)
   }
 
+  /// Housekeeping on demand — see `LogWriter.maintain`.
+  ///
+  /// Gated on the handle still being live for the same reason every other entry
+  /// point here is: a released handle must not move files a writer another
+  /// handle now owns.
+  public func maintain(deadlineMs: Double) -> LogSinkStatus {
+    guard liveGeneration() != nil else {
+      return LogSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+    }
+    return writer.maintain(handleID: id, deadlineMs: deadlineMs)
+  }
+
   public func flush(deadlineMs: Double) -> LogFlushOutcome {
     guard liveGeneration() != nil else {
       // Not `durable: true`. A released handle did not flush anything, and

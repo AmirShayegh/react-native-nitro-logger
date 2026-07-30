@@ -134,6 +134,18 @@ final class HybridFileSink: HybridFileSinkSpec {
     return Self.status(handle.status())
   }
 
+  func maintain(deadlineMs: Double) throws -> SinkStatus {
+    // Same shape as `getStatus`, deliberately: a sink nobody has opened has no
+    // files to rotate and no archives to sweep, so "nothing to do" is the whole
+    // answer and a zeroed status describes it exactly. A closed one is the same
+    // — its writer is gone, and the artifacts it left are the registry's to
+    // sweep the next time somebody opens that path.
+    guard let handle = current() else {
+      return SinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
+    }
+    return Self.status(handle.maintain(deadlineMs: deadlineMs))
+  }
+
   func flush(deadlineMs: Double) throws -> FlushOutcome {
     // One snapshot, so the handle and the answer to give without one cannot
     // disagree about which instant they describe.

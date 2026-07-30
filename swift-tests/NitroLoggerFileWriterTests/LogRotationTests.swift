@@ -69,6 +69,136 @@ final class LogRotationTests: LogWriterTestCase {
     }
   }
 
+  // MARK: - Maintenance without a write
+
+  /// The whole reason `maintain` exists. Rotation runs from `performWrite` and
+  /// nowhere else, so a sink nobody is logging to never age-rotates however
+  /// long it sits there.
+  func testMaintainAgeRotatesAFileNothingIsWritingTo() throws {
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 0.05
+    )
+    let handle = try makeHandle(policy: policy)
+    write(handle, "young\n")
+
+    Thread.sleep(forTimeInterval: 0.2)
+
+    // The control, and the point: the file is old enough to rotate and stays
+    // put, because nothing has written to it. Without this assertion the one
+    // below would pass against a writer that rotated on its own.
+    XCTAssertEqual(archiveNames().count, 0, "an unwritten file does not rotate itself")
+
+    _ = handle.maintain(deadlineMs: 1000)
+
+    XCTAssertEqual(archiveNames().count, 1, "the sweep rotates it with no record to carry")
+    XCTAssertEqual(contents(), "", "the fresh file starts empty")
+  }
+
+  /// The other half: an archive that expired while the app sat idle.
+  func testMaintainPrunesAnExpiredArchiveWithNoWrites() throws {
+    let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 100, archiveAge: 0.1))
+    write(handle, record)
+    write(handle, record) // rotation
+    XCTAssertEqual(archiveNames().count, 1)
+
+    Thread.sleep(forTimeInterval: 0.3)
+    XCTAssertEqual(archiveNames().count, 1, "retention does not sweep itself either")
+
+    _ = handle.maintain(deadlineMs: 1000)
+
+    XCTAssertEqual(archiveNames().count, 0, "the expired archive goes without a record arriving")
+  }
+
+  /// A flush is not a sweep. Both take a deadline and both go on the writer's
+  /// queue, which is exactly why someone would reach for the wrong one.
+  func testFlushDoesNotStandInForMaintain() throws {
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 0.05
+    )
+    let handle = try makeHandle(policy: policy)
+    write(handle, "young\n")
+
+    Thread.sleep(forTimeInterval: 0.2)
+    XCTAssertTrue(handle.flush(deadlineMs: 1000).durable)
+
+    XCTAssertEqual(archiveNames().count, 0, "flush drains the queue and moves no files")
+  }
+
+  /// The status has to describe what this call found, not what the last append
+  /// left behind — a destination nobody writes to has no next append.
+  func testMaintainReportsWhatTheSweepItselfBroke() throws {
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 0.05,
+      compressArchives: true
+    )
+    let handle = try makeHandle(policy: policy, compressor: { _, _ in false })
+    write(handle, "young\n")
+    XCTAssertEqual(handle.status().degraded & LogDegradation.gzip.rawValue, 0)
+
+    Thread.sleep(forTimeInterval: 0.2)
+    let status = handle.maintain(deadlineMs: 1000)
+
+    XCTAssertNotEqual(
+      status.degraded & LogDegradation.gzip.rawValue, 0,
+      "the compression this sweep failed is in the status this sweep returned"
+    )
+  }
+
+  /// Same rule as every other entry point: a released handle must not move
+  /// files a live handle owns.
+  func testAReleasedHandleMaintainsNothing() throws {
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 0.05
+    )
+    let keeper = try makeHandle(policy: policy)
+    let released = try makeHandle(policy: policy)
+    write(keeper, "young\n")
+
+    _ = released.close(deadlineMs: 1000)
+    Thread.sleep(forTimeInterval: 0.2)
+
+    let status = released.maintain(deadlineMs: 1000)
+    XCTAssertEqual(status.degraded, 0)
+    XCTAssertEqual(archiveNames().count, 0, "the writer the keeper holds is untouched")
+
+    // And the live handle can still do it.
+    _ = keeper.maintain(deadlineMs: 1000)
+    XCTAssertEqual(archiveNames().count, 1)
+  }
+
+  /// A terminated writer no longer owns the path, and the retention sweep is
+  /// the half of maintenance that needs no stream to do damage: it works off a
+  /// directory listing, so it would happily delete archives under whichever
+  /// writer holds the path now, using a policy that writer never agreed to.
+  func testMaintainAfterTerminationSweepsNothing() throws {
+    let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 100, archiveAge: 0.1))
+    let writer = handle.writerForTesting
+    write(handle, record)
+    write(handle, record) // rotation
+    XCTAssertEqual(archiveNames().count, 1)
+
+    _ = handle.close(deadlineMs: 1000)
+    Thread.sleep(forTimeInterval: 0.3)
+
+    // Straight at the writer: the handle refuses on its own, and the guard
+    // under test is the one beneath it.
+    _ = writer.maintain(handleID: 0, deadlineMs: 1000)
+
+    XCTAssertEqual(
+      archiveNames().count, 1,
+      "an archive this writer no longer owns is not its to expire"
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: logURL.path))
+  }
+
   // MARK: - Retention
 
   func testPrunesByCount() throws {

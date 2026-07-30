@@ -70,6 +70,7 @@ namespace margelo::nitro::nitrologger {
       virtual FlushOutcome flush(double deadlineMs) = 0;
       virtual FlushOutcome close(double deadlineMs) = 0;
       virtual std::vector<std::string> getLogFilePaths() = 0;
+      virtual SinkStatus maintain(double deadlineMs) = 0;
       virtual ClearOutcome clearLogs(double deadlineMs) = 0;
 
     protected:

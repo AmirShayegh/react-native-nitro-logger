@@ -62,6 +62,12 @@ export type {
   FlushOnBackgroundOptions,
   AppStateLike,
 } from './integrations/appState';
+export { scheduleMaintenance } from './integrations/maintenance';
+export { MINIMUM_MAINTENANCE_INTERVAL_MS } from './integrations/maintenance';
+export type {
+  ScheduleMaintenanceOptions,
+  MaintainableDestination,
+} from './integrations/maintenance';
 export {
   sanitizeError,
   DEFAULT_BUNDLE_NAMES,

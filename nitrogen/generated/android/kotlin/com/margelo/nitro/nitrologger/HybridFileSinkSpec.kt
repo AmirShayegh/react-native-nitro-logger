@@ -56,6 +56,10 @@ abstract class HybridFileSinkSpec: HybridObject() {
   
   @DoNotStrip
   @Keep
+  abstract fun maintain(deadlineMs: Double): SinkStatus
+  
+  @DoNotStrip
+  @Keep
   abstract fun clearLogs(deadlineMs: Double): ClearOutcome
 
   // Default implementation of `HybridObject.toString()`

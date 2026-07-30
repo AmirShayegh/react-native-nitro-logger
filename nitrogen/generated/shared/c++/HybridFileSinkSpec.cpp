@@ -21,6 +21,7 @@ namespace margelo::nitro::nitrologger {
       prototype.registerHybridMethod("flush", &HybridFileSinkSpec::flush);
       prototype.registerHybridMethod("close", &HybridFileSinkSpec::close);
       prototype.registerHybridMethod("getLogFilePaths", &HybridFileSinkSpec::getLogFilePaths);
+      prototype.registerHybridMethod("maintain", &HybridFileSinkSpec::maintain);
       prototype.registerHybridMethod("clearLogs", &HybridFileSinkSpec::clearLogs);
     });
   }

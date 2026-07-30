@@ -1151,6 +1151,139 @@ class LogFileWriterTest {
                w.status(1).degraded and LogDegradation.SIDECAR != 0)
   }
 
+  // MARK: - Maintenance without a write
+
+  /// The whole reason [LogFileWriter.maintain] exists. Rotation runs from
+  /// `performWrite` and nowhere else, so a sink nobody is logging to never
+  /// age-rotates however long it sits there.
+  @Test
+  fun `maintain age rotates a file nothing is writing to`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileAgeSeconds = 60.0))
+    w.write("early\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    now += 61_000
+
+    // The control, and the point: the file is old enough to rotate and stays
+    // put, because nothing has written to it. Without this the assertion below
+    // would pass against a writer that rotated on its own.
+    assertTrue("an unwritten file rotated itself", archives().isEmpty())
+
+    w.maintain(1, 1000.0)
+    w.settleForTesting()
+
+    assertEquals(1, archives().size)
+  }
+
+  /// The other half: an archive that expired while the app sat idle.
+  @Test
+  fun `maintain prunes an expired archive with no writes`() {
+    val w = writer(
+      policy = LogRotationPolicy.of(
+        maxFileSizeBytes = 16.0,
+        maxArchivedFilesCount = 50.0,
+        maxArchiveAgeSeconds = 30.0
+      )
+    )
+    w.write("0123456789012345\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val rotated = archives()
+    assertTrue(rotated.isNotEmpty())
+    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+
+    now += 1_000
+    assertEquals("retention does not sweep itself either", rotated.size, archives().size)
+
+    w.maintain(1, 1000.0)
+    w.settleForTesting()
+
+    assertTrue("the expired archive survived", archives().none { it in rotated })
+  }
+
+  /// A flush is not a sweep. Both take a deadline and both go on the writer's
+  /// executor, which is exactly why someone would reach for the wrong one.
+  @Test
+  fun `flush does not stand in for maintain`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileAgeSeconds = 60.0))
+    w.write("early\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    now += 61_000
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    assertTrue("flush drains the queue and moves no files", archives().isEmpty())
+  }
+
+  /// The status has to describe what this call found, not what the last append
+  /// left behind — a destination nobody writes to has no next append.
+  @Test
+  fun `maintain reports what the sweep itself broke`() {
+    val w = writer(
+      policy = LogRotationPolicy.of(maxFileAgeSeconds = 60.0, compressArchives = true),
+      compressor = { _, _ -> false }
+    )
+    w.write("early\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+    assertEquals(0, w.status(1).degraded and LogDegradation.GZIP)
+
+    now += 61_000
+    val status = w.maintain(1, 1000.0)
+
+    assertTrue(
+      "the compression this sweep failed is missing from the status it returned",
+      status.degraded and LogDegradation.GZIP != 0
+    )
+  }
+
+  /// A terminated writer no longer owns the path, and the retention sweep is
+  /// the half of maintenance that needs no stream to do damage: it works off a
+  /// directory listing, so it would happily expire archives under whichever
+  /// writer holds the path now, under a policy that one never agreed to.
+  ///
+  /// **What this does not prove.** What stops it here is [close] shutting the
+  /// executor down, which rejects the sweep before it is ever queued — remove
+  /// the `terminated` check inside `maintain` and this test still passes. That
+  /// check is the second line, for a sweep enqueued in the window between the
+  /// close barrier being submitted and the shutdown that follows it, and no
+  /// caller can reach that window today: `LogFileHandle.maintain` refuses on a
+  /// released handle, and the writer is only closed once the last handle is
+  /// released. iOS has no executor to shut down, so there the same check is the
+  /// only line and `testMaintainAfterTerminationSweepsNothing` pins it.
+  @Test
+  fun `maintain after close sweeps nothing`() {
+    val w = writer(
+      policy = LogRotationPolicy.of(
+        maxFileSizeBytes = 16.0,
+        maxArchivedFilesCount = 50.0,
+        maxArchiveAgeSeconds = 30.0
+      )
+    )
+    w.write("0123456789012345\n")
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    val rotated = archives()
+    assertTrue(rotated.isNotEmpty())
+    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+
+    w.close(1, 1000.0)
+    now += 1_000
+    w.maintain(1, 1000.0)
+
+    assertEquals("an archive this writer no longer owns is not its to expire",
+                 rotated.sorted(), archives().sorted())
+    assertTrue(File(directory, "app.log").exists())
+  }
+
+  private fun archives(): List<String> =
+    directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
+
   // MARK: - Config clamping
 
   /// The distinction the retention limit has to make: zero is an instruction

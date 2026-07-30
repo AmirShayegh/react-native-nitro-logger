@@ -937,6 +937,54 @@ class LogFileWriter internal constructor(
   fun flush(handleId: Long, deadlineMs: Double): LogFlushOutcome =
     flushUntil(handleId, monotonic() + clampDeadline(deadlineMs))
 
+  /**
+   * Runs the housekeeping the write path would otherwise have to trigger.
+   *
+   * Rotation and retention only ever run from a write — [rotateIfNeeded] from
+   * `performWrite`, [sweepRetention] from open and from rotation — so a sink
+   * nobody is logging to keeps whatever it had when the last record landed: an
+   * age rotation that never fires, an expired archive that is never deleted, a
+   * total-bytes cap that goes on being exceeded. [flush] is not a substitute;
+   * it drains the queue and touches neither.
+   *
+   * On the writer's own executor, like everything else that moves files, so it
+   * cannot interleave with a rotation a write is already performing.
+   *
+   * The status is read after the wait, not after the sweep — those are the same
+   * instant only when the sweep finished inside [deadlineMs]. A caller that
+   * passes `0`, or whose budget expires behind a wedged write, gets a status
+   * describing what the sweep found *so far*. The sweep itself still runs, on
+   * the executor, and a status read after it completes carries the rest — not
+   * necessarily the very next one, since nothing stops a caller reading again
+   * while it is still going.
+   */
+  fun maintain(handleId: Long, deadlineMs: Double): LogSinkStatus {
+    val done = CountDownLatch(1)
+    try {
+      executor.execute {
+        try {
+          // Rotation would stop at its own `stream == null` check, but the
+          // sweep would not: it works off a directory listing and needs no
+          // stream, so a writer whose close has already run would go on
+          // expiring archives at whichever writer now holds this path, under a
+          // policy that one never agreed to.
+          if (!terminated) {
+            rotateIfNeeded()
+            sweepRetention()
+          }
+        } finally {
+          done.countDown()
+        }
+      }
+      done.await(clampDeadline(deadlineMs), TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+    } catch (_: RejectedExecutionException) {
+      // A close shut the executor down; there is nothing left to maintain.
+    }
+    return status(handleId)
+  }
+
   private fun flushUntil(handleId: Long, expiry: Long): LogFlushOutcome {
     var timedOut = false
 
@@ -1188,11 +1236,14 @@ class LogFileWriter internal constructor(
   data class Artifact(val file: File, val modified: Long, val size: Long)
 
   /**
-   * Applies all three retention limits. Runs at open and after each rotation.
+   * Applies all three retention limits. Runs at open, after each rotation, and
+   * from [maintain].
    *
-   * No background timer: an idle process writes nothing, so there is nothing to
-   * sweep, and a timer that fires in the background is a wakeup the app pays
-   * for. An active process rotates, and rotation sweeps.
+   * Still no timer of its own: one that fires in the background is a wakeup the
+   * app pays for and a retention policy the JS side is not consulted on. An
+   * active process rotates, and rotation sweeps; a quiet one is swept by
+   * [maintain], on whatever schedule the app decides — which is what
+   * `scheduleMaintenance` is, in TypeScript, where the app can see it.
    */
   private fun sweepRetention() {
     var failed = false

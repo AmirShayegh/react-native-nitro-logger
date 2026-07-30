@@ -39,7 +39,7 @@ export interface SinkStatus {
   queuedBytes: number;
   lostBytes: number;
   lostEntries: number;
-  /** Payload-free degradation bitmask: rotation|gzip|prune|sidecar|protection. */
+  /** Payload-free degradation bitmask: rotation|gzip|prune|sidecar|protection|exclusivity. */
   degraded: number;
 }
 
@@ -141,6 +141,32 @@ export interface FileSink extends HybridObject<{
    * opened answers empty once its files have been purged or swept away.
    */
   getLogFilePaths(): string[];
+
+  /**
+   * Runs the housekeeping that otherwise only ever happens on a write.
+   *
+   * Rotation and retention are driven from the write path — `rotateIfNeeded`
+   * from `performWrite`, the retention sweep from open and from rotation — so a
+   * sink that has gone quiet keeps whatever it had when the last record landed.
+   * An age-based rotation never fires, an expired archive is never deleted, and
+   * a `maxTotalLogBytes` cap goes on being exceeded, for as long as nobody
+   * logs. `flush(0)` cannot stand in for this: it drains the queue and touches
+   * neither.
+   *
+   * Enqueued on the writer's own queue like every other operation, and bounded
+   * by `deadlineMs`. The status comes back after that wait rather than after
+   * the sweep — the same instant only when the sweep finished inside the
+   * deadline. Within it, the caller's degradation mask reflects what this call
+   * found rather than what the last write did; a deadline of `0`, or one spent
+   * behind a wedged write, returns early and the sweep goes on without it, its
+   * findings reaching whichever status is read after it completes.
+   *
+   * There is deliberately no timer behind it. Native timers here would fire on
+   * a queue this library does not own, in a process state it cannot see; the
+   * schedule belongs to the app, and `scheduleMaintenance()` in TypeScript is
+   * the one this package ships.
+   */
+  maintain(deadlineMs: number): SinkStatus;
 
   /**
    * Registry-serialized purge of the COMPLETE artifact set (current file,

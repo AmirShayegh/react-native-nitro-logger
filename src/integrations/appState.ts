@@ -4,6 +4,15 @@ import type { Uninstall } from './errorHandler';
 
 /** The part of RN's `AppState` this uses. Injected in tests. */
 export interface AppStateLike {
+  /**
+   * The state right now, if the implementation offers it.
+   *
+   * Optional because the listener is the part this module actually needs;
+   * {@link scheduleMaintenance} reads it to decide whether to start its timer
+   * before the first transition arrives, and treats an absent value as
+   * foreground.
+   */
+  readonly currentState?: string;
   addEventListener(
     type: 'change',
     listener: (state: string) => void
@@ -91,8 +100,11 @@ export function flushOnBackground(
  * A static import would make this module — and therefore the package entry
  * point — unloadable anywhere React Native is not present, which includes the
  * Node process the unit tests run in.
+ *
+ * @internal Shared with {@link scheduleMaintenance}; not part of the package's
+ * public surface.
  */
-function resolveAppState(): AppStateLike | undefined {
+export function resolveAppState(): AppStateLike | undefined {
   try {
     const rn = require('react-native') as { AppState?: unknown };
     const candidate = rn.AppState;
