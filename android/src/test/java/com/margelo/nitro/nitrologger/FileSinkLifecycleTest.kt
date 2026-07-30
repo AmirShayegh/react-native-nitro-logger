@@ -71,7 +71,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `claiming the right to open immediately forfeits vacuous success`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     assertEquals(FileSinkLifecycle.State.OPENING, lifecycle.currentState)
     assertFalse(lifecycle.vacuousSuccess)
@@ -82,22 +82,22 @@ class FileSinkLifecycleTest {
   @Test
   fun `a second open is refused while the first is still acquiring`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     // The loser's handle would be unreachable, and unreachable means a later
     // purge never deletes its files.
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.ALREADY_OPEN, lifecycle.beginOpen())
     assertEquals(FileSinkLifecycle.State.OPENING, lifecycle.currentState)
   }
 
   @Test
   fun `a second open is refused once a handle is installed`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(handle()))
 
     assertEquals(FileSinkLifecycle.State.OPEN, lifecycle.currentState)
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.ALREADY_OPEN, lifecycle.beginOpen())
   }
 
   // MARK: open failure
@@ -105,12 +105,12 @@ class FileSinkLifecycleTest {
   @Test
   fun `a failed open returns to closed without regaining vacuous success`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.failOpen()
 
     assertEquals(FileSinkLifecycle.State.CLOSED, lifecycle.currentState)
     assertFalse(lifecycle.vacuousSuccess)
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
   }
 
   // MARK: close
@@ -119,7 +119,7 @@ class FileSinkLifecycleTest {
   fun `closing hands the handle back exactly once`() {
     val lifecycle = FileSinkLifecycle()
     val live = handle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(live))
 
     assertSame(live, lifecycle.beginClose().handle)
@@ -131,7 +131,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `closing never restores vacuous success`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(handle())
     lifecycle.beginClose()
 
@@ -141,11 +141,11 @@ class FileSinkLifecycleTest {
   @Test
   fun `a closed sink can be opened again`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(handle())
     lifecycle.beginClose()
 
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
   }
 
   // MARK: where the artifacts are
@@ -154,7 +154,7 @@ class FileSinkLifecycleTest {
   fun `a closed sink still knows where its artifacts are`() {
     val lifecycle = FileSinkLifecycle()
     val live = handle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(live))
     lifecycle.beginClose()
 
@@ -182,7 +182,7 @@ class FileSinkLifecycleTest {
     val lifecycle = FileSinkLifecycle()
     val asked = File(directory, "./nested/../app.log").absolutePath
     val live = handle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(live)
 
     assertNotEquals("the spellings have to differ or this proves nothing",
@@ -203,7 +203,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `an open still in flight has nothing to enumerate`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     assertNull(lifecycle.artifactSource().path)
     assertFalse("but it has already forfeited vacuous success", lifecycle.vacuousSuccess)
@@ -250,7 +250,7 @@ class FileSinkLifecycleTest {
     handle("link/app.log")
 
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     var reported: String? = null
     var retarget = Result.success(Unit)
     try {
@@ -307,7 +307,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `a failure before resolution records nothing`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     var reported: String? = null
     try {
@@ -334,7 +334,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `a close arriving during acquisition cancels the open`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     assertNull(lifecycle.beginClose().handle)
     assertEquals(FileSinkLifecycle.State.CLOSE_PENDING, lifecycle.currentState)
@@ -347,11 +347,11 @@ class FileSinkLifecycleTest {
   @Test
   fun `a cancelled open does not cancel the one after it`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.beginClose()
     assertEquals(FileSinkLifecycle.Installation.ABANDON, lifecycle.finishOpen(handle()))
 
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     val second = handle("second.log")
     assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(second))
     assertSame(second, lifecycle.current())
@@ -372,12 +372,12 @@ class FileSinkLifecycleTest {
   @Test
   fun `a second close during acquisition does not free the sink`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     assertNull(lifecycle.beginClose().handle)
     assertNull(lifecycle.beginClose().handle)
     assertEquals(FileSinkLifecycle.State.CLOSE_PENDING, lifecycle.currentState)
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.CLOSING, lifecycle.beginOpen())
 
     // The first acquisition finally lands, and is still discarded.
     val stale = handle()
@@ -385,7 +385,7 @@ class FileSinkLifecycleTest {
     assertNull(lifecycle.current())
 
     // Only now is the sink free, and the next open gets its own handle.
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     val fresh = handle("fresh.log")
     assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(fresh))
     assertSame(fresh, lifecycle.current())
@@ -398,23 +398,23 @@ class FileSinkLifecycleTest {
   @Test
   fun `disposing after a close during acquisition is still terminal`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     assertNull(lifecycle.beginClose().handle)
 
     assertNull(lifecycle.beginDispose().handle)
     assertEquals(FileSinkLifecycle.State.DISPOSED, lifecycle.currentState)
     assertEquals(FileSinkLifecycle.Installation.ABANDON, lifecycle.finishOpen(handle()))
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.DISPOSED, lifecycle.beginOpen())
   }
 
   @Test
   fun `an open is refused while a cancelled acquisition is still in flight`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.beginClose()
 
     assertEquals(FileSinkLifecycle.State.CLOSE_PENDING, lifecycle.currentState)
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.CLOSING, lifecycle.beginOpen())
   }
 
   // MARK: dispose
@@ -423,18 +423,18 @@ class FileSinkLifecycleTest {
   fun `dispose is terminal where close is not`() {
     val lifecycle = FileSinkLifecycle()
     val live = handle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(live)
 
     assertSame(live, lifecycle.beginDispose().handle)
     assertEquals(FileSinkLifecycle.State.DISPOSED, lifecycle.currentState)
-    assertFalse(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.DISPOSED, lifecycle.beginOpen())
   }
 
   @Test
   fun `disposing during acquisition also discards the handle`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
 
     assertNull(lifecycle.beginDispose().handle)
     assertEquals(FileSinkLifecycle.Installation.ABANDON, lifecycle.finishOpen(handle()))
@@ -444,7 +444,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `disposing twice is harmless`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(handle())
 
     assertSame(handles.first(), lifecycle.beginDispose().handle)
@@ -465,7 +465,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `a closed sink refuses to call a purge durable`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(handle())
     lifecycle.beginClose()
 
@@ -488,7 +488,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `a sink whose open failed refuses to call a purge durable`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.failOpen()
 
     assertFalse(lifecycle.snapshot().durableWithoutHandle)
@@ -505,7 +505,7 @@ class FileSinkLifecycleTest {
     val lifecycle = FileSinkLifecycle()
     val winners = AtomicInteger()
 
-    runConcurrently(64) { if (lifecycle.beginOpen()) winners.incrementAndGet() }
+    runConcurrently(64) { if (lifecycle.beginOpen() == FileSinkLifecycle.Claim.GRANTED) winners.incrementAndGet() }
 
     assertEquals(1, winners.get())
     assertEquals(FileSinkLifecycle.State.OPENING, lifecycle.currentState)
@@ -518,7 +518,7 @@ class FileSinkLifecycleTest {
   @Test
   fun `concurrent closes hand the handle to exactly one caller`() {
     val lifecycle = FileSinkLifecycle()
-    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
     lifecycle.finishOpen(handle())
 
     val takers = AtomicInteger()

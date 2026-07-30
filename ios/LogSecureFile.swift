@@ -1,5 +1,46 @@
 import Foundation
 
+/// How much of the claim a directory *this call creates* receives.
+///
+/// "We made it, so it is ours" is right about a directory whose name this
+/// package chose, and wrong about one whose name is a platform convention.
+/// `<Library>/Logs` is the second kind: it is where an iOS app is expected to
+/// put logs, so the host app and any other library in the process may use it
+/// too — and on a fresh container the first `open` is simply whoever gets
+/// there first. Winning that race is not ownership.
+///
+/// What is actually at stake is the two *directory-wide* protections, both of
+/// which outlive this sink and neither of which the app can see:
+///
+/// - the backup exclusion is persistent and applies to the directory, so it
+///   silently takes everything anyone later puts in `Logs` out of iCloud
+///   backup;
+/// - the protection class is inherited by every file created in there
+///   afterwards, including files this package never writes — which can turn
+///   another component's write into a silent failure on a locked device.
+///
+/// The mode is a different question and is applied either way: `0700` on a
+/// directory this call brought into existence inside the app's own container
+/// takes nothing away from anyone — there was nothing there to take.
+///
+/// **Nothing is lost by holding back.** Every artifact this writer creates
+/// gets all three explicitly, through its own descriptor; the directory-wide
+/// settings were never what protected the log files. See PRIVACY.md, which
+/// already makes that argument for files.
+///
+/// It is decided by the directory's *name*, not by who asked for it. A caller
+/// that spells out `<Library>/Logs` gets the same restraint as one that took
+/// the default: the reason to hold back is that the host app is entitled to
+/// that directory, and that is true however this writer arrived at it.
+internal enum LogDirectoryClaim {
+  /// Mode, protection class, and backup exclusion. For a directory whose name
+  /// this package or its caller chose, which nothing else has a standing
+  /// reason to be in.
+  case full
+  /// Mode only. For a directory whose name is a platform convention.
+  case modeOnly
+}
+
 /// Creating log files and directories the way a file full of patient data has
 /// to be created.
 ///
@@ -49,6 +90,76 @@ internal enum LogSecureFile {
   static let directoryMode: Int = 0o700
   static let fileMode: Int = 0o600
 
+  /// Where this platform expects an app to keep its logs.
+  ///
+  /// One definition, read twice: the Nitro adapter advertises it as
+  /// `defaultLogDirectory`, and this file treats it as a name it does not own.
+  /// Two spellings of that would be a bug that hides — the directory the
+  /// package hands out by default has to be exactly the directory it declines
+  /// to claim.
+  static var conventionalLogDirectory: URL {
+    let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+      ?? FileManager.default.temporaryDirectory
+    return base.appendingPathComponent("Logs")
+  }
+
+  /// Whether a directory's *name* is a platform convention rather than a name
+  /// this package or its caller chose.
+  ///
+  /// Asked about the directory that was actually created, at the moment it is
+  /// created. It used to be asked in the adapter, of the string the caller
+  /// passed, before anything resolved it — and that is defeated by a second
+  /// spelling of the same directory: `/var/…` against `/private/var/…`, a
+  /// container reached through a symlink, a relative path. Missing the match
+  /// there did not withhold a claim, it *made* one, on the single directory
+  /// that must not be claimed.
+  ///
+  /// Asking here also covers the level the adapter could not speak for at all:
+  /// `Logs` created as an *intermediate* of `<Library>/Logs/mine` is the same
+  /// conventional directory as `Logs` created as a leaf, and a claim threaded
+  /// down from the caller describes only the leaf.
+  private static func isConventional(_ url: URL) -> Bool {
+    if sameDirectory(url, conventionalLogDirectory) { return true }
+    seamLock.lock()
+    defer { seamLock.unlock() }
+    return conventionalDirectoriesForTesting.contains { sameDirectory(url, $0) }
+  }
+
+  /// Two names for one directory.
+  ///
+  /// Either spelling matching is enough, and the asymmetry is deliberate. A
+  /// missed match claims a directory that must not be claimed; a spurious one
+  /// only withholds directory-wide settings from a directory whose artifacts
+  /// are protected individually regardless. The comparison is therefore
+  /// allowed to be generous, and every fallback below is written to fail in
+  /// that direction.
+  private static func sameDirectory(_ lhs: URL, _ rhs: URL) -> Bool {
+    lhs.standardizedFileURL.path == rhs.standardizedFileURL.path
+      || canonicalDirectoryPath(lhs) == canonicalDirectoryPath(rhs)
+  }
+
+  /// A directory's canonical path, resolved as far as the filesystem allows.
+  ///
+  /// `realpath` needs every component to exist, and the directory being asked
+  /// about may be the one that does not yet — that is the whole question. So
+  /// the *parent* is resolved, which does exist by the time this is asked, and
+  /// the last component is appended verbatim: every symlink above the leaf is
+  /// gone, and the leaf is either a directory `mkdir` has just created or the
+  /// name being decided about, neither of which is a link.
+  ///
+  /// A parent that will not resolve falls back to the standardized spelling,
+  /// which `sameDirectory` compares as well — so an unreadable ancestor cannot
+  /// turn a conventional directory into a claimed one by making the canonical
+  /// forms disagree.
+  private static func canonicalDirectoryPath(_ url: URL) -> String {
+    let standardized = url.standardizedFileURL
+    let parent = standardized.deletingLastPathComponent()
+    guard let resolved = realpath(parent.path, nil) else { return standardized.path }
+    defer { free(resolved) }
+    return URL(fileURLWithPath: String(cString: resolved))
+      .appendingPathComponent(standardized.lastPathComponent).path
+  }
+
   /// Creates `url` and every missing parent as owner-only directories.
   ///
   /// **A directory this call did not create is inspected, never changed.** The
@@ -73,8 +184,12 @@ internal enum LogSecureFile {
   /// all: a world-readable `Logs` left behind by an upgrade or a restored
   /// backup is real, it just is not ours to silently reconfigure.
   ///
-  /// A directory this call *creates* is unambiguously ours and gets all three —
-  /// at every level, not just the leaf. See `createIntermediates(below:)`, which
+  /// A directory this call *creates* gets all three — at every level, not just
+  /// the leaf — with one exception, decided per level rather than per call: a
+  /// directory whose *name* is a platform convention gets the mode alone, since
+  /// creating `<Library>/Logs` first is not the same as owning it. See
+  /// `LogDirectoryClaim` and `isConventional`. See also
+  /// `createIntermediates(below:)`, which
   /// is also where the asymmetry is written down: a pre-existing **leaf** is
   /// inspected and a loose mode reported, a pre-existing **ancestor** is not
   /// looked at, because `Library` and the container root are `0755` by design
@@ -100,7 +215,7 @@ internal enum LogSecureFile {
     // Subject to the umask, which is why `secure` re-asserts the mode and reads
     // it back rather than trusting this argument.
     if mkdir(url.path, mode_t(directoryMode)) == 0 {
-      shortfall.formUnion(secure(url, isDirectory: true))
+      shortfall.formUnion(secure(createdDirectory: url))
       return shortfall
     }
     let failure = errno
@@ -170,7 +285,7 @@ internal enum LogSecureFile {
     var shortfall = Shortfall()
     for directory in chain.reversed() {
       if mkdir(directory.path, mode_t(directoryMode)) == 0 {
-        shortfall.formUnion(secure(directory, isDirectory: true))
+        shortfall.formUnion(secure(createdDirectory: directory))
         continue
       }
       let failure = errno
@@ -223,6 +338,87 @@ internal enum LogSecureFile {
     }
 
     shortfall.formUnion(protect(url, isDirectory: isDirectory))
+    return shortfall
+  }
+
+  /// The same for a directory this call has just created, bound to the inode
+  /// rather than to the name.
+  ///
+  /// `mkdir` returning 0 proves this process created it. It does not prove the
+  /// name still leads there a microsecond later — and every step after it used
+  /// to be path-based. Rename the new directory away, drop a symlink at the
+  /// name it had, and a path `chmod` follows the link: the mode lands on the
+  /// target, and the path read-back follows the same link and agrees. The
+  /// comment on `currentMode` used to describe following links for directories
+  /// as simply matching what `chmod` did, which is true and is not the same as
+  /// safe.
+  ///
+  /// Opening `O_DIRECTORY | O_NOFOLLOW` immediately after the `mkdir` takes the
+  /// name out of every step that follows: `O_NOFOLLOW` refuses outright if a
+  /// link is sitting at the name, and from there `fchmod` and `fstat` carry no
+  /// name at all, so there is nothing left to redirect.
+  ///
+  /// **What that does not establish**, stated because the version of this
+  /// comment that did not state it is the finding this method came from: a
+  /// successful open does not prove this is the inode `mkdir` created. A rename
+  /// away and a *real* directory left at the name is not a symlink, and
+  /// `O_NOFOLLOW` has no opinion about it — so a replacement that lands in the
+  /// gap between the `mkdir` and the `open` is neither refused nor noticed.
+  /// This call then holds a descriptor for the replacement, every check below
+  /// agrees about it, and it reports success about a directory this process did
+  /// not create. Nothing here detects that, and it is worth being exact about
+  /// which window is which:
+  ///
+  /// - a symlink at the name **when this opens** is refused, by `O_NOFOLLOW`;
+  /// - a replacement **after the descriptor is acquired** is detected, because
+  ///   the protection class and the backup exclusion have no descriptor-based
+  ///   setter and so still go out by name, but what they did is read back
+  ///   **through the descriptor** — landing on another inode comes back as
+  ///   `.protection`, and the app is told its logs are degraded rather than
+  ///   told they are fine;
+  /// - a replacement **between the `mkdir` and the `open`** is neither.
+  ///
+  /// All three need write access to the parent, which inside app-private
+  /// storage means code already running as this app: the attacker PRIVACY.md's
+  /// threat model excludes, and one that can read the log files directly, which
+  /// is what these protections are for. `secure(descriptor:at:)` makes the same
+  /// argument for files and says why an inode comparison would be weaker.
+  @discardableResult
+  static func secure(createdDirectory url: URL) -> Shortfall {
+    let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else {
+      // A symlink is sitting at the name, or it no longer opens as a directory
+      // at all. Either way this call cannot reach what it made, and must not
+      // apply the claim to whatever is there instead.
+      return [.permissions, .protection]
+    }
+    defer { close(descriptor) }
+    return secure(directoryDescriptor: descriptor, at: url)
+  }
+
+  /// The same, given a descriptor the caller already holds.
+  ///
+  /// Split out so the mismatch this reports on can be handed to it directly: a
+  /// descriptor for one directory and the name of another is exactly the state
+  /// a swap leaves behind, and there is no other way to arrange it from a test
+  /// — the window it lives in is inside this call.
+  @discardableResult
+  static func secure(directoryDescriptor descriptor: Int32, at url: URL) -> Shortfall {
+    var shortfall = Shortfall()
+    let wanted = mode_t(directoryMode)
+    if fchmod(descriptor, wanted) != 0 { shortfall.insert(.permissions) }
+    var opened = stat()
+    guard fstat(descriptor, &opened) == 0 else { return [.permissions, .protection] }
+    if (opened.st_mode & 0o7777) != wanted { shortfall.insert(.permissions) }
+
+    // A conventional directory gets the mode and stops there — see
+    // `LogDirectoryClaim`. Not a shortfall: nothing failed, and nothing was
+    // supposed to happen. Reporting one would light the degradation bit on
+    // every launch for a decision this package made on purpose.
+    guard !isConventional(url) else { return shortfall }
+
+    shortfall.formUnion(protect(url, isDirectory: true))
+    if !isProtected(descriptor: descriptor) { shortfall.insert(.protection) }
     return shortfall
   }
 
@@ -328,27 +524,58 @@ internal enum LogSecureFile {
   /// can observe and the writer must be told about is also the one no test can
   /// produce — which is how it came to be discarded unnoticed in the first
   /// place.
-  private static let faultLock = NSLock()
+  /// Shared by both seams below, and named for that rather than for either.
+  private static let seamLock = NSLock()
   private static var directoryProtectionFaults: [String: Shortfall] = [:]
 
+  /// Test seam: further directories to treat as platform conventions.
+  ///
+  /// The real one is `<Library>/Logs`, which on the test host is the
+  /// developer's own — a test may not create it and must not touch its backup
+  /// policy. So the rule is exercised against a directory under the test's own
+  /// root, declared conventional here, and `isConventional` compares it by the
+  /// same identity rule it applies to the real one.
+  ///
+  /// What this replaced is why it exists. The claim used to be a parameter the
+  /// caller passed, so a test could hand `.modeOnly` straight to the securing
+  /// call — which pinned the plumbing and left the decision itself, the part
+  /// that was wrong, unexercised.
+  ///
+  /// Scoped and cleared per test, for the reason the fault map above is: the
+  /// state is process-wide, and a directory left declared conventional by one
+  /// test would silently withhold the claim from another test's directory.
+  private static var conventionalDirectoriesForTesting: Set<URL> = []
+
+  static func addConventionalDirectoryForTesting(_ url: URL) {
+    seamLock.lock()
+    conventionalDirectoriesForTesting.insert(url)
+    seamLock.unlock()
+  }
+
+  static func removeConventionalDirectoryForTesting(_ url: URL) {
+    seamLock.lock()
+    conventionalDirectoriesForTesting.remove(url)
+    seamLock.unlock()
+  }
+
   static func injectDirectoryProtectionFaultForTesting(_ shortfall: Shortfall, under root: URL) {
-    faultLock.lock()
+    seamLock.lock()
     directoryProtectionFaults[root.path] = shortfall
-    faultLock.unlock()
+    seamLock.unlock()
   }
 
   static func clearDirectoryProtectionFaultsForTesting(under root: URL) {
-    faultLock.lock()
+    seamLock.lock()
     directoryProtectionFaults.removeValue(forKey: root.path)
-    faultLock.unlock()
+    seamLock.unlock()
   }
 
   /// Path-boundary prefix match: `/a/b` covers `/a/b` and `/a/b/c`, and does
   /// NOT cover `/a/bc` — a bare `hasPrefix` would, and the UUID roots only make
   /// that collision unlikely, not impossible.
   private static func injectedFault(for url: URL) -> Shortfall {
-    faultLock.lock()
-    defer { faultLock.unlock() }
+    seamLock.lock()
+    defer { seamLock.unlock() }
     var result = Shortfall()
     for (root, fault) in directoryProtectionFaults
     where url.path == root || url.path.hasPrefix(root + "/") {
@@ -388,7 +615,7 @@ internal enum LogSecureFile {
     return shortfall
   }
 
-  /// The mode actually on disk.
+  /// The mode actually on disk, by name.
   ///
   /// Following links has to match what `chmod` just did, or the check
   /// contradicts the change. A log *directory* reached through a symlink is
@@ -397,6 +624,20 @@ internal enum LogSecureFile {
   /// report a shortfall against a target that is correctly `0700`. A log
   /// *file*, by contrast, must never be a link at all, so there `lstat` is the
   /// point: the mode of the link itself is exactly what we want to see.
+  ///
+  /// **A path read-back agrees with a path write, including when both were
+  /// redirected.** That is the limit of what this can say, and it used to be
+  /// the only thing said about it. If something replaces the name between the
+  /// `chmod` and this call, both follow the replacement and both report
+  /// success about an inode this process never made. Nothing here can detect
+  /// that, because there is a name in the question.
+  ///
+  /// Which is why the directory this call creates no longer comes through here
+  /// at all — `secure(createdDirectory:)` holds a descriptor from immediately
+  /// after the `mkdir` and asks `fstat`, where there is no name to redirect.
+  /// This remains for the artifacts reached by name and nothing else: a
+  /// pre-existing directory, which is inspected rather than changed, and the
+  /// path-based file `secure`, whose callers have no descriptor.
   static func currentMode(of url: URL, followingLinks: Bool) -> mode_t? {
     var info = stat()
     let ok = followingLinks ? stat(url.path, &info) == 0 : lstat(url.path, &info) == 0

@@ -29,7 +29,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// directory it had just created.
   func testClaimingTheRightToOpenImmediatelyForfeitsVacuousSuccess() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     XCTAssertEqual(lifecycle.currentState, .opening)
     XCTAssertFalse(lifecycle.vacuousSuccess,
@@ -40,21 +40,21 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
 
   func testASecondOpenIsRefusedWhileTheFirstIsStillAcquiring() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     // Refused rather than allowed to race: the loser's handle would be
     // unreachable, and unreachable means a later purge never deletes its files.
-    XCTAssertFalse(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .alreadyOpen)
     XCTAssertEqual(lifecycle.currentState, .opening)
   }
 
   func testASecondOpenIsRefusedOnceAHandleIsInstalled() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
 
     XCTAssertEqual(lifecycle.currentState, .open)
-    XCTAssertFalse(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .alreadyOpen)
   }
 
   // MARK: - Open failure
@@ -66,13 +66,13 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// `mayHaveArtifacts` exists to stop.
   func testAFailedOpenReturnsToClosedWithoutRegainingVacuousSuccess() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     lifecycle.failOpen()
 
     XCTAssertEqual(lifecycle.currentState, .closed)
     XCTAssertFalse(lifecycle.vacuousSuccess,
                    "acquire creates the directory before it opens the file")
-    XCTAssertTrue(lifecycle.beginOpen(), "and a retry is allowed")
+    XCTAssertEqual(lifecycle.beginOpen(), .granted, "and a retry is allowed")
   }
 
   // MARK: - Close
@@ -80,7 +80,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   func testClosingHandsTheHandleBackExactlyOnce() throws {
     let lifecycle = FileSinkLifecycle()
     let handle = try makeHandle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(handle), .installed)
 
     XCTAssertTrue(lifecycle.beginClose().handle === handle,
@@ -94,7 +94,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// Closing releases a handle; it does not unmake files.
   func testClosingNeverRestoresVacuousSuccess() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
     _ = lifecycle.beginClose()
 
@@ -104,11 +104,11 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
 
   func testAClosedSinkCanBeOpenedAgain() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
     _ = lifecycle.beginClose()
 
-    XCTAssertTrue(lifecycle.beginOpen(), "close is not terminal; dispose is")
+    XCTAssertEqual(lifecycle.beginOpen(), .granted, "close is not terminal; dispose is")
   }
 
   // MARK: - Where the artifact list comes from
@@ -118,7 +118,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   func testAClosedSinkStillKnowsWhereItsArtifactsAre() throws {
     let lifecycle = FileSinkLifecycle()
     let live = try makeHandle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(live), .installed)
     _ = lifecycle.beginClose()
 
@@ -140,7 +140,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
     let lifecycle = FileSinkLifecycle()
     let asked = logsDirectory.appendingPathComponent("nested/../app.log").path
     let live = try makeHandle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     _ = lifecycle.finishOpen(live)
 
     XCTAssertNotEqual(asked, live.filePath,
@@ -159,7 +159,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// true answer rather than a cautious one.
   func testAnOpenStillInFlightHasNothingToEnumerate() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     XCTAssertNil(lifecycle.artifactSource().path)
     XCTAssertFalse(lifecycle.vacuousSuccess, "but it has already forfeited vacuous success")
@@ -197,7 +197,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
     try makeHandle(at: link.appendingPathComponent("app.log"))
 
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     var reported: String?
     var retargetError: Error?
     XCTAssertThrowsError(
@@ -250,7 +250,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// what a support upload enumerates.
   func testAFailureBeforeResolutionRecordsNothing() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     var reported: String?
     XCTAssertThrowsError(
@@ -287,7 +287,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// registry slot with nothing able to reach it.
   func testACloseArrivingDuringAcquisitionCancelsTheOpen() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     XCTAssertNil(lifecycle.beginClose().handle, "there is no handle to hand back yet")
     XCTAssertEqual(lifecycle.currentState, .closePending,
@@ -302,11 +302,11 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// silently cancel the *next* open too.
   func testACancelledOpenDoesNotCancelTheOneAfterIt() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     _ = lifecycle.beginClose()
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .abandon)
 
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     let second = try makeHandle(at: logsDirectory.appendingPathComponent("second.log"))
     XCTAssertEqual(lifecycle.finishOpen(second), .installed)
     XCTAssertTrue(lifecycle.current() === second)
@@ -324,13 +324,13 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// does it too — so the cancellation has to survive being repeated.
   func testASecondCloseDuringAcquisitionDoesNotFreeTheSink() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     XCTAssertNil(lifecycle.beginClose().handle)
     XCTAssertNil(lifecycle.beginClose().handle)
     XCTAssertEqual(lifecycle.currentState, .closePending,
                    "the pending cancellation was spent by the repeat close")
-    XCTAssertFalse(lifecycle.beginOpen(),
+    XCTAssertEqual(lifecycle.beginOpen(), .closing,
                    "an open here would be filled by the acquisition still in flight")
 
     // The first acquisition finally lands, and is still discarded.
@@ -339,7 +339,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
     XCTAssertNil(lifecycle.current())
 
     // Only now is the sink free, and the next open gets its own handle.
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     let fresh = try makeHandle(at: logsDirectory.appendingPathComponent("fresh.log"))
     XCTAssertEqual(lifecycle.finishOpen(fresh), .installed)
     XCTAssertTrue(lifecycle.current() === fresh, "the stale acquisition must not be what got installed")
@@ -349,24 +349,24 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// terminal — the repeat-close rule must not swallow the dispose.
   func testDisposingAfterACloseDuringAcquisitionIsStillTerminal() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertNil(lifecycle.beginClose().handle)
 
     XCTAssertNil(lifecycle.beginDispose().handle)
     XCTAssertEqual(lifecycle.currentState, .disposed)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .abandon)
-    XCTAssertFalse(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .disposed)
   }
 
   /// While an open is in flight and already cancelled, another open is still
   /// refused — the sink is not free until the acquisition lands.
   func testAnOpenIsRefusedWhileACancelledAcquisitionIsStillInFlight() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     _ = lifecycle.beginClose()
 
     XCTAssertEqual(lifecycle.currentState, .closePending)
-    XCTAssertFalse(lifecycle.beginOpen(),
+    XCTAssertEqual(lifecycle.beginOpen(), .closing,
                    "the in-flight acquire has not landed; a rival would race it")
   }
 
@@ -375,17 +375,17 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   func testDisposeIsTerminalWhereCloseIsNot() throws {
     let lifecycle = FileSinkLifecycle()
     let handle = try makeHandle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(handle), .installed)
 
     XCTAssertTrue(lifecycle.beginDispose().handle === handle)
     XCTAssertEqual(lifecycle.currentState, .disposed)
-    XCTAssertFalse(lifecycle.beginOpen(), "a disposed object must not be reopened")
+    XCTAssertEqual(lifecycle.beginOpen(), .disposed, "a disposed object must not be reopened")
   }
 
   func testDisposingDuringAcquisitionAlsoDiscardsTheHandle() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
 
     XCTAssertNil(lifecycle.beginDispose().handle)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .abandon,
@@ -395,7 +395,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
 
   func testDisposingTwiceIsHarmless() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
 
     XCTAssertNotNil(lifecycle.beginDispose().handle)
@@ -413,7 +413,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// `durable: !created` used to leave every test in the repo green.
   func testAClosedSinkRefusesToCallAPurgeDurable() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
     _ = lifecycle.beginClose()
 
@@ -435,7 +435,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// have left something behind.
   func testASinkWhoseOpenFailedRefusesToCallAPurgeDurable() {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     lifecycle.failOpen()
 
     XCTAssertFalse(lifecycle.snapshot().durableWithoutHandle)
@@ -453,7 +453,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
     let winners = NSCounter()
 
     DispatchQueue.concurrentPerform(iterations: 64) { _ in
-      if lifecycle.beginOpen() { winners.increment() }
+      if lifecycle.beginOpen() == .granted { winners.increment() }
     }
 
     XCTAssertEqual(winners.value, 1)
@@ -465,7 +465,7 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
   /// writer somebody else already gave back to the registry.
   func testConcurrentClosesHandTheHandleToExactlyOneCaller() throws {
     let lifecycle = FileSinkLifecycle()
-    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.beginOpen(), .granted)
     XCTAssertEqual(lifecycle.finishOpen(try makeHandle()), .installed)
 
     let takers = NSCounter()

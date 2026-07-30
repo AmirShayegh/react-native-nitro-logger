@@ -28,6 +28,19 @@ class LogWriterTestCase: XCTestCase {
     registry = LogWriterRegistry.isolated()
   }
 
+  /// Points the "this name is a platform convention" rule at a directory this
+  /// test owns, and takes it back again afterwards.
+  ///
+  /// The real one is `<Library>/Logs`, which on this host belongs to whoever is
+  /// running the tests. Registering and unregistering here rather than in each
+  /// test keeps the seam paired: it is process-wide, and a directory left
+  /// declared conventional would silently withhold the claim from a parallel
+  /// test's directory of the same name.
+  func declareConventional(_ url: URL) {
+    LogSecureFile.addConventionalDirectoryForTesting(url)
+    addTeardownBlock { LogSecureFile.removeConventionalDirectoryForTesting(url) }
+  }
+
   override func tearDownWithError() throws {
     // Release any stall first: closing a handle waits on the write queue.
     stalls.forEach { $0() }

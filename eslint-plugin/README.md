@@ -157,6 +157,14 @@ functional bug: `Log.subsystem('network', 'debug')` can only match names known
 at configuration time, so a dynamic name silently misses every level override
 the app configured.
 
+This covers the package's free functions as well as its methods —
+`installErrorHandler({ subsystem })` tags every uncaught-error entry with a name
+that renders unredacted, and it is checked the same way. Free functions are
+matched by **import**, not by name: an `installErrorHandler` of your own is not
+this package's, and demanding a literal of it would be a false positive on
+unrelated code. The cost is that a re-export barrel is not followed — add the
+barrel's module path to `loggerModules` and it is.
+
 ## Options
 
 Every rule accepts `loggerNames`, `loggerModules`, and `singletonName`.

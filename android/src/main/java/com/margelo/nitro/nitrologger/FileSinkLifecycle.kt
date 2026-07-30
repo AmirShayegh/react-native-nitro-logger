@@ -78,6 +78,31 @@ internal class FileSinkLifecycle {
 
   enum class State { IDLE, OPENING, OPEN, CLOSE_PENDING, CLOSED, DISPOSED }
 
+  /**
+   * Whether [beginOpen] granted the claim, and if not, why.
+   *
+   * A boolean here meant one error string for four different situations, and
+   * one of them is not like the others: [CLOSING] is *temporary*. A close
+   * arriving during an in-flight open leaves this sink in
+   * [State.CLOSE_PENDING] until the acquisition it is cancelling comes back,
+   * which is bounded by the registry's close wait and can genuinely be
+   * seconds. "already open" tells a caller to stop; "still being cancelled"
+   * tells it to retry, and only one of those is true here.
+   */
+  enum class Claim {
+    /** The caller may proceed with acquisition. */
+    GRANTED,
+
+    /** A handle is installed, or an acquisition is already in flight. */
+    ALREADY_OPEN,
+
+    /** An earlier open is still being cancelled. Retrying is reasonable. */
+    CLOSING,
+
+    /** Terminal. Retrying is not. */
+    DISPOSED
+  }
+
   /** What [finishOpen] tells the caller to do with the handle it acquired. */
   enum class Installation {
     /** The handle now belongs to this object. */
@@ -169,14 +194,24 @@ internal class FileSinkLifecycle {
    * Deliberately takes no path. `mayHaveArtifacts` is a bit and can be set from
    * a guess; [openedPath] is a name something will be opened by, and the only
    * safe source for it is the registry — see [openedPath].
+   *
+   * **A granted claim must be given back**, by [finishOpen] or by [failOpen],
+   * on every path out of the caller. There is nothing here that can enforce
+   * that: an early `return` or a `throw` added between the two leaves this
+   * object in [State.OPENING] for the life of the process, and every later
+   * open is refused by a sink that is not open. Both adapters funnel their
+   * failure paths through a single `catch` for exactly this reason, and that
+   * is a convention rather than a guarantee.
    */
-  fun beginOpen(): Boolean = lock.withLock {
+  fun beginOpen(): Claim = lock.withLock {
     when (state) {
-      State.OPEN, State.OPENING, State.CLOSE_PENDING, State.DISPOSED -> false
+      State.OPEN, State.OPENING -> Claim.ALREADY_OPEN
+      State.CLOSE_PENDING -> Claim.CLOSING
+      State.DISPOSED -> Claim.DISPOSED
       State.IDLE, State.CLOSED -> {
         state = State.OPENING
         created = true
-        true
+        Claim.GRANTED
       }
     }
   }

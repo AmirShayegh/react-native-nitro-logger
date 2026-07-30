@@ -211,6 +211,176 @@ final class LogSecureFileTests: LogWriterTestCase {
     XCTAssertTrue(isExcludedFromBackup(leaf))
   }
 
+  /// A conventional directory this call creates gets the mode and stops there.
+  ///
+  /// `<Library>/Logs` is where an iOS app is expected to put logs, so the host
+  /// app and any other library in the process may use it. On a fresh container
+  /// the first `open` wins the `mkdir`, and winning that race is not ownership:
+  /// the two *directory-wide* protections outlive this sink and are invisible
+  /// to the app — the backup exclusion silently takes everything anyone later
+  /// puts in `Logs` out of iCloud backup, and the protection class is inherited
+  /// by files this package never writes.
+  ///
+  /// The mode is applied anyway, and that asymmetry is the point: `0700` on a
+  /// directory that did not exist a moment ago takes nothing from anyone.
+  /// The real conventional directory is `<Library>/Logs`, which on this host is
+  /// the developer's own — a test may not create it and must not touch its
+  /// backup policy — so the rule is pointed at a directory under this test's
+  /// root instead. What it exercises is the decision itself: the claim used to
+  /// be a parameter, and a test that passed `.modeOnly` in pinned the plumbing
+  /// while leaving the part that was wrong — which directory that is —
+  /// unexercised.
+  func testAConventionalDirectoryIsCreatedButNotClaimed() throws {
+    // Directly under `root`, which nothing has claimed. Under `logsDirectory`
+    // the assertion could not isolate the leaf: the exclusion on a directory
+    // reads back as set on everything inside it, so a claimed parent answers
+    // for its children and the test would pass whatever this call did.
+    let leaf = root.appendingPathComponent("conventional")
+    declareConventional(leaf)
+
+    let shortfall = try LogSecureFile.createDirectory(at: leaf)
+
+    XCTAssertTrue(shortfall.isEmpty,
+                  "nothing failed; the claim was withheld on purpose, which is not a shortfall")
+    XCTAssertEqual(mode(of: leaf), 0o700, "the mode is still ours to set")
+    XCTAssertFalse(isExcludedFromBackup(leaf),
+                   "a directory-wide backup exclusion would cover files this package never writes")
+  }
+
+  /// The same directory reached by another name is the same directory.
+  ///
+  /// This decision used to be made in the Nitro adapter, comparing the caller's
+  /// string against the default directory before anything resolved either — and
+  /// a second spelling of one path defeats that: `/var` against `/private/var`,
+  /// a container reached through a link, a relative path. The comment there
+  /// claimed getting it wrong could only claim *less*. It was the other way
+  /// round, on the one directory that must not be claimed at all.
+  func testTheConventionalDirectoryIsRecognizedThroughAnotherSpelling() throws {
+    let container = root.appendingPathComponent("container")
+    try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+    let link = root.appendingPathComponent("link")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: container)
+
+    // Declared under its resolved name; asked for under the link's.
+    let canonical = container.appendingPathComponent("Logs")
+    declareConventional(canonical)
+
+    try LogSecureFile.createDirectory(at: link.appendingPathComponent("Logs"))
+
+    XCTAssertEqual(mode(of: canonical), 0o700)
+    XCTAssertFalse(isExcludedFromBackup(canonical),
+                   "a spelling the comparison did not recognize would have claimed it in full")
+  }
+
+  /// And the decision is per directory, not per call.
+  ///
+  /// A caller asking for `<Library>/Logs/mine` gets `Logs` created on the way
+  /// past, as an intermediate. That is the same conventional directory it would
+  /// have been as a leaf, and it was being claimed in full — a claim threaded
+  /// down from the caller can only ever describe the last component.
+  func testAConventionalDirectoryCreatedAsAnIntermediateIsNotClaimedEither() throws {
+    let conventional = root.appendingPathComponent("conventional")
+    declareConventional(conventional)
+    let leaf = conventional.appendingPathComponent("mine")
+
+    try LogSecureFile.createDirectory(at: leaf)
+
+    XCTAssertEqual(mode(of: conventional), 0o700)
+    XCTAssertFalse(isExcludedFromBackup(conventional),
+                   "created on the way past, and no more ours for that")
+    XCTAssertTrue(isExcludedFromBackup(leaf),
+                  "the name the caller chose is claimed as fully as ever")
+  }
+
+  /// And the artifacts inside it lose nothing, which is what makes the above
+  /// safe rather than merely polite.
+  ///
+  /// The directory-wide settings were never what protected the log files: every
+  /// artifact is secured through its own descriptor when it is created.
+  func testArtifactsInAnUnclaimedDirectoryStillGetEverything() throws {
+    let leaf = root.appendingPathComponent("conventional")
+    declareConventional(leaf)
+    try LogSecureFile.createDirectory(at: leaf)
+    let file = leaf.appendingPathComponent("app.log")
+
+    let handle = try makeHandle(at: file)
+    write(handle, "record\n")
+
+    XCTAssertEqual(mode(of: file), 0o600)
+    XCTAssertTrue(isExcludedFromBackup(file),
+                  "the file carries its own exclusion, directory or no directory")
+  }
+
+  /// The claim on a created directory is bound to the inode, not to the name.
+  ///
+  /// `createDirectory` only reaches this straight after its own `mkdir`, so in
+  /// production the name really does lead to the directory this process made —
+  /// but "leads there now" is precisely what a path-based `chmod` assumes and
+  /// cannot check. Rename the new directory away, drop a link at the name, and
+  /// `chmod` follows it; so does a path read-back, so the two agree about an
+  /// inode nobody here created.
+  ///
+  /// Handed a symlink, the descriptor path refuses outright rather than
+  /// applying this package's policy — a persistent, directory-wide backup
+  /// exclusion, and a protection class every later child inherits — to a
+  /// directory somebody else owns.
+  func testSecuringACreatedDirectoryRefusesToFollowASymlink() throws {
+    let target = root.appendingPathComponent("someone-elses")
+    try FileManager.default.createDirectory(
+      at: target, withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o755])
+    let link = root.appendingPathComponent("link")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+    let shortfall = LogSecureFile.secure(createdDirectory: link)
+
+    XCTAssertTrue(shortfall.contains(.permissions))
+    XCTAssertTrue(shortfall.contains(.protection))
+    XCTAssertEqual(mode(of: target), 0o755,
+                   "the directory behind the link keeps its own mode")
+    XCTAssertFalse(isExcludedFromBackup(target),
+                   "and its backup policy is still its own")
+  }
+
+  /// A directory that is no longer at the name is reported, never called
+  /// secured.
+  ///
+  /// `O_NOFOLLOW` refuses a *symlink* sitting at the name when the securing
+  /// call opens it, which is the case above. This is the other window: a
+  /// replacement arriving once the descriptor is already held. The protection
+  /// class and the backup exclusion have no descriptor-based setter, so they go
+  /// out through the path, and the only reason that is acceptable is that what
+  /// they did is read back through the descriptor — so they are reported as
+  /// missing rather than applied.
+  ///
+  /// Not every window is covered, and this test does not pretend otherwise: a
+  /// real directory swapped in between the `mkdir` and the `open` is neither
+  /// refused nor detected, because the descriptor is then the replacement and
+  /// everything below agrees about it. All of these need write access to the
+  /// parent — code already running as this app, which can read the log files
+  /// anyway. See `secure(createdDirectory:)`.
+  ///
+  /// A descriptor for one directory and the name of another is exactly the
+  /// state that swap leaves behind, so it is handed over directly — the window
+  /// it lives in is inside the call, and there is no other way to be in it.
+  func testSecuringADirectoryTheNameNoLongerLeadsToIsReportedAsAShortfall() throws {
+    let held = root.appendingPathComponent("held")
+    try FileManager.default.createDirectory(at: held, withIntermediateDirectories: true)
+    let decoy = root.appendingPathComponent("decoy")
+    try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+
+    let descriptor = open(held.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    XCTAssertGreaterThanOrEqual(descriptor, 0)
+    defer { close(descriptor) }
+
+    let shortfall = LogSecureFile.secure(directoryDescriptor: descriptor, at: decoy)
+
+    XCTAssertTrue(shortfall.contains(.protection),
+                  "the protections went to the name, and the name is not this directory")
+    XCTAssertFalse(isExcludedFromBackup(held),
+                   "which the descriptor read-back is the only way to notice")
+  }
+
   /// A leaf that is not a directory at all fails the call outright.
   ///
   /// `mkdir` answers `EEXIST` for a plain file exactly as it does for a

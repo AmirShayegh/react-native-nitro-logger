@@ -2098,6 +2098,159 @@ function metadataArguments(context, call) {
       if (property.kind !== 'absent') results.push(property);
     }
   }
+  // One node, one result. An options object nobody can read is unreadable for
+  // every field at once — a spread or a computed key makes `optionsProperty`
+  // hand back the *same* wildcard node for `metadata` and for `scopeMetadata`
+  // — and the loop above would otherwise return it once per field. That is two
+  // errors at byte-identical ranges on a single `...opts`, which reads as two
+  // problems and is one.
+  //
+  // Identity, not position: two real fields always have distinct value nodes,
+  // so nothing legitimate collapses. `{ metadata: x, scopeMetadata: x }` is two
+  // references to `x` and therefore two nodes.
+  const seen = new Set();
+  return results.filter((result) => {
+    if (seen.has(result.node)) return false;
+    seen.add(result.node);
+    return true;
+  });
+}
+
+/* -------------------------------------------------------------------------
+ * Free functions
+ * ---------------------------------------------------------------------- */
+
+/**
+ * The package's own exported free functions, and which fields of their options
+ * object feed a channel a rule polices.
+ *
+ * Every subsystem and correlation rule here is built around a receiver, and a
+ * free function has none — `classifyReceiver` has nothing to classify, so
+ * `installErrorHandler({ subsystem: patientId })` was invisible to the whole
+ * plugin. It is not a marginal channel: that name is attached to every
+ * uncaught-error entry the handler emits and renders unredacted in each one.
+ *
+ * Enumerated rather than discovered, and pinned against the real option
+ * interfaces by a test in `eslintPlugin.test.js`. The failure this table has to
+ * survive is a new integration, or a new field on an existing one, that carries
+ * a channel nobody wired up — which is exactly how this gap opened.
+ *
+ * `flushOnBackground` is listed with no channels on purpose. It takes an
+ * options object and none of its fields reach a policed channel today; leaving
+ * it out entirely would make "absent from the table" ambiguous between
+ * "checked, nothing to check" and "never considered".
+ */
+const FREE_FUNCTION_OPTION_CHANNELS = {
+  installErrorHandler: { subsystem: ['subsystem'] },
+  flushOnBackground: {},
+};
+
+/**
+ * The exported name a callee resolves to, or null when it is not ours.
+ *
+ * Verified by import, not by name, for the reason `isLoggerImport` gives: an
+ * application's own `installErrorHandler` is not this package's, and demanding
+ * a literal subsystem of it would be a false positive on unrelated code. So the
+ * binding has to be an import whose *imported* name is in the table — aliasing
+ * on the way in changes the local spelling and nothing else — and whose module
+ * is one that ships this package.
+ *
+ * The cost of that strictness, stated rather than hidden: a re-export barrel is
+ * not followed. `import { installErrorHandler } from './logging'` is unchecked
+ * until './logging' is added to `loggerModules`, which is what that option is
+ * for. Following arbitrary re-exports would mean resolving modules from a lint
+ * rule, and the same trade is already made for the Logger itself.
+ */
+function integrationName(context, callee) {
+  const current = unwrap(callee);
+  if (!current) return null;
+
+  // `installErrorHandler(…)`, under whatever local name the import gave it.
+  //
+  // A *named* import and nothing else. A default import binds whatever the
+  // module's default export happens to be, and its local spelling is the
+  // author's choice — `import installErrorHandler from '…'` says nothing about
+  // what it received, so reading the local name there would lint a function
+  // this package never exported on the strength of its variable name.
+  if (current.type === 'Identifier') {
+    const def = importDefFrom(context, current);
+    if (!def || def.node.type !== 'ImportSpecifier') return null;
+    // `imported` is a Literal for a string-named import (`{ 'a-b' as x }`),
+    // which has no `.name` and is therefore not in the table.
+    return knownIntegration(def.node.imported?.name);
+  }
+
+  // `import * as logger from '…'; logger.installErrorHandler(…)` reaches the
+  // identical function, and a namespace import is the ordinary way to write it.
+  if (current.type === 'MemberExpression') {
+    const property = staticPropertyName(context, current);
+    if (property === null) return null;
+    const object = unwrap(current.object);
+    if (!object || object.type !== 'Identifier') return null;
+    const def = importDefFrom(context, object);
+    if (!def || def.node.type !== 'ImportNamespaceSpecifier') return null;
+    return knownIntegration(property);
+  }
+
+  return null;
+}
+
+/** The import this identifier binds to, if it came from a module we ship. */
+function importDefFrom(context, identifier) {
+  const def = singleDef(resolveVariable(context, identifier));
+  if (!def || def.type !== 'ImportBinding') return null;
+  const source = def.parent?.source?.value;
+  if (typeof source !== 'string' || !loggerModules(context).has(source)) {
+    return null;
+  }
+  return def;
+}
+
+function knownIntegration(name) {
+  return typeof name === 'string' &&
+    Object.prototype.hasOwnProperty.call(FREE_FUNCTION_OPTION_CHANNELS, name)
+    ? name
+    : null;
+}
+
+/**
+ * A call to one of this package's free functions.
+ *
+ * Returns null for anything else, including a locally declared function that
+ * merely shares the name — that one is provably not ours.
+ */
+function describeIntegrationCall(context, node) {
+  if (!node || node.type !== 'CallExpression') return null;
+  const name = integrationName(context, node.callee);
+  if (!name) return null;
+  return {
+    name,
+    node,
+    args: node.arguments,
+    spreadArgs: node.arguments.some((a) => a.type === 'SpreadElement'),
+  };
+}
+
+/**
+ * Argument positions carrying a subsystem name in a free-function call.
+ *
+ * The spread case is answered here rather than by the rule, because it is the
+ * same question: whether *this* function has a subsystem channel at all. A
+ * spread hides the options object, so for a function that takes a subsystem the
+ * name is somewhere unreadable rather than provably absent — reported against
+ * the call, which is the only node there is. For a function that takes none —
+ * `flushOnBackground` — there was never anything to read, and reporting its
+ * spread would be an error about a channel that does not exist.
+ */
+function integrationSubsystemArguments(context, call) {
+  const fields = FREE_FUNCTION_OPTION_CHANNELS[call.name]?.subsystem ?? [];
+  if (fields.length === 0) return [];
+  if (call.spreadArgs) return [{ kind: 'unanalyzable', node: call.node }];
+  const results = [];
+  for (const field of fields) {
+    const property = optionsProperty(context, call.args[0], field);
+    if (property.kind !== 'absent') results.push(property);
+  }
   return results;
 }
 
@@ -2133,6 +2286,7 @@ function correlationArguments(context, call) {
 module.exports = {
   API_METHODS,
   CONFIG_METHODS,
+  FREE_FUNCTION_OPTION_CHANNELS,
   LEVEL_METHODS,
   LOGGER_OWN_METHODS,
   LOG_METHODS,
@@ -2143,9 +2297,11 @@ module.exports = {
   classifyReceiver,
   correlationArguments,
   describeCall,
+  describeIntegrationCall,
   describeLogCall,
   describeScopedCall,
   describeSubsystemConfigCall,
+  integrationSubsystemArguments,
   isMutable,
   isOmitted,
   isStaticMessage,

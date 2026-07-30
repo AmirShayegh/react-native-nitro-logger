@@ -2,9 +2,11 @@
 
 const {
   RECEIVER_OPTION_PROPERTIES,
+  describeIntegrationCall,
   describeLogCall,
   describeScopedCall,
   describeSubsystemConfigCall,
+  integrationSubsystemArguments,
   isOmitted,
   isStaticString,
   maybeLogger,
@@ -66,6 +68,30 @@ module.exports = {
             return;
           }
           for (const result of subsystemArguments(context, call)) {
+            if (result.kind === 'unanalyzable') {
+              context.report({ node: result.node, messageId: 'unanalyzable' });
+            } else {
+              check(result.node);
+            }
+          }
+          return;
+        }
+
+        // `installErrorHandler({ subsystem })` — a free function, so nothing
+        // above sees it: every check up to here starts from a receiver, and
+        // this has none. The name still rides every entry the handler emits.
+        //
+        // The spread case is not special-cased here, unlike the receiver-based
+        // branches below: which functions even *have* a subsystem to hide is a
+        // property of the table, so it is answered where the table is read.
+        // Reporting every spread from here would flag `flushOnBackground(...a)`
+        // for a channel it does not have.
+        const integration = describeIntegrationCall(context, node);
+        if (integration) {
+          for (const result of integrationSubsystemArguments(
+            context,
+            integration
+          )) {
             if (result.kind === 'unanalyzable') {
               context.report({ node: result.node, messageId: 'unanalyzable' });
             } else {

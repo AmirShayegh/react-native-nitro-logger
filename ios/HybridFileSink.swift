@@ -32,10 +32,21 @@ final class HybridFileSink: HybridFileSinkSpec {
     _ = lifecycle.beginDispose().handle?.close(deadlineMs: 0)
   }
 
+  /// `<Library>/Logs` — and deliberately not a second spelling of it.
+  ///
+  /// The securing layer declines to make a directory-wide claim on this
+  /// directory, because it is where an iOS app is *expected* to put logs: the
+  /// host app and any other library in the process may use it too, and on a
+  /// fresh container the first `open` simply wins the `mkdir`. Winning that
+  /// race is not ownership. Every artifact this writer creates still gets all
+  /// three protections through its own descriptor — see `LogDirectoryClaim`.
+  ///
+  /// That decision is made against `LogSecureFile.conventionalLogDirectory`, so
+  /// this reads the same definition rather than restating it. The directory the
+  /// package hands out by default has to be exactly the directory it declines
+  /// to claim, and two copies of that expression is how they stop being.
   var defaultLogDirectory: String {
-    let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
-      ?? FileManager.default.temporaryDirectory
-    return base.appendingPathComponent("Logs").path
+    LogSecureFile.conventionalLogDirectory.path
   }
 
   func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws {
@@ -43,8 +54,21 @@ final class HybridFileSink: HybridFileSinkSpec {
     // handle would be unreachable, and unreachable means a later purge never
     // deletes its files. The lock is not held across the acquisition, which
     // does real I/O — see `FileSinkLifecycle`.
-    guard lifecycle.beginOpen() else {
+    //
+    // The refusal says which refusal it is. "Already open" and "an earlier open
+    // is still being cancelled" are different instructions to the caller: the
+    // second is temporary, bounded by the registry's close wait, and retrying
+    // is the right response to it.
+    switch lifecycle.beginOpen() {
+    case .granted:
+      break
+    case .alreadyOpen:
       throw RuntimeError.error(withMessage: "FileSink: already open")
+    case .closing:
+      throw RuntimeError.error(
+        withMessage: "FileSink: an earlier open on this sink is still being cancelled; retry")
+    case .disposed:
+      throw RuntimeError.error(withMessage: "FileSink: this sink has been disposed")
     }
 
     // Written by `acquire` the moment it resolves, so the failure path below

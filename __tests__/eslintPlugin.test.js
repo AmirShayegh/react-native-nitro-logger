@@ -13,6 +13,10 @@ const plugin = require('../eslint-plugin');
  * values are strings, which no escape can alter.
  */
 const IMPORT_LOG = "import { Log } from 'react-native-nitro-logger';";
+const IMPORT_INSTALL =
+  "import { installErrorHandler } from 'react-native-nitro-logger';";
+const IMPORT_FLUSH =
+  "import { flushOnBackground } from 'react-native-nitro-logger';";
 
 const ruleTester = new RuleTester({
   languageOptions: {
@@ -908,6 +912,28 @@ describe('no-computed-metadata-key', () => {
           code: "Log.log('m', { metadata: { [a]: 1 }, scopeMetadata: { [b]: 2 } });",
           errors: [{ messageId: 'computed' }, { messageId: 'computed' }],
         },
+        // And the converse: an options object nobody can read is ONE finding,
+        // not one per field. A spread or a computed key makes every field
+        // unreadable at the same node, and the field loop used to return that
+        // node once for `metadata` and again for `scopeMetadata` — two errors
+        // at byte-identical ranges, on a single `...opts`, with one edit that
+        // fixes both. Deduplicated by node; these four were 2-for-1 before.
+        {
+          code: "Log.log('m', { ...opts });",
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        {
+          code: "Log.log('m', { [k]: 1 });",
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        {
+          code: "Log.logMessage('m', { ...opts });",
+          errors: [{ messageId: 'unanalyzable' }],
+        },
+        {
+          code: "Log.logMessage('m', { [k]: 1 });",
+          errors: [{ messageId: 'unanalyzable' }],
+        },
       ],
     }
   );
@@ -1133,6 +1159,32 @@ describe('literal-subsystem', () => {
       // metadata and must not be flagged.
       "const s = Log.scoped('c'); s.info('m', { state: 'x' });",
       "const s = Log.scoped('c'); s.log('m', 'info', { state: 'x' });",
+      // Free functions. Every check in this rule starts from a receiver, and
+      // these have none, so `installErrorHandler({ subsystem })` was invisible
+      // to the entire plugin — on a name that rides every uncaught-error entry
+      // the handler emits and renders unredacted in each one.
+      `${IMPORT_INSTALL} installErrorHandler({ subsystem: 'crash' });`,
+      `${IMPORT_INSTALL} installErrorHandler();`,
+      `${IMPORT_INSTALL} installErrorHandler({ fatalFlushMs: budget });`,
+      // No subsystem field on this one, so nothing to demand a literal of.
+      `${IMPORT_FLUSH} flushOnBackground({ deadlineMs: budget });`,
+      // And a spread hides nothing when there is nothing to hide. Which
+      // functions have a subsystem at all is the table's answer, so a rule that
+      // reported every spread it recognized would flag this one for a channel
+      // `flushOnBackground` does not have.
+      `${IMPORT_FLUSH} flushOnBackground(...args);`,
+      // A default import binds whatever the module's default export is, and its
+      // local spelling is the author's choice. Treating that name as the named
+      // export would lint a function this package never exported on the
+      // strength of a variable name.
+      "import installErrorHandler from 'react-native-nitro-logger'; installErrorHandler({ subsystem: patientId });",
+      // Provably not ours: a local declaration shadowing the name. Reporting
+      // it would be a false positive on somebody else's function.
+      'function installErrorHandler(o) {} installErrorHandler({ subsystem: patientId });',
+      // Name is not provenance — the same rule `isLoggerImport` follows. The
+      // cost is a re-export barrel: this is unchecked until './phi-helpers'
+      // is added to `loggerModules`, which is what that option is for.
+      "import { installErrorHandler } from './phi-helpers'; installErrorHandler({ subsystem: patientId });",
     ],
     invalid: [
       {
@@ -1172,6 +1224,44 @@ describe('literal-subsystem', () => {
       {
         code: 'class A { m() { this.logger.subsystem(name, "debug"); } }',
         errors: [{ messageId: 'dynamic' }],
+      },
+      // The free-function channel, which had no coverage at all.
+      {
+        code: `${IMPORT_INSTALL} installErrorHandler({ subsystem: patientId });`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_INSTALL} installErrorHandler({ subsystem: \`p-\${id}\` });`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Aliasing changes the local spelling and nothing else, so the table is
+      // keyed on the imported name.
+      {
+        code: "import { installErrorHandler as install } from 'react-native-nitro-logger'; install({ subsystem: patientId });",
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A namespace import reaches the identical function and is the ordinary
+      // way to write it.
+      {
+        code: "import * as nl from 'react-native-nitro-logger'; nl.installErrorHandler({ subsystem: patientId });",
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Configure the barrel and it is followed — the negative fixture above
+      // is a configuration boundary, not a blind spot.
+      {
+        code: "import { installErrorHandler } from './logging'; installErrorHandler({ subsystem: patientId });",
+        options: [{ loggerModules: ['./logging'] }],
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_INSTALL} installErrorHandler(optionsFromElsewhere);`,
+        errors: [{ messageId: 'unanalyzable' }],
+      },
+      // The options object is the only argument, so a spread puts the
+      // subsystem somewhere unreadable rather than provably absent.
+      {
+        code: `${IMPORT_INSTALL} installErrorHandler(...args);`,
+        errors: [{ messageId: 'unanalyzable' }],
       },
     ],
   });
@@ -1578,6 +1668,89 @@ describe('plugin configs', () => {
       .sort();
 
     expect(carriesMetadata).toEqual([...METADATA_OPTION_FIELDS].sort());
+  });
+
+  /**
+   * The same pin for the free functions, which had no model at all.
+   *
+   * `FREE_FUNCTION_OPTION_CHANNELS` is the plugin's whole knowledge of what an
+   * exported free function can carry. Two ways for it to go quietly wrong, and
+   * this covers both: a new integration exporting an options-taking function
+   * nobody added, and a new `subsystem` field on one that is already listed.
+   * Either is a channel that renders unredacted with nothing checking it,
+   * which is exactly how `installErrorHandler({ subsystem })` came to be
+   * invisible to every rule here.
+   *
+   * Read from the TypeScript AST for the reason above: an assertion against a
+   * restated list only ever proves the list matches itself.
+   */
+  test('the free-function model matches the integrations it describes', () => {
+    const ts = require('typescript');
+    const { readFileSync, readdirSync } = require('fs');
+    const { join } = require('path');
+    const {
+      FREE_FUNCTION_OPTION_CHANNELS,
+    } = require('../eslint-plugin/shared');
+
+    const directory = join(__dirname, '..', 'src', 'integrations');
+    /** `name -> Set(option field names)` for every exported free function
+     * whose first parameter is an interface declared in the same file. */
+    const exported = new Map();
+
+    for (const entry of readdirSync(directory)) {
+      if (!entry.endsWith('.ts')) continue;
+      const path = join(directory, entry);
+      const file = ts.createSourceFile(
+        path,
+        readFileSync(path, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS
+      );
+
+      /** `interface Name` -> its property names, for this file only. */
+      const interfaces = new Map();
+      for (const statement of file.statements) {
+        if (!ts.isInterfaceDeclaration(statement)) continue;
+        interfaces.set(
+          statement.name.text,
+          statement.members
+            .filter((m) => ts.isPropertySignature(m))
+            .map((m) => m.name.getText(file))
+        );
+      }
+
+      for (const statement of file.statements) {
+        if (!ts.isFunctionDeclaration(statement) || !statement.name) continue;
+        const isExported = (statement.modifiers ?? []).some(
+          (m) => m.kind === ts.SyntaxKind.ExportKeyword
+        );
+        if (!isExported) continue;
+        const first = statement.parameters[0];
+        if (!first?.type) continue;
+        const typeName = first.type.getText(file).replace(/\s/g, '');
+        if (!interfaces.has(typeName)) continue;
+        exported.set(statement.name.text, new Set(interfaces.get(typeName)));
+      }
+    }
+
+    // Guards the parse. A rename that made the walk find nothing would
+    // otherwise satisfy every comparison below.
+    expect(exported.size).toBeGreaterThan(1);
+
+    expect([...exported.keys()].sort()).toEqual(
+      Object.keys(FREE_FUNCTION_OPTION_CHANNELS).sort()
+    );
+
+    // And the channels themselves: a function is listed as carrying a
+    // subsystem exactly when its options interface declares that field.
+    for (const [name, fields] of exported) {
+      const declared = fields.has('subsystem') ? ['subsystem'] : [];
+      expect([
+        name,
+        FREE_FUNCTION_OPTION_CHANNELS[name].subsystem ?? [],
+      ]).toEqual([name, declared]);
+    }
   });
 
   test('every rule declares the options it reads', () => {

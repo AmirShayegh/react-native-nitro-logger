@@ -48,7 +48,7 @@ import Foundation
 ///
 /// | Operation | Linearizes at |
 /// | --- | --- |
-/// | `open` (start) | `beginOpen()` returning `true` — `idle`/`closed` → `opening`. From here a rival `open` is refused, and the sink is no longer "closed" to a racing `close`. |
+/// | `open` (start) | `beginOpen()` returning `.granted` — `idle`/`closed` → `opening`. From here a rival `open` is refused, and the sink is no longer "closed" to a racing `close`. The refusal names its reason: `.closing` is temporary and worth retrying, `.alreadyOpen` and `.disposed` are not. |
 /// | `open` (finish) | `finishOpen(_:)` — `opening` → `open` (installed) or `closePending` → `closed` (abandoned). |
 /// | `open` (failure) | `failOpen()` — `opening` → `closed`. |
 /// | `close` | `beginClose()` — whichever of the handle detach or the `closePending` record applies. |
@@ -139,6 +139,26 @@ final class FileSinkLifecycle {
     case open
     case closePending
     case closed
+    case disposed
+  }
+
+  /// Whether `beginOpen` granted the claim, and if not, why.
+  ///
+  /// A boolean here meant one error string for four different situations, and
+  /// one of them is not like the others: `closing` is *temporary*. A close
+  /// arriving during an in-flight open leaves this sink in `.closePending`
+  /// until the acquisition it is cancelling comes back, which is bounded by
+  /// the registry's close wait and can genuinely be seconds. "Already open"
+  /// tells a caller to stop; "still being cancelled" tells it to retry, and
+  /// only one of those is true here.
+  enum Claim: Equatable {
+    /// The caller may proceed with acquisition.
+    case granted
+    /// A handle is installed, or an acquisition is already in flight.
+    case alreadyOpen
+    /// An earlier open is still being cancelled. Retrying is reasonable.
+    case closing
+    /// Terminal. Retrying is not.
     case disposed
   }
 
@@ -242,16 +262,28 @@ final class FileSinkLifecycle {
   /// Deliberately takes no path. `mayHaveArtifacts` is a bit and can be set
   /// from a guess; `openedPath` is a name something will be opened by, and the
   /// only safe source for it is the registry — see `openedPath`.
-  func beginOpen() -> Bool {
+  ///
+  /// **A granted claim must be given back**, by `finishOpen` or by `failOpen`,
+  /// on every path out of the caller. There is nothing here that can enforce
+  /// that: an early `return` or a `throw` added between the two leaves this
+  /// object in `.opening` for the life of the process, and every later open is
+  /// refused by a sink that is not open. Both adapters funnel their failure
+  /// paths through a single `catch` for exactly this reason, and that is a
+  /// convention rather than a guarantee.
+  func beginOpen() -> Claim {
     lock.lock()
     defer { lock.unlock() }
     switch state {
-    case .open, .opening, .closePending, .disposed:
-      return false
+    case .open, .opening:
+      return .alreadyOpen
+    case .closePending:
+      return .closing
+    case .disposed:
+      return .disposed
     case .idle, .closed:
       state = .opening
       created = true
-      return true
+      return .granted
     }
   }
 

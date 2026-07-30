@@ -337,8 +337,37 @@ those would silently take your whole document tree out of iCloud backup.
 
 So if the directory was already there, the writer leaves it exactly as it found
 it and reports a loose mode as a `protection` degradation for you to act on. If
-the writer created the directory, it is unambiguously the writer's and gets all
-three. *Files* are different and always get all three: a log file at the log
+the writer created the directory, it is the writer's and gets all three — with
+one exception, below.
+
+**The exception is the default iOS directory, which the writer creates but does
+not claim.** `<Library>/Logs` is where an iOS app is *expected* to put logs, so
+your app and any other library in the process may be using it too; on a fresh
+install whoever opens first simply wins the `mkdir`, and winning that race is
+not ownership. Claiming it would apply a persistent, directory-wide backup
+exclusion and an inherited protection class to a conventional directory, and you
+would have no way to see that it had happened. So a directory the writer creates
+at the default path gets the `0700` mode — which takes nothing from anyone,
+since the directory did not exist a moment earlier — and neither of the two
+directory-wide settings.
+
+That is decided by the directory's name and not by who asked for it, so spelling
+`<Library>/Logs` out yourself gets the same restraint as taking the default —
+the reason to hold back is that your app is entitled to that directory, and that
+is true however the writer arrived at it. It is recognized by identity rather
+than by spelling, so a path that reaches it through a symlink is the same
+directory, and it is decided for each level the writer creates, so asking for
+`<Library>/Logs/mine` does not claim `Logs` on the way past. Any other directory
+you name is yours to give away and is still claimed in full.
+
+Nothing is lost by that. Every artifact the writer creates gets all three
+explicitly through its own descriptor, so the log files carry their own
+protection whether or not the directory carries any. The directory-wide settings
+were never what protected them. Android has no equivalent case: its default is
+`<noBackupFilesDir>/logs`, a name this package chose, and the backup behaviour
+there comes from the path rather than from anything the writer applies.
+
+*Files* are different and always get all three: a log file at the log
 path is one the writer is about to append to, rotate and purge, so it counts as
 its own even if it was already there — and a `0644` log file left by an earlier
 version is exactly the thing worth tightening. Android has nothing to scope —

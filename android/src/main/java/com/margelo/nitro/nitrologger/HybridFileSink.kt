@@ -110,10 +110,24 @@ class HybridFileSink : HybridFileSinkSpec() {
     // handle would be unreachable, and unreachable means a later purge never
     // deletes its files. The lock is not held across the acquisition, which
     // does real I/O — see [FileSinkLifecycle].
-    if (!lifecycle.beginOpen()) {
-      throw LogWriterException(
+    //
+    // The refusal says which refusal it is. "Already open" and "an earlier open
+    // is still being cancelled" are different instructions to the caller: the
+    // second is temporary, bounded by the registry's close wait, and retrying
+    // is the right response to it.
+    when (lifecycle.beginOpen()) {
+      FileSinkLifecycle.Claim.GRANTED -> Unit
+      FileSinkLifecycle.Claim.ALREADY_OPEN -> throw LogWriterException(
         LogWriterException.Kind.CONFIG_CONFLICT,
         "this sink is already open"
+      )
+      FileSinkLifecycle.Claim.CLOSING -> throw LogWriterException(
+        LogWriterException.Kind.STILL_CLOSING,
+        "an earlier open on this sink is still being cancelled; retry"
+      )
+      FileSinkLifecycle.Claim.DISPOSED -> throw LogWriterException(
+        LogWriterException.Kind.CONFIG_CONFLICT,
+        "this sink has been disposed"
       )
     }
 
