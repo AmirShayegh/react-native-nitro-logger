@@ -253,11 +253,27 @@ export class MemoryFileSink implements FileSinkLike {
     // that purged anyway would let a purge-after-dispose test pass against a
     // library that reports a successful compliance deletion over surviving
     // files. The double has to be able to fail the way the real thing fails.
+    //
+    // Which means answering the way they answer, not merely failing: this is
+    // the `FileSinkLifecycle` table, and both natives derive these two fields
+    // from it.
+    //
+    // - `failedPaths` is empty. There is no handle, so nothing was attempted,
+    //   and naming a path here would report a *deletion failure* for a file
+    //   nobody tried to delete. This double used to name one.
+    // - `durable` is vacuously true for a sink that never opened — nothing was
+    //   ever created, so "every artifact is gone" holds with nothing to check
+    //   — and false once files may exist. It used to be hardcoded false, which
+    //   re-arms a compliance failure for a sink that cannot owe one.
+    //
+    // Dead today: `FileDestination.purge` short-circuits before reaching a
+    // disposed sink. Fixed anyway, because the reason it is dead is a guard in
+    // the caller, and the next caller inherits whatever this says.
     if (this.closed) {
       return {
         deletedCount: 0,
-        failedPaths: [this.openedPath ?? ''],
-        durable: false,
+        failedPaths: [],
+        durable: this.openedPath === undefined,
         rebound: false,
       };
     }

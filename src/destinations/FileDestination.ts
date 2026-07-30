@@ -209,7 +209,18 @@ export class FileDestination implements LogDestination {
     return this.batcher.flush(deadlineMs);
   }
 
-  /** Current file and archives, newest first; empty if the sink refuses. */
+  /**
+   * Current file and archives, newest first; empty if the sink refuses.
+   *
+   * Still answers after `dispose()`. Releasing the handle does not unmake the
+   * files, and a support-upload flow that collected after `removeDestination()`
+   * would otherwise be told there is nothing on the device.
+   *
+   * Empty means "no artifacts", not "no sink". A destination that never opened
+   * has no directory to inspect; one that opened keeps inspecting its own
+   * directory afterwards and will rightly answer with nothing once a `purge()`,
+   * a retention sweep or something outside this process has taken the files.
+   */
   getLogFilePaths(): string[] {
     try {
       return this.sink.getLogFilePaths();

@@ -15,7 +15,31 @@ import org.junit.Test
  */
 class NativeConsoleWriterTest {
 
-  private fun utf8(text: String) = text.toByteArray(Charsets.UTF_8).size
+  /**
+   * What logcat is actually handed, counted independently of the writer.
+   *
+   * Deliberately **not** `NativeConsoleWriter.logcatLength` — a budget test
+   * that measures with the same function the budget is computed from proves
+   * only that the code agrees with itself. This walks the string the way JNI's
+   * `GetStringUTFChars` does: modified UTF-8, so each surrogate is encoded on
+   * its own (three bytes each, six for the pair) and U+0000 becomes `C0 80`.
+   *
+   * Against plain `toByteArray(UTF_8)` the two differ on exactly the inputs
+   * that matter here, which is why the emoji cases below would pass while a
+   * real entry lost its tail.
+   */
+  private fun logcatBytes(text: String): Int {
+    var bytes = 0
+    for (unit in text) {
+      bytes += when {
+        unit.code == 0 -> 2
+        unit.code < 0x80 -> 1
+        unit.code < 0x800 -> 2
+        else -> 3 // includes each half of a surrogate pair, counted separately
+      }
+    }
+    return bytes
+  }
 
   /** Records what would have reached logcat. */
   private class Recorder {
@@ -157,8 +181,9 @@ class NativeConsoleWriterTest {
     val pieces = NativeConsoleWriter.chunks("y".repeat(NativeConsoleWriter.CHUNK_BYTES * 3))
     assertTrue(pieces.size > 1)
     for (piece in pieces) {
-      assertTrue("a piece exceeded the entry limit: ${utf8(piece)}",
-                 utf8(piece) <= NativeConsoleWriter.CHUNK_BYTES)
+      assertTrue("a piece exceeded the entry limit: ${logcatBytes(piece)}",
+                 logcatBytes(piece) <=
+                   NativeConsoleWriter.messageBudget(NativeConsoleWriter.FALLBACK_TAG))
     }
   }
 
@@ -192,13 +217,31 @@ class NativeConsoleWriterTest {
     val line = "😀".repeat(NativeConsoleWriter.CHUNK_BYTES)
     val pieces = NativeConsoleWriter.chunks(line)
 
+    // Every assertion below holds for a chunker that returned the line whole,
+    // so without this the test passes while splitting nothing — the exact
+    // vacuous pass a boundary test cannot afford.
+    assertTrue("nothing was split, so the boundary rule was never exercised",
+               pieces.size > 1)
+
     for (piece in pieces) {
       val body = piece.substringAfter(") ")
+      // In the encoding the limit is defined in. These pieces are emoji, where
+      // standard UTF-8 reports four bytes for what logcat stores as six — so
+      // measuring the standard way would let an oversized piece through.
+      assertTrue("a piece exceeded the entry limit: ${logcatBytes(piece)}",
+                 logcatBytes(piece) <=
+                   NativeConsoleWriter.messageBudget(NativeConsoleWriter.FALLBACK_TAG))
       assertTrue("a piece starts with an orphaned low surrogate",
                  body.isEmpty() || !body.first().isLowSurrogate())
       assertTrue("a piece ends with an orphaned high surrogate",
                  body.isEmpty() || !body.last().isHighSurrogate())
       assertTrue("a piece contains a replacement character", !body.contains('�'))
+      // The bytes that came back have to be the bytes that were asked for: a
+      // piece that survives a UTF-8 round trip unchanged cannot be holding
+      // half a code point, whatever the surrogate checks above do or do not
+      // catch at its two ends.
+      assertEquals("a piece did not survive a UTF-8 round trip",
+                   body, String(body.toByteArray(Charsets.UTF_8), Charsets.UTF_8))
     }
   }
 
@@ -221,7 +264,8 @@ class NativeConsoleWriterTest {
     val pieces = NativeConsoleWriter.chunks("w".repeat(NativeConsoleWriter.CHUNK_BYTES * 40))
     val last = pieces.last()
 
-    assertTrue(utf8(last) <= NativeConsoleWriter.CHUNK_BYTES)
+    assertTrue(logcatBytes(last) <=
+                 NativeConsoleWriter.messageBudget(NativeConsoleWriter.FALLBACK_TAG))
     assertTrue(last.contains("bytes truncated"))
   }
 
@@ -233,10 +277,12 @@ class NativeConsoleWriterTest {
 
     val reported = Regex("""\+(\d+) bytes truncated""")
       .find(pieces.last())!!.groupValues[1].toInt()
-    val kept = pieces.sumOf { utf8(it.substringAfter(") ")) } -
-      utf8(" …+$reported bytes truncated")
+    // The count the writer reports is in its own units, so the arithmetic that
+    // checks it has to be too.
+    val kept = pieces.sumOf { logcatBytes(it.substringAfter(") ")) } -
+      logcatBytes(" …+$reported bytes truncated")
 
-    assertEquals(utf8(line), kept + reported)
+    assertEquals(logcatBytes(line), kept + reported)
   }
 
   /** A byte count is a length, not content. */
@@ -310,7 +356,129 @@ class NativeConsoleWriterTest {
 
     assertTrue(recorder.entries.size > 1)
     for (entry in recorder.entries) {
-      assertTrue(utf8(entry.third) <= NativeConsoleWriter.CHUNK_BYTES)
+      assertTrue(logcatBytes(entry.third) <=
+                   NativeConsoleWriter.messageBudget(NativeConsoleWriter.FALLBACK_TAG))
     }
+  }
+
+  // MARK: - The tag is part of the budget
+
+  /**
+   * The category is caller-supplied and was stored verbatim, so a long one used
+   * to eat the headroom the chunk size reserves and truncate every line's tail
+   * in silence — the failure the chunker exists to prevent.
+   */
+  @Test
+  fun `a caller-supplied tag cannot eat the entry budget`() {
+    val recorder = Recorder()
+    val writer = NativeConsoleWriter(recorder.emit)
+    writer.install("com.example.app", "t".repeat(NativeConsoleWriter.CHUNK_BYTES))
+    writer.logBatch(doubleArrayOf(2.0), arrayOf("w".repeat(NativeConsoleWriter.CHUNK_BYTES)))
+
+    assertTrue(recorder.entries.isNotEmpty())
+    for ((_, tag, message) in recorder.entries) {
+      assertTrue("the stored tag was ${logcatBytes(tag)} bytes",
+                 logcatBytes(tag) <= NativeConsoleWriter.MAX_TAG_BYTES)
+      assertTrue("tag and message together were ${logcatBytes(tag) + logcatBytes(message)} bytes",
+                 logcatBytes(tag) + logcatBytes(message) <= NativeConsoleWriter.ENTRY_BYTES)
+    }
+  }
+
+  /**
+   * The bytes that matter are the ones JNI produces, not the ones
+   * `String.toByteArray()` would.
+   *
+   * `Log.println` crosses through `GetStringUTFChars`, which encodes each
+   * surrogate separately: an emoji costs six bytes there and four in standard
+   * UTF-8. A budget computed the standard way lets an all-emoji tag and line
+   * through at 1.5× the payload they were measured at, and logcat drops the
+   * difference in silence. This is the case that says so — every assertion is
+   * in modified-UTF-8 bytes, counted here rather than borrowed from the writer.
+   */
+  @Test
+  fun `an emoji tag and line are budgeted in the bytes logcat receives`() {
+    val recorder = Recorder()
+    val writer = NativeConsoleWriter(recorder.emit)
+    // 400 emoji: 1600 standard bytes, 2400 as logcat counts them — so a
+    // standard-UTF-8 cap of 256 would have stored ~64 of them and a
+    // modified-UTF-8 cap stores ~42.
+    writer.install("com.example.app", "😀".repeat(400))
+    writer.logBatch(doubleArrayOf(2.0), arrayOf("😀".repeat(2_000)))
+
+    assertTrue(recorder.entries.isNotEmpty())
+    for ((_, tag, message) in recorder.entries) {
+      assertTrue("the stored tag was ${logcatBytes(tag)} bytes to logcat",
+                 logcatBytes(tag) <= NativeConsoleWriter.MAX_TAG_BYTES)
+      assertTrue("the entry was ${logcatBytes(tag) + logcatBytes(message)} bytes to logcat",
+                 logcatBytes(tag) + logcatBytes(message) <= NativeConsoleWriter.ENTRY_BYTES)
+      // The measurement the writer itself uses has to agree with an
+      // independent count, or the budget is right about the wrong number.
+      assertEquals(logcatBytes(message), NativeConsoleWriter.logcatLength(message))
+    }
+  }
+
+  /**
+   * U+0000 is the other place the two encodings disagree: JNI writes it as the
+   * two-byte `C0 80` so it cannot terminate the C string early.
+   */
+  @Test
+  fun `a NUL costs two bytes, the way JNI writes it`() {
+    assertEquals(2, NativeConsoleWriter.logcatLength("\u0000"))
+    assertEquals(2, logcatBytes("\u0000"))
+    assertEquals(6, NativeConsoleWriter.logcatLength("😀"))
+    assertEquals(3, NativeConsoleWriter.logcatLength("€"))
+    assertEquals(1, NativeConsoleWriter.logcatLength("a"))
+  }
+
+  /**
+   * The tail is preserved by splitting earlier, not by dropping it. A budget
+   * that ignored the tag would return this line as one entry that logcat then
+   * cuts short.
+   */
+  @Test
+  fun `a long tag lowers the message budget rather than costing the tail`() {
+    val tag = "c".repeat(NativeConsoleWriter.MAX_TAG_BYTES)
+    val line = "m".repeat(NativeConsoleWriter.CHUNK_BYTES)
+    val pieces = NativeConsoleWriter.chunks(line, tag)
+
+    assertTrue("a line that no longer fits was not split", pieces.size > 1)
+    assertEquals(line, pieces.joinToString("") { it.substringAfter(") ") })
+    for (piece in pieces) {
+      assertTrue("tag and piece together were ${logcatBytes(tag) + logcatBytes(piece)} bytes",
+                 logcatBytes(tag) + logcatBytes(piece) <= NativeConsoleWriter.ENTRY_BYTES)
+    }
+  }
+
+  /** Ordinary tags change nothing about the split. */
+  @Test
+  fun `a short tag leaves the message budget at the ceiling`() {
+    assertEquals(NativeConsoleWriter.CHUNK_BYTES, NativeConsoleWriter.messageBudget("network"))
+    val line = "x".repeat(NativeConsoleWriter.CHUNK_BYTES)
+    assertEquals(listOf(line), NativeConsoleWriter.chunks(line, "network"))
+  }
+
+  /**
+   * A tag ending in a partial UTF-8 sequence renders as a replacement
+   * character and cannot be typed back into a filter expression.
+   */
+  @Test
+  fun `a capped tag ends on a code point boundary`() {
+    val category = "😀".repeat(NativeConsoleWriter.MAX_TAG_BYTES)
+    val capped = NativeConsoleWriter.cappedTag(category)
+
+    assertTrue(logcatBytes(capped) <= NativeConsoleWriter.MAX_TAG_BYTES)
+    assertTrue("the cap dropped everything", capped.isNotEmpty())
+    assertTrue("the cap did not keep a prefix of what was asked for",
+               category.startsWith(capped))
+    assertTrue("the tag ends in an orphaned high surrogate", !capped.last().isHighSurrogate())
+    assertEquals("the tag did not survive a UTF-8 round trip",
+                 capped, String(capped.toByteArray(Charsets.UTF_8), Charsets.UTF_8))
+  }
+
+  /** A category that already fits is stored as it was written. */
+  @Test
+  fun `a tag at the cap is left alone`() {
+    val category = "n".repeat(NativeConsoleWriter.MAX_TAG_BYTES)
+    assertEquals(category, NativeConsoleWriter.cappedTag(category))
   }
 }

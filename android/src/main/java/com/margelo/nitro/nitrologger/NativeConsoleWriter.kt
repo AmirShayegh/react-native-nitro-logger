@@ -26,7 +26,7 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
     // logcat has no subsystem dimension, so the category becomes the tag and
     // the subsystem is deliberately unused — it is already in the rendered
     // line. An empty category would produce entries nobody can filter for.
-    tag = category.ifEmpty { FALLBACK_TAG }
+    tag = cappedTag(category.ifEmpty { FALLBACK_TAG })
   }
 
   /**
@@ -43,7 +43,9 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
     val tag = this.tag
     for (i in messages.indices) {
       val priority = priorityOf(if (i < levels.size) levels[i] else 2.0)
-      for (chunk in chunks(messages[i])) emit(priority, tag, chunk)
+      // The tag travels with the message into one entry and is charged against
+      // the same budget — see [messageBudget].
+      for (chunk in chunks(messages[i], tag)) emit(priority, tag, chunk)
     }
   }
 
@@ -59,8 +61,80 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
      *
      * Lower than the iOS 900 because the two platforms' limits genuinely
      * differ; the *behaviour* around the limit is what is kept identical.
+     *
+     * A ceiling on the message alone, not the whole budget: the tag is charged
+     * against [ENTRY_BYTES] too, and a long one lowers the effective limit. See
+     * [messageBudget].
      */
     const val CHUNK_BYTES = 3800
+
+    /**
+     * Tag plus message bytes this writer will put in one entry.
+     *
+     * logcat's payload is about 4 KB and holds the priority byte, the tag, the
+     * message and a NUL after each of the last two. 4000 leaves ~96 bytes for
+     * that framing, which is far more than it needs — the margin is there so a
+     * device that accounts differently still fits.
+     *
+     * Counted the way the platform counts, not the way the caller wrote it:
+     * every budget here is in **modified UTF-8**, which is what JNI hands to
+     * native logcat. See [logcatLength].
+     */
+    const val ENTRY_BYTES = 4000
+
+    /**
+     * Longest tag this writer will store, in bytes.
+     *
+     * The category is caller-supplied and was previously stored verbatim, which
+     * is what makes this a cap rather than a formality: nothing stopped a
+     * 4 KB category from consuming the whole entry and truncating every line's
+     * tail in silence — the exact failure the chunker exists to prevent.
+     *
+     * 256 is generous for a real reverse-DNS category and still small enough
+     * that a filter expression stays typeable. logcat itself once capped tags
+     * at 23 characters; it no longer does, but tooling still displays long ones
+     * badly, so this is a limit callers are unlikely to meet by accident.
+     *
+     * Deliberately above `ENTRY_BYTES - CHUNK_BYTES` (200): a tag between those
+     * two numbers is legal and shrinks the message budget instead of being
+     * rejected, which is why [messageBudget] derives the limit rather than
+     * assuming the reservation holds.
+     */
+    const val MAX_TAG_BYTES = 256
+
+    /**
+     * Message bytes available alongside [tag] — the reservation, computed.
+     *
+     * [CHUNK_BYTES] is the ceiling; a tag longer than the ~200 bytes that
+     * ceiling implicitly reserved lowers it byte for byte, so tag + message
+     * never exceeds [ENTRY_BYTES]. For every ordinary tag this is exactly
+     * [CHUNK_BYTES] and nothing about the split changes.
+     */
+    fun messageBudget(tag: String): Int = minOf(CHUNK_BYTES, ENTRY_BYTES - logcatLength(tag))
+
+    /**
+     * [category] cut to [MAX_TAG_BYTES], on a code point boundary.
+     *
+     * Cutting mid-code-point would hand logcat a tag ending in a partial UTF-8
+     * sequence, which renders as a replacement character and, worse, cannot be
+     * typed back into a filter expression.
+     */
+    fun cappedTag(category: String): String {
+      if (logcatLength(category) <= MAX_TAG_BYTES) return category
+      val kept = StringBuilder()
+      var bytes = 0
+      var i = 0
+      while (i < category.length) {
+        val codePoint = category.codePointAt(i)
+        val width = logcatWidth(codePoint)
+        if (bytes + width > MAX_TAG_BYTES) break
+        val charCount = Character.charCount(codePoint)
+        kept.appendRange(category, i, i + charCount)
+        bytes += width
+        i += charCount
+      }
+      return kept.toString()
+    }
 
     /**
      * At most this many chunks per line. A stack trace should arrive whole; a
@@ -146,15 +220,22 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
      * and an ICU version that varies by device, for a case that renders
      * oddly rather than corruptly. `docs/PARITY.md` records the difference.
      *
-     * A single code point wider than a whole chunk cannot occur — four bytes at
-     * most, against a budget in the thousands.
+     * A single code point wider than a whole chunk cannot occur — six bytes at
+     * most as logcat counts them (see [logcatLength]), against a budget in the
+     * thousands.
+     *
+     * [tag] is charged against the same entry, so it is what the limit is
+     * computed from — see [messageBudget]. It defaults to [FALLBACK_TAG]
+     * because most callers here are asking about the split itself, and that is
+     * the shortest tag any entry can carry.
      */
-    fun chunks(message: String): List<String> {
-      if (utf8Length(message) <= CHUNK_BYTES) return listOf(message)
+    fun chunks(message: String, tag: String = FALLBACK_TAG): List<String> {
+      val limit = messageBudget(tag)
+      if (logcatLength(message) <= limit) return listOf(message)
 
       // Reserve room for the widest marker any of these pieces can carry, so
       // adding the prefix cannot push a piece back over the limit.
-      val budget = CHUNK_BYTES - MARKER_WIDTH
+      val budget = limit - MARKER_WIDTH
       val pieces = mutableListOf<String>()
       val current = StringBuilder()
       var currentBytes = 0
@@ -163,7 +244,7 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
       while (i < message.length) {
         val codePoint = message.codePointAt(i)
         val charCount = Character.charCount(codePoint)
-        val width = utf8Width(codePoint)
+        val width = logcatWidth(codePoint)
 
         if (currentBytes + width > budget && current.isNotEmpty()) {
           pieces.add(current.toString())
@@ -181,17 +262,17 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
       // Whatever is left over after the chunk ceiling is announced by size
       // rather than dropped in silence. A byte count is a length, not content,
       // so it says nothing about what was in the line.
-      var remaining = utf8Length(message) - pieces.sumOf { utf8Length(it) }
+      var remaining = logcatLength(message) - pieces.sumOf { logcatLength(it) }
       if (remaining > 0 && pieces.isNotEmpty()) {
         val last = StringBuilder(pieces.removeAt(pieces.size - 1))
         // Make room for the notice inside the entry rather than appending past
         // the limit — otherwise logcat truncates the very sentence that exists
         // to report truncation, which is the one line here that must survive.
         // Each code point given back grows the count it reports.
-        while (utf8Length(last) + NOTICE_WIDTH + MARKER_WIDTH > CHUNK_BYTES && last.isNotEmpty()) {
+        while (logcatLength(last) + NOTICE_WIDTH + MARKER_WIDTH > limit && last.isNotEmpty()) {
           val dropped = last.codePointBefore(last.length)
           last.setLength(last.length - Character.charCount(dropped))
-          remaining += utf8Width(dropped)
+          remaining += logcatWidth(dropped)
         }
         last.append(" …+$remaining bytes truncated")
         pieces.add(last.toString())
@@ -202,36 +283,56 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
     }
 
     /** `"(8/8) "` — the widest prefix [MAX_CHUNKS] can produce. */
-    private val MARKER_WIDTH = utf8Length("($MAX_CHUNKS/$MAX_CHUNKS) ")
+    private val MARKER_WIDTH = logcatLength("($MAX_CHUNKS/$MAX_CHUNKS) ")
 
     /**
      * The truncation notice at its widest, so reserving this much is always
      * enough however large the count turns out to be.
      */
-    private val NOTICE_WIDTH = utf8Length(" …+${Int.MAX_VALUE} bytes truncated")
+    private val NOTICE_WIDTH = logcatLength(" …+${Int.MAX_VALUE} bytes truncated")
 
     /**
-     * UTF-8 byte length, computed rather than measured.
+     * Byte length **as logcat will count it**, computed rather than measured.
      *
-     * `toByteArray()` would encode the whole string to answer a question about
-     * its length, on every code point of every oversized line.
+     * Not standard UTF-8, and the difference is the whole reason this is a
+     * function rather than `toByteArray().size`. `Log.println` hands the tag
+     * and the message to native code through JNI's `GetStringUTFChars`, which
+     * produces **modified UTF-8**: a supplementary code point crosses as its
+     * two surrogates encoded separately — six bytes, not four — and U+0000
+     * crosses as the two-byte `C0 80` rather than a NUL that would terminate
+     * the C string early.
+     *
+     * Budgeting in standard UTF-8 therefore undercounts an emoji-heavy line by
+     * half again, which is exactly enough to push a "safely under 4 KB" entry
+     * past the limit and have logcat drop its tail in silence — the failure
+     * this whole file exists to prevent. Measuring what the caller wrote is not
+     * the same as measuring what the platform stores, and only the second one
+     * is a budget.
+     *
+     * `toByteArray()` would also encode the whole string to answer a question
+     * about its length, on every code point of every oversized line — and it
+     * would answer the wrong question.
      */
-    private fun utf8Length(text: CharSequence): Int {
+    fun logcatLength(text: CharSequence): Int {
       var bytes = 0
       var i = 0
       while (i < text.length) {
         val codePoint = Character.codePointAt(text, i)
-        bytes += utf8Width(codePoint)
+        bytes += logcatWidth(codePoint)
         i += Character.charCount(codePoint)
       }
       return bytes
     }
 
-    private fun utf8Width(codePoint: Int): Int = when {
+    /** One code point's cost in modified UTF-8. See [logcatLength]. */
+    private fun logcatWidth(codePoint: Int): Int = when {
+      // The one case where modified UTF-8 is *wider* than plain ASCII.
+      codePoint == 0 -> 2
       codePoint < 0x80 -> 1
       codePoint < 0x800 -> 2
       codePoint < 0x10000 -> 3
-      else -> 4
+      // Two three-byte surrogates, not a four-byte sequence.
+      else -> 6
     }
   }
 }

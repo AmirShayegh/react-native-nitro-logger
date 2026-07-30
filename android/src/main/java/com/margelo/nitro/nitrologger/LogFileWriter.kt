@@ -194,6 +194,60 @@ class LogFileWriter internal constructor(
       return pattern.matches(name.substring(prefix.length))
     }
 
+    /**
+     * Archives for [baseName], newest first.
+     *
+     * Ordered by modification time rather than by name. The name's timestamp
+     * has one-second resolution, so a burst of rotations inside the same second
+     * all share it and only the random suffix differs — sorting by name would
+     * keep an arbitrary subset and delete newer archives than it kept. Names
+     * break exact ties so the order is still deterministic.
+     *
+     * On the companion rather than the instance because [artifactPaths] needs
+     * it with no writer in existence, and because it reads only the two
+     * arguments — it never touched instance state.
+     */
+    private fun archives(directory: File, baseName: String): List<Artifact> {
+      val names = directory.list() ?: return emptyList()
+      return names
+        .filter { isArchiveName(it, baseName) }
+        .map { File(directory, it) }
+        .map { Artifact(it, it.lastModified(), it.length()) }
+        .sortedWith(compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name })
+    }
+
+    /**
+     * The active file and every archive for [file], for a path the caller has
+     * no handle for — a **best-effort directory snapshot**, and the weaker
+     * guarantee is the point.
+     *
+     * A sink that opened and then closed still has its files on disk, and a
+     * caller collecting them for support needs their names — see the
+     * `getLogFilePaths` row of [FileSinkLifecycle]'s table. There is no
+     * executor to serialize against here, because there is no handle to reach
+     * one through.
+     *
+     * **That is not the same as no writer.** `beginClose` detaches the handle
+     * before `close` has drained, and a close can time out with work still
+     * running, so a caller on another thread can land here while the writer is
+     * finishing a rotation, a compression or a prune. The result is then a read
+     * of a directory that is still moving: an archive mid-rename can be missed,
+     * or named a moment before it changes. The live path is executor-confined
+     * precisely to avoid that; this one cannot be, and says so rather than
+     * implying a consistency it does not have. For a support upload — which
+     * opens what it finds and tolerates a file having gone — best effort is the
+     * right trade against answering `[]`.
+     *
+     * The active path is included when it exists. Unlike the live case it is
+     * not unconditional — with no handle there is nothing that owns it, and
+     * naming a file that is not there would send a collector to open nothing.
+     */
+    fun artifactPaths(file: File): List<String> {
+      val directory = file.parentFile ?: File(".")
+      val active = if (file.exists()) listOf(file.absolutePath) else emptyList()
+      return active + archives(directory, file.name).map { it.file.absolutePath }
+    }
+
     @Throws(LogWriterException::class)
     fun open(
       file: File,
@@ -675,6 +729,28 @@ class LogFileWriter internal constructor(
    */
   private fun writableStream(ignoringBackoff: Boolean = false): FileOutputStream? {
     stream?.let { return it }
+
+    // Past the close barrier there is nothing to reopen INTO. `close()` is
+    // finished with this writer, so opening a fresh stream would leak it for
+    // the life of the process and resurrect a writer that was deliberately
+    // shut — and `reopen()` is not a passive call: it recreates the directory,
+    // the log file and the sidecar it is closing.
+    //
+    // The guard lives here rather than at each call site because this is the
+    // only place a stream is created on demand. [performWrite] and the purge
+    // path already refuse after termination; [syncNow] did not, and it reaches
+    // this with `ignoringBackoff = true`, so a flush executing on the write
+    // thread past the barrier reopened — reporting itself durable, over a file
+    // it had just recreated. Callers read `null` as "no stream", which is the
+    // truth: a terminated writer cannot sync.
+    //
+    // Only PAST the barrier. `close()`'s own flush runs before it, with
+    // `terminated` still false, and its reopen is deliberate — that is what
+    // `ignoringBackoff` is for, and `a flush reopens a stream lost inside the
+    // backoff window` pins it on both platforms. The iOS twin guards
+    // `writableHandle` identically, as C7.
+    if (terminated) return null
+
     if (!ignoringBackoff && monotonic() - lastReopenAttempt < REOPEN_BACKOFF_MS) return null
     reopen()
     return stream
@@ -1037,24 +1113,6 @@ class LogFileWriter internal constructor(
     }
 
     if (failed) note(LogDegradation.PRUNE)
-  }
-
-  /**
-   * Archives for [baseName], newest first.
-   *
-   * Ordered by modification time rather than by name. The name's timestamp has
-   * one-second resolution, so a burst of rotations inside the same second all
-   * share it and only the random suffix differs — sorting by name would keep an
-   * arbitrary subset and delete newer archives than it kept. Names break exact
-   * ties so the order is still deterministic.
-   */
-  private fun archives(directory: File, baseName: String): List<Artifact> {
-    val names = directory.list() ?: return emptyList()
-    return names
-      .filter { isArchiveName(it, baseName) }
-      .map { File(directory, it) }
-      .map { Artifact(it, it.lastModified(), it.length()) }
-      .sortedWith(compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name })
   }
 
   /**

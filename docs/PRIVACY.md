@@ -391,6 +391,28 @@ support-log upload. Collecting and transmitting logs is deliberately not in
 this library: that needs a consent flow and an encryption story that belong to
 the application, not to its logger.
 
+It keeps answering after `dispose()`, and that is deliberate rather than an
+oversight in the teardown path. Disposing releases the native handle; it does
+not delete the log set, so there is still something to collect afterwards —
+though individual filenames can change while an outstanding close finishes
+rotating or compressing, which is what makes the list best-effort rather than a
+frozen inventory (below). An empty list there would tell a support flow "there is nothing to
+collect" about logs that are still on the device — and `removeDestination()`
+followed by a collection is an ordinary sequence, not a contrived one. This is
+the one place where losing the handle does *not* narrow what can be said,
+because the answer is a fact about storage rather than a claim about reach —
+contrast `purge()`, which reports `durable: false` after disposal for exactly
+the mirrored reason.
+
+Empty means "no artifacts", not "no sink": a destination that never opened has
+no directory to inspect, and one that opened answers with nothing once a purge,
+a retention sweep or something outside the process has taken the files. The
+list is also a **best-effort snapshot** when there is no live handle. Nothing
+serializes it against a writer that is still draining a close, so an archive
+being renamed at that instant may be missed. A collector opens what it finds
+and tolerates a file having gone; that trade is the right way round against
+answering `[]`.
+
 ---
 
 ## Threat model, briefly

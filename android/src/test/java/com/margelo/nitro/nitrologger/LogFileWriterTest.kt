@@ -4,6 +4,7 @@ import org.junit.After
 import org.junit.Assume
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -87,6 +88,50 @@ class LogFileWriterTest {
 
   private fun LogFileWriter.write(text: String, entries: Long = 1, handle: Long = 1) =
     append(handle, currentGeneration, text, entries)
+
+  /**
+   * Skips rather than fails when the runtime is not bound by the permission
+   * the test just removed.
+   *
+   * Every test below that builds an obstacle out of `setWritable(false)` or
+   * `setReadable(false)` needs one of these. A root JVM — a CI container's
+   * default user, a rooted device — ignores the mode entirely, so the obstacle
+   * is not one and the failure the test exists to observe never happens: the
+   * assertion then fails for a reason that says nothing about the writer.
+   *
+   * `assumeTrue`, not an `if`. A silent pass claims coverage the run did not
+   * have, which is the same defect in the other direction. Probed **while the
+   * permission is off**, because a `reopen` re-secures the directory and hands
+   * the bit straight back, so asking afterwards always finds it restored.
+   *
+   * And a skip here does not quietly become a green build: `check-test-reports`
+   * counts skips as problems ("a skip is a hole, not a pass") and fails the
+   * target. So what these guards buy is not permission to pass — it is a red
+   * that names the real reason, "this runtime ignores file permissions",
+   * instead of an assertion failure that reads as a bug in the writer.
+   */
+  private fun assumeDirectoryRefusesWrites(target: File = directory) {
+    val probe = File(target, ".permission-probe")
+    val created = runCatching { probe.createNewFile() }.getOrDefault(false)
+    if (created) probe.delete()
+    Assume.assumeTrue("this runtime can create files in a mode-0500 directory", !created)
+  }
+
+  /** The same, for a directory made unreadable rather than unwritable. */
+  private fun assumeDirectoryRefusesListing(target: File = directory) {
+    Assume.assumeTrue("this runtime can list a mode-0300 directory", target.list() == null)
+  }
+
+  /**
+   * The same, for a file. Opened for append and closed without writing: the
+   * open IS the permission check, and append mode does not truncate, so the
+   * probe cannot alter the bytes the test is about to assert on.
+   */
+  private fun assumeFileRefusesWrites(target: File) {
+    val opened = runCatching { FileOutputStream(target, true).close(); true }
+      .getOrDefault(false)
+    Assume.assumeTrue("this runtime can write to a mode-0400 file", !opened)
+  }
 
   // MARK: - Appending
 
@@ -371,6 +416,11 @@ class LogFileWriterTest {
     // would land is impractical; instead delete the parent's write permission.
     directory.setWritable(false, false)
     try {
+      // Under a root JVM the rename succeeds, every write rotates cleanly, and
+      // the count sails past the backoff bound for a reason that is about the
+      // runtime rather than the writer.
+      assumeDirectoryRefusesWrites()
+
       repeat(5) { w.write("0123456789\n") }
       w.flush(1, 1000.0)
       w.settleForTesting()
@@ -474,10 +524,13 @@ class LogFileWriterTest {
     directory.setReadable(false, false)
     directory.setExecutable(false, false)
     try {
+      // Was an `if`, which passed in silence on a runtime that can still list
+      // the directory — claiming coverage of the worst lie this call can tell
+      // over a run that never put it in a position to tell it.
+      assumeDirectoryRefusesListing()
+
       val (outcome, _) = w.clearLogs(2000.0)
-      if (directory.list() == null) {
-        assertFalse("an unreadable directory reported a durable purge", outcome.durable)
-      }
+      assertFalse("an unreadable directory reported a durable purge", outcome.durable)
     } finally {
       directory.setReadable(true, true)
       directory.setExecutable(true, true)
@@ -520,6 +573,10 @@ class LogFileWriterTest {
     w.closeStreamForTesting()
     assertTrue(logs.deleteRecursively())
     assertTrue(directory.setWritable(false, false))
+    // Before the write, so a runtime that ignores the mode skips the test
+    // rather than failing the precondition below — which it would, since the
+    // reopen succeeds and there is no backoff window to arm.
+    assumeDirectoryRefusesWrites()
     w.write("blocked\n")
     w.settleForTesting()
     assertFalse("precondition: the reopen has to have failed", logs.exists())
@@ -568,6 +625,49 @@ class LogFileWriterTest {
     assertTrue("once the window passes the write reopens", File(logs, "app.log").exists())
   }
 
+  /**
+   * The other side of the bypass: past the close barrier there is nothing to
+   * reopen INTO, and reopening is not passive — it recreates the directory, the
+   * log file and the `.meta` sidecar the close was shutting.
+   *
+   * **Why this runs inside `onTerminated`.** It is reproducing one specific
+   * interleaving and nothing else reaches it. A `flush` enqueued before the
+   * barrier runs while `terminated` is still false; a `handle.flush` after
+   * `close()` returned is refused by the generation check; and `close()` shuts
+   * the executor down, so a plain `writer.flush` afterwards is rejected before
+   * `syncNow` can run. The path that matters is a flush *executing on the write
+   * thread after the barrier has passed* — which is exactly where
+   * `onTerminated` runs, and where a racing `handle.flush` that already cleared
+   * the generation check lands. The inline branch in `flushUntil` takes it
+   * straight to `syncNow`.
+   *
+   * iOS grew this guard as C7; the Android twin was left without it, so this is
+   * the case that recreated everything on the way out.
+   */
+  @Test
+  fun `a flush that reaches the writer after termination recreates nothing`() {
+    val logs = File(directory, "sub")
+    val w = writer(name = "sub/app.log")
+    w.write("before\n")
+    assertTrue(w.flush(1, 1000.0).durable)
+    assertTrue(File(logs, "app.log").exists())
+
+    var outcome: LogFlushOutcome? = null
+    w.close(1, 1000.0) {
+      // On the write thread, immediately past the barrier. Deleting first makes
+      // a reopen visible rather than inferred: without the guard every one of
+      // these three comes back.
+      assertTrue(logs.deleteRecursively())
+      outcome = w.flush(1, 1000.0)
+    }
+
+    assertNotNull("the barrier callback never ran, so this asserted nothing", outcome)
+    assertFalse("a terminated writer cannot sync anything", outcome!!.durable)
+    assertFalse("the flush recreated the directory it was closing", logs.exists())
+    assertFalse(File(logs, "app.log").exists())
+    assertFalse(File(logs, "app.log.meta").exists())
+  }
+
   /** A flush that reopens and still cannot write reports the truth. */
   @Test
   fun `a writer that cannot reopen reports a flush that is not durable`() {
@@ -577,6 +677,10 @@ class LogFileWriterTest {
     assertTrue(logs.deleteRecursively())
     assertTrue(directory.setWritable(false, false))
     try {
+      // A runtime that ignores the mode reopens fine and flushes durably, so
+      // the assertion below would fail for a reason about the runtime.
+      assumeDirectoryRefusesWrites()
+
       assertFalse(w.flush(1, 500.0).durable)
     } finally {
       directory.setWritable(true, true)
@@ -781,6 +885,11 @@ class LogFileWriterTest {
     // already open and keeps being writable through its descriptor.
     assertTrue(directory.setWritable(false, false))
     try {
+      // The guard its PRUNE sibling below has always had. Under a root JVM the
+      // rename succeeds, the rotation is clean, ROTATION is correctly unset,
+      // and this fails red over an environment rather than a defect.
+      assumeDirectoryRefusesWrites()
+
       w.write("0123456789012345\n")
       w.flush(1, 1000.0)
       w.settleForTesting()
@@ -1038,6 +1147,7 @@ class LogFileWriterTest {
 
     // Read-only, so every attempt to record the fresh time fails.
     assertTrue(sidecar.setWritable(false, false))
+    assumeFileRefusesWrites(sidecar)
     refuseOpen = true
 
     w.write("rotate me\n")
@@ -1095,6 +1205,10 @@ class LogFileWriterTest {
       // Deletions now fail, so the fallback lookup is what decides.
       directory.setWritable(false, false)
       try {
+        // Deletion is what has to fail here; a runtime that can unlink anyway
+        // never reaches the fallback lookup this is about.
+        assumeDirectoryRefusesWrites()
+
         val outcome = w.clearLogs(2000.0).first
         assertTrue("the file is still on disk either way", artifact.exists())
         return outcome
@@ -1229,6 +1343,41 @@ class LogFileWriterTest {
     } finally {
       resume()
     }
+  }
+
+  /**
+   * The closed-sink half of the `getLogFilePaths` row: a released writer does
+   * not unmake its files, and the same names have to come back without one.
+   */
+  @Test
+  fun `artifact paths lists the same files with no live writer`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
+    repeat(6) {
+      w.write("0123456789012345\n")
+      now += 1_000
+    }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+    val live = w.logFilePaths()
+    w.close(1, 1000.0)
+
+    val dead = LogFileWriter.artifactPaths(File(directory, "app.log"))
+
+    assertEquals("the files did not move when the writer went away", live.toSet(), dead.toSet())
+    assertTrue("no archives rotated, so this compared almost nothing", dead.size > 1)
+  }
+
+  /**
+   * The one case that answers with nothing: a path where no file was ever
+   * written. The active name is included only when it is really there, so a
+   * collector is never sent to open a file that does not exist.
+   */
+  @Test
+  fun `artifact paths at an untouched path is empty`() {
+    assertEquals(
+      emptyList<String>(),
+      LogFileWriter.artifactPaths(File(directory, "never-opened.log"))
+    )
   }
 }
 

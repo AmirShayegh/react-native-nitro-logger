@@ -170,9 +170,30 @@ class LogWriterRegistry {
     rawWrite: LogFileWriter.RawWrite? = null,
     compressor: LogFileWriter.Compressor? = null,
     clock: (() -> Long)? = null,
-    monotonic: (() -> Long)? = null
+    monotonic: (() -> Long)? = null,
+    /**
+     * Reports the canonical path, once, the instant resolution produces it.
+     *
+     * For the caller that has to answer "where are the artifacts" after this
+     * call has **thrown**. [resolve] creates the log directory before it opens
+     * anything, so a failure downstream of it can still leave files on disk,
+     * and they are under the canonical name rather than the caller's spelling
+     * of it.
+     *
+     * Reported from here rather than looked up again afterwards, and that is
+     * the whole point: re-resolving the caller's string after the failure would
+     * consult the filesystem a second time, and a symlink retargeted in between
+     * would answer with a directory this acquire never touched. What is handed
+     * over is the value this acquire actually used.
+     *
+     * Not called when [resolve] itself throws — nothing was resolved, so there
+     * is no canonical name to give, and the caller's spelling is not a
+     * substitute for one.
+     */
+    onResolve: ((String) -> Unit)? = null
   ): LogFileHandle {
     val resolved = resolve(path, platform)
+    onResolve?.invoke(resolved.canonicalPath)
 
     lock.withLock {
       // Wait out a close still in progress on this path — but not forever. The

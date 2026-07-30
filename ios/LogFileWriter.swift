@@ -191,7 +191,11 @@ public final class LogWriter {
   private static let reopenBackoffMs: Int64 = 1_000
   /// Longest any deadline-bounded call will wait. Well short of the watchdog
   /// window a synchronous crash-path flush has to live inside.
-  private static let MAX_DEADLINE_MS = 30_000
+  ///
+  /// Internal rather than private so the clamp can be asserted against it
+  /// instead of against a number copied into the test, which is how a ceiling
+  /// and its pin drift apart. Kotlin's twin is public for the same reason.
+  static let MAX_DEADLINE_MS = 30_000
   /// How long `logFilePaths()` will wait for the queue before answering with the
   /// active path alone. Short: it takes no deadline of its own, and collecting
   /// support logs is not worth blocking the JS thread over.
@@ -1125,6 +1129,35 @@ public final class LogWriter {
       return [fileURL.path]
     }
     return paths
+  }
+
+  /// The same list, for a path this object has no handle for — a **best-effort
+  /// directory snapshot**, and the weaker guarantee is the point.
+  ///
+  /// A sink that opened and then closed still has its files on disk, and a
+  /// caller collecting them for support needs their names — see the
+  /// `getLogFilePaths` row of `FileSinkLifecycle`'s table. There is no queue to
+  /// serialize against here, because there is no handle to reach one through.
+  ///
+  /// **That is not the same as no writer.** `beginClose` detaches the handle
+  /// before `close` has drained, and a close can time out with work still
+  /// running, so a caller on another thread can land here while the writer is
+  /// finishing a rotation, a compression or a prune. The result is then a read
+  /// of a directory that is still moving: an archive mid-rename can be missed
+  /// or named a moment before it changes. The live path is queue-confined
+  /// precisely to avoid that; this one cannot be, and says so rather than
+  /// implying a consistency it does not have. For a support upload — which
+  /// opens what it finds and tolerates a file having gone — best effort is the
+  /// right trade against answering `[]`.
+  ///
+  /// The active path is included when it exists. Unlike the live case it is not
+  /// unconditional — with no handle there is nothing that owns it, and naming a
+  /// file that is not there would send a collector to open nothing.
+  static func artifactPaths(at fileURL: URL) -> [String] {
+    let directory = fileURL.deletingLastPathComponent()
+    let baseName = fileURL.lastPathComponent
+    let active = FileManager.default.fileExists(atPath: fileURL.path) ? [fileURL.path] : []
+    return active + archives(in: directory, baseName: baseName).map(\.url.path)
   }
 
   // MARK: - Purge

@@ -164,12 +164,49 @@ final class LogSecureFileTests: LogWriterTestCase {
   /// The parent chain has to be built before the leaf `mkdir` can land, so this
   /// pins that building it does not accidentally create — and therefore claim —
   /// the leaf as well.
+  ///
+  /// And every level this call *did* create gets all three protections, not
+  /// just the leaf. Building the chain with `withIntermediateDirectories` gave
+  /// the intermediates the mode alone — no protection class, no backup
+  /// exclusion, no read-back — while the promise on `createDirectory` is made
+  /// about any directory this call creates. `<Logs>/a/b` is an ordinary way to
+  /// reach that gap, not an exotic one.
   func testAMissingLeafUnderMissingParentsIsCreatedAndClaimed() throws {
     let leaf = logsDirectory.appendingPathComponent("a/b/c")
 
     let shortfall = try LogSecureFile.createDirectory(at: leaf)
 
     XCTAssertTrue(shortfall.isEmpty)
+    for level in [logsDirectory,
+                  logsDirectory.appendingPathComponent("a"),
+                  logsDirectory.appendingPathComponent("a/b"),
+                  leaf] {
+      XCTAssertEqual(mode(of: level), 0o700, "\(level.lastPathComponent) is not owner-only")
+      XCTAssertTrue(isExcludedFromBackup(level),
+                    "\(level.lastPathComponent) was created here and left in backup")
+    }
+  }
+
+  /// The other half of the same rule: an ancestor that was already there is
+  /// neither changed nor judged.
+  ///
+  /// Not judged is the part worth pinning. A real ancestor is `Library`, or the
+  /// container root — app-owned, `0755` by design — so inspecting them the way
+  /// the leaf is inspected would report a shortfall on every launch for a
+  /// condition no app can act on, and the writer folds that into the same
+  /// `protection` degradation bit an app is meant to react to.
+  func testAPreExistingAncestorIsNeitherClaimedNorJudged() throws {
+    let shared = logsDirectory.appendingPathComponent("shared")
+    try FileManager.default.createDirectory(
+      at: shared, withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o755])
+    let leaf = shared.appendingPathComponent("logs")
+
+    let shortfall = try LogSecureFile.createDirectory(at: leaf)
+
+    XCTAssertTrue(shortfall.isEmpty, "an ancestor's mode is not this call's business")
+    XCTAssertEqual(mode(of: shared), 0o755, "not ours, so not changed")
+    XCTAssertFalse(isExcludedFromBackup(shared), "and its backup policy is not ours either")
     XCTAssertEqual(mode(of: leaf), 0o700)
     XCTAssertTrue(isExcludedFromBackup(leaf))
   }

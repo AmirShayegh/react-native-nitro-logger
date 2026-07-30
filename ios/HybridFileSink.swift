@@ -47,6 +47,12 @@ final class HybridFileSink: HybridFileSinkSpec {
       throw RuntimeError.error(withMessage: "FileSink: already open")
     }
 
+    // Written by `acquire` the moment it resolves, so the failure path below
+    // has the canonical name without asking the filesystem a second question.
+    // Still `nil` if resolution itself failed — nothing was resolved, and
+    // `path` as spelled here is not a stand-in for a name the registry made.
+    var resolvedPath: String?
+
     let acquired: LogFileHandle
     do {
       acquired = try LogWriterRegistry.shared.acquire(
@@ -55,14 +61,21 @@ final class HybridFileSink: HybridFileSinkSpec {
         // Absent means absent. Without a declared one-record-per-line contract
         // the startup scan must not trim a trailing record, because it cannot
         // tell a torn one from an intentional newline.
-        lineFramed: lineFramed ?? false
+        lineFramed: lineFramed ?? false,
+        onResolve: { resolvedPath = $0 }
       )
     } catch {
       // One exit, whatever went wrong. A failure that leaves the attempt
       // published refuses every later open for the life of the object, and
       // spreading the release across one clause per error kind is how the
       // clause added next gets forgotten.
-      lifecycle.failOpen()
+      //
+      // The resolved path goes with it: `acquire` creates the log directory
+      // before it opens the file, so a throw can still leave artifacts, and
+      // they are under the canonical name. `nil` — resolution never got that
+      // far — means there is nothing to enumerate, which is exactly what
+      // should be recorded.
+      lifecycle.failOpen(artifactPath: resolvedPath)
       throw Self.openFailure(error)
     }
 
@@ -119,7 +132,14 @@ final class HybridFileSink: HybridFileSinkSpec {
   }
 
   func getLogFilePaths() throws -> [String] {
-    current()?.logFilePaths() ?? []
+    // Not `current()?.logFilePaths() ?? []`. Closing releases a handle; it does
+    // not delete files, and `[]` from a closed sink tells a support-upload flow
+    // there is nothing to collect over logs that are still on the device. See
+    // the `getLogFilePaths` row of `FileSinkLifecycle`'s table.
+    let (live, path) = lifecycle.artifactSource()
+    if let handle = live { return handle.logFilePaths() }
+    guard let path else { return [] }
+    return LogWriter.artifactPaths(at: URL(fileURLWithPath: path))
   }
 
   func clearLogs(deadlineMs: Double) throws -> ClearOutcome {

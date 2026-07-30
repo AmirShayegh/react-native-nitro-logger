@@ -131,7 +131,15 @@ export interface FileSink extends HybridObject<{
   /** Deadline-aware disposal; a hung write cannot block forever. */
   close(deadlineMs: number): FlushOutcome;
 
-  /** Active file + archives, newest first. */
+  /**
+   * Active file + archives, newest first.
+   *
+   * Answers from the directory once the handle is gone: closing releases a
+   * writer, it does not delete files, and `[]` from a closed sink would tell a
+   * support-upload flow there is nothing to collect. Empty means no artifacts
+   * — a sink that never opened has no directory to look in, and one that
+   * opened answers empty once its files have been purged or swept away.
+   */
   getLogFilePaths(): string[];
 
   /**

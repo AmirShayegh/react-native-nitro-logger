@@ -456,10 +456,27 @@ final class LogFileWriterTests: LogWriterTestCase {
     XCTAssertNil(unlimited.maxTotalLogBytes)
   }
 
+  /// The clamp is the claim, and it is asserted on the clamp.
+  ///
+  /// `Int(exactly:)` traps on `NaN` and on `1e30`, so these have to be mapped
+  /// rather than cast — that is the defect. What this must **not** assert is
+  /// that a zero budget produces `durable: false`: a zero budget bounds the
+  /// wait, it does not guarantee one. The queue can drain the barrier before
+  /// `group.wait` is even entered, and asserting otherwise made this test fail
+  /// spuriously on a loaded machine — a red run that says nothing about the
+  /// code is worse than no test.
   func testHostileDeadlinesDoNotTrap() throws {
+    XCTAssertEqual(LogWriter.clampDeadline(.nan), 0, "a nonsense deadline means no budget")
+    XCTAssertEqual(LogWriter.clampDeadline(-1), 0)
+    XCTAssertEqual(LogWriter.clampDeadline(0), 0)
+    XCTAssertEqual(LogWriter.clampDeadline(.infinity), LogWriter.MAX_DEADLINE_MS,
+                   "'as long as you are allowed to' is the ceiling, not zero")
+    XCTAssertEqual(LogWriter.clampDeadline(1e30), LogWriter.MAX_DEADLINE_MS)
+
+    // And the values reach the writer without trapping on the way.
     let handle = try makeHandle()
     write(handle, "x\n")
-    XCTAssertFalse(handle.flush(deadlineMs: .nan).durable, "a nonsense deadline means no budget")
+    _ = handle.flush(deadlineMs: .nan)
     XCTAssertTrue(handle.flush(deadlineMs: .infinity).durable, "and is clamped, not cast")
   }
 }

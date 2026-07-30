@@ -7,6 +7,7 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -119,11 +120,15 @@ class LogWriterRegistryTest {
     val real = File(directory, "elsewhere.log")
     real.writeText("")
     val link = File(directory, "app.log")
-    try {
-      java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
-    } catch (_: Exception) {
-      return // the filesystem will not make one; nothing to assert
-    }
+    // Assumed, not returned from. A bare `return` reports green for a test that
+    // never ran its own invariant; a skip is caught by `check-test-reports.sh`,
+    // which counts one as a hole rather than a pass.
+    Assume.assumeTrue(
+      "this filesystem makes symbolic links",
+      runCatching {
+        java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
+      }.isSuccess
+    )
 
     try {
       acquire(link.absolutePath)

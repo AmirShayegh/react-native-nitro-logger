@@ -3,9 +3,13 @@ package com.margelo.nitro.nitrologger
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Assume
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -142,6 +146,187 @@ class FileSinkLifecycleTest {
     lifecycle.beginClose()
 
     assertTrue(lifecycle.beginOpen())
+  }
+
+  // MARK: where the artifacts are
+
+  @Test
+  fun `a closed sink still knows where its artifacts are`() {
+    val lifecycle = FileSinkLifecycle()
+    val live = handle()
+    assertTrue(lifecycle.beginOpen())
+    assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(live))
+    lifecycle.beginClose()
+
+    val source = lifecycle.artifactSource()
+    assertNull("the handle went out with the close", source.handle)
+    assertEquals(
+      "closing releases a handle; it does not unmake files, and the caller collecting them needs the name",
+      live.filePath,
+      source.path
+    )
+  }
+
+  /**
+   * The writer's path wins over the caller's spelling of it.
+   *
+   * The registry canonicalizes what it is handed — `/var` resolves through to
+   * `/private/var` on the machine this suite runs on, and a relative path or a
+   * symlinked ancestor resolves the same way — and the artifacts are under
+   * *that* name. Enumerating the caller's string after a close would follow a
+   * symlink that may since have been retargeted and hand a support upload
+   * somebody else's directory.
+   */
+  @Test
+  fun `the artifact source is the writer's resolved path, not the caller's`() {
+    val lifecycle = FileSinkLifecycle()
+    val asked = File(directory, "./nested/../app.log").absolutePath
+    val live = handle()
+    assertTrue(lifecycle.beginOpen())
+    lifecycle.finishOpen(live)
+
+    assertNotEquals("the spellings have to differ or this proves nothing",
+                    asked, live.filePath)
+    assertEquals(live.filePath, lifecycle.artifactSource().path)
+    lifecycle.beginClose()
+    assertEquals("and it survives the close", live.filePath, lifecycle.artifactSource().path)
+  }
+
+  /**
+   * An open still in flight has nothing to enumerate, and says so.
+   *
+   * There is no canonical name yet — the directory may not exist to resolve
+   * through — and the caller's spelling is not an acceptable stand-in. Nothing
+   * has been accepted through this sink at this point either, so `[]` is the
+   * true answer rather than a cautious one.
+   */
+  @Test
+  fun `an open still in flight has nothing to enumerate`() {
+    val lifecycle = FileSinkLifecycle()
+    assertTrue(lifecycle.beginOpen())
+
+    assertNull(lifecycle.artifactSource().path)
+    assertFalse("but it has already forfeited vacuous success", lifecycle.vacuousSuccess)
+  }
+
+  @Test
+  fun `a sink that never opened has nowhere to look`() {
+    val lifecycle = FileSinkLifecycle()
+    val source = lifecycle.artifactSource()
+    assertNull(source.handle)
+    assertNull("nowhere to look, which is not the same as nothing to find", source.path)
+  }
+
+  /**
+   * Same reasoning as `created`: a failed acquisition may still have created
+   * the directory, so what it left stays enumerable.
+   *
+   * The path recorded is the one the acquire **reported as it resolved**, not
+   * one looked up afterwards — and the difference is the whole point. This
+   * walks the adapter's own sequence: capture the report, let the acquire die,
+   * record the capture. The symlink is retargeted from inside the report, which
+   * is exactly the interval a re-resolution after the failure would run in, so
+   * a second lookup would answer `elsewhere` and the assertion below says it
+   * does not.
+   */
+  @Test
+  fun `a failed open records the path the acquire resolved, not a later lookup`() {
+    val real = File(directory, "real").apply { mkdirs() }
+    val elsewhere = File(directory, "elsewhere").apply { mkdirs() }
+    val link = File(directory, "link")
+    // Assumed, not returned from. A bare `return` reports green for a test that
+    // never ran its own invariant; a skip is caught by `check-test-reports.sh`,
+    // which counts one as a hole rather than a pass.
+    Assume.assumeTrue(
+      "this filesystem makes symbolic links",
+      runCatching {
+        java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
+      }.isSuccess
+    )
+    val asked = File(link, "app.log").absolutePath
+
+    // A live writer on the resolved path, so the second acquire fails *after*
+    // resolution — the only failures that have a resolved path to report.
+    handle("link/app.log")
+
+    val lifecycle = FileSinkLifecycle()
+    assertTrue(lifecycle.beginOpen())
+    var reported: String? = null
+    var retarget = Result.success(Unit)
+    try {
+      registry.acquire(
+        path = asked,
+        policy = LogRotationPolicy.of(),
+        // Disagrees with the live writer's, which is what makes it throw.
+        lineFramed = false,
+        platform = PlatformIo.Jvm,
+        onResolve = {
+          reported = it
+          // Between resolution and the failure. Everything after this point
+          // sees a link pointing somewhere the acquire never touched.
+          retarget = runCatching {
+            link.delete()
+            java.nio.file.Files.createSymbolicLink(link.toPath(), elsewhere.toPath())
+            Unit
+          }
+        }
+      )
+      fail("expected the conflicting configuration to be refused")
+    } catch (e: LogWriterException) {
+      assertEquals(LogWriterException.Kind.CONFIG_CONFLICT, e.kind)
+      lifecycle.failOpen(reported)
+    }
+
+    // The window has to have actually moved. If the retarget quietly failed, a
+    // second lookup would land on `real` as well and every assertion below
+    // would hold for a build that re-resolves — green, and proving nothing.
+    assertTrue("the retarget failed: ${retarget.exceptionOrNull()}", retarget.isSuccess)
+    assertEquals("the link has to point somewhere else now",
+                 elsewhere.canonicalFile.absolutePath, link.canonicalFile.absolutePath)
+    assertNotEquals("the spellings have to differ or this proves nothing",
+                    asked, reported)
+    assertEquals(
+      "the acquire resolved through the link as it was, and that is what is kept",
+      File(real.canonicalFile, "app.log").absolutePath,
+      lifecycle.artifactSource().path
+    )
+    assertFalse(
+      "a lookup after the failure would have followed the retargeted link",
+      lifecycle.artifactSource().path!!.startsWith(elsewhere.canonicalFile.absolutePath)
+    )
+  }
+
+  /**
+   * A failure before resolution leaves nothing recorded.
+   *
+   * Not a fallback to the caller's string: resolution is what creates the
+   * directory, so a failure ahead of it left nothing on disk — and keeping an
+   * unresolved name is the one thing that lets a symlink created later decide
+   * what a support upload enumerates.
+   */
+  @Test
+  fun `a failure before resolution records nothing`() {
+    val lifecycle = FileSinkLifecycle()
+    assertTrue(lifecycle.beginOpen())
+
+    var reported: String? = null
+    try {
+      registry.acquire(
+        // Refused by `resolve`'s first line, before it creates anything.
+        path = "",
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        onResolve = { reported = it }
+      )
+      fail("expected the open to be refused")
+    } catch (e: LogWriterException) {
+      assertEquals(LogWriterException.Kind.OPEN_FAILED, e.kind)
+    }
+    assertNull("resolution never produced a path, so none was reported", reported)
+    lifecycle.failOpen(reported)
+
+    assertNull(lifecycle.artifactSource().path)
   }
 
   // MARK: close racing open

@@ -73,7 +73,12 @@ internal enum LogSecureFile {
   /// all: a world-readable `Logs` left behind by an upgrade or a restored
   /// backup is real, it just is not ours to silently reconfigure.
   ///
-  /// A directory this call *creates* is unambiguously ours and gets all three.
+  /// A directory this call *creates* is unambiguously ours and gets all three —
+  /// at every level, not just the leaf. See `createIntermediates(below:)`, which
+  /// is also where the asymmetry is written down: a pre-existing **leaf** is
+  /// inspected and a loose mode reported, a pre-existing **ancestor** is not
+  /// looked at, because `Library` and the container root are `0755` by design
+  /// and reporting them would light the degradation bit on every launch.
   ///
   /// **Ownership is decided by `mkdir` itself, not by a check before it.** A
   /// `lstat` that says "nothing here" is a statement about the past by the time
@@ -87,19 +92,16 @@ internal enum LogSecureFile {
   /// is `EEXIST` and is inspected rather than claimed through.
   @discardableResult
   static func createDirectory(at url: URL) throws -> Shortfall {
-    // Parents first, so the leaf `mkdir` has somewhere to land. The same rule
-    // applies to them by construction: `withIntermediateDirectories` gives the
-    // mode only to directories it creates and leaves existing ones alone.
-    try FileManager.default.createDirectory(
-      at: url.deletingLastPathComponent(),
-      withIntermediateDirectories: true,
-      attributes: [.posixPermissions: directoryMode]
-    )
+    // Parents first, so the leaf `mkdir` has somewhere to land — and by the
+    // same `mkdir` rule as the leaf, so "did this call create it" is answered
+    // by the kernel for every level rather than only for the last one.
+    var shortfall = try createIntermediates(below: url)
 
     // Subject to the umask, which is why `secure` re-asserts the mode and reads
     // it back rather than trusting this argument.
     if mkdir(url.path, mode_t(directoryMode)) == 0 {
-      return secure(url, isDirectory: true)
+      shortfall.formUnion(secure(url, isDirectory: true))
+      return shortfall
     }
     let failure = errno
     guard failure == EEXIST else { throw posixError(failure, at: url) }
@@ -123,7 +125,61 @@ internal enum LogSecureFile {
     guard (existing.st_mode & S_IFMT) == S_IFDIR else {
       throw posixError(ENOTDIR, at: url)
     }
-    return inspect(url)
+    shortfall.formUnion(inspect(url))
+    return shortfall
+  }
+
+  /// Creates the missing ancestors of `url`, claiming exactly the ones this
+  /// call brings into existence.
+  ///
+  /// `FileManager.createDirectory(withIntermediateDirectories:)` used to do
+  /// this, with `.posixPermissions` as its only attribute. That gives a created
+  /// intermediate the mode and nothing else: no protection class, no backup
+  /// exclusion, and no read-back to say whether even the mode stuck — while the
+  /// comment above promises all three to any directory this call creates. A
+  /// `Logs` directory whose parent this call also created was the ordinary way
+  /// to get one, so the gap was not exotic.
+  ///
+  /// Shallowest first, one `mkdir` each, for the reason the leaf uses `mkdir`:
+  /// ownership is decided by the kernel with no window. A pre-scan for "which
+  /// of these are missing" followed by a bulk create would be a statement about
+  /// the past, and losing that race means applying this package's policy —
+  /// including a persistent, directory-wide backup exclusion — to a directory
+  /// somebody else created a moment earlier.
+  ///
+  /// A directory that is already there is left entirely alone, and unlike the
+  /// leaf it is not even inspected. The leaf is the one directory the log files
+  /// sit in and a loose mode there is worth reporting; an ancestor is
+  /// `Library`, or the container root, or `/var` — app-owned or system-owned,
+  /// `0755` by design, and reporting each of them as a shortfall would light
+  /// the `protection` degradation bit on every launch for a condition no app
+  /// can act on.
+  private static func createIntermediates(below url: URL) throws -> Shortfall {
+    var chain: [URL] = []
+    var current = url.deletingLastPathComponent().standardizedFileURL
+    while current.path != "/" && !current.path.isEmpty {
+      chain.append(current)
+      let parent = current.deletingLastPathComponent().standardizedFileURL
+      // A URL whose parent is itself — "/" reached by another spelling, or a
+      // relative path that has run out of components. Either way there is
+      // nothing above this to create.
+      if parent.path == current.path { break }
+      current = parent
+    }
+
+    var shortfall = Shortfall()
+    for directory in chain.reversed() {
+      if mkdir(directory.path, mode_t(directoryMode)) == 0 {
+        shortfall.formUnion(secure(directory, isDirectory: true))
+        continue
+      }
+      let failure = errno
+      // Anything else — `ENOTDIR` from a plain file in the way, `EACCES`,
+      // failing storage — is thrown rather than left for the leaf's `mkdir` to
+      // report as a less specific error about a different path.
+      guard failure == EEXIST else { throw posixError(failure, at: directory) }
+    }
+    return shortfall
   }
 
   /// The path is safe to carry here: this error is consumed inside the writer —

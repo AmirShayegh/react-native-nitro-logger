@@ -23,7 +23,14 @@ export interface NativeConsoleDestinationOptions {
   readonly formatter?: LogFormatter;
   /** Reverse-DNS, as os_log expects. Default: the bundle's, chosen natively. */
   readonly subsystem?: string;
-  /** Default 'log'. Becomes the logcat tag on Android. */
+  /**
+   * Default 'log'. Becomes the logcat tag on Android, where it shares the
+   * entry with the message and is capped at 256 bytes; a category longer than
+   * ~200 bytes shortens each entry's message rather than costing its tail.
+   * Bytes are counted as JNI encodes them — modified UTF-8, so an emoji costs
+   * six. On iOS the category is a field of the `os_log` object and costs
+   * nothing.
+   */
   readonly category?: string;
   /** Entries per bridge crossing. Default 64. */
   readonly batchSize?: number;

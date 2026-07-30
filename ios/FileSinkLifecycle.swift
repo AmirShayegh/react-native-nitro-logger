@@ -95,6 +95,7 @@ import Foundation
 /// | --- | --- | --- |
 /// | `flush` / `close` `durable` | `true` | `false` |
 /// | `clearLogs` `durable` | `true` | `false` |
+/// | `getLogFilePaths` | `[]` | the artifacts still on disk |
 ///
 /// `true` only where it is **vacuous**. Nothing was ever accepted through a
 /// sink that never opened, so "every accepted byte reached storage" holds with
@@ -104,6 +105,17 @@ import Foundation
 /// (`Batcher.settled`), and it would tell a compliance caller that a purge
 /// succeeded over files that are still on the device. Both lie in the direction
 /// that matters.
+///
+/// `getLogFilePaths` is the row that runs the other way, and it is why the
+/// table is about the *question* rather than about `durable`. Closing releases
+/// a handle; it does not delete files. A closed sink answering `[]` says "there
+/// is nothing to collect" over logs that are still on the device — which a
+/// consent-gated support upload believes, and then uploads nothing. So the
+/// answer with no handle is not the empty list but the directory: the paths are
+/// a fact about storage, not a claim about this object's reach, and enumerating
+/// them needs no live writer. Empty then means "no artifacts", not "no sink" —
+/// a purge or a retention sweep leaves an opened sink with nothing to name, and
+/// that is a correct answer rather than the vacuous one.
 ///
 /// ## Divergences found
 ///
@@ -143,6 +155,25 @@ final class FileSinkLifecycle {
   private var state: State = .idle
   private var handle: LogFileHandle?
   private var created = false
+  /// Where the artifacts are, kept for the life of this object.
+  ///
+  /// **Only ever a registry-resolved path.** The caller's spelling is never
+  /// stored, and that is the rule rather than an implementation detail: the
+  /// registry canonicalizes what it is given — a relative path against the
+  /// working directory, a symlinked ancestor resolved through — and the
+  /// writer's files are under *that* name. Keeping the caller's string would
+  /// leave a name that a symlink retargeted after the fact could redirect, and
+  /// hand a consent-gated support upload somebody else's directory.
+  ///
+  /// Written by `finishOpen` from the acquired handle, and by `failOpen` from
+  /// the path the failed acquire reported as it resolved. Both come from the
+  /// acquisition itself rather than from a second look at the filesystem, so
+  /// neither can be redirected by a symlink retargeted after the fact.
+  ///
+  /// Still `nil` while an open is in flight, so `getLogFilePaths` answers `[]`
+  /// for that window. Correct rather than merely safe — nothing has been
+  /// accepted through this sink yet.
+  private var openedPath: String?
 
   // MARK: - Reading
 
@@ -187,6 +218,19 @@ final class FileSinkLifecycle {
     return (handle, !created)
   }
 
+  /// Where to get the artifact list: the live handle, or failing that the path
+  /// to enumerate. Read together, for the same reason `snapshot` reads its two
+  /// fields in one critical section.
+  ///
+  /// `(nil, nil)` is the never-opened sink, the one case with nowhere to look.
+  /// An opened sink always has somewhere, which is not the same as always
+  /// having something: a purge leaves the directory there and empty.
+  func artifactSource() -> (handle: LogFileHandle?, path: String?) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (handle, openedPath)
+  }
+
   // MARK: - Transitions
 
   /// Claims the right to open. `false` means the caller must refuse.
@@ -194,6 +238,10 @@ final class FileSinkLifecycle {
   /// Marks `mayHaveArtifacts` before the attempt rather than after it succeeds:
   /// acquisition creates the log directory and can then fail on the file, so a
   /// throw is not evidence that nothing was written.
+  ///
+  /// Deliberately takes no path. `mayHaveArtifacts` is a bit and can be set
+  /// from a guess; `openedPath` is a name something will be opened by, and the
+  /// only safe source for it is the registry — see `openedPath`.
   func beginOpen() -> Bool {
     lock.lock()
     defer { lock.unlock() }
@@ -208,9 +256,14 @@ final class FileSinkLifecycle {
   }
 
   /// Reports a successful acquisition, and learns whether to keep it.
+  ///
+  /// Takes the acquired handle's own path as the artifact source from here on
+  /// — see `openedPath`. Recorded in the abandoned case too: that handle really
+  /// did open those files, and whoever closes it does not unmake them.
   func finishOpen(_ acquired: LogFileHandle) -> Installation {
     lock.lock()
     defer { lock.unlock() }
+    openedPath = acquired.filePath
     switch state {
     case .opening:
       handle = acquired
@@ -231,9 +284,17 @@ final class FileSinkLifecycle {
   }
 
   /// Reports a failed acquisition. `mayHaveArtifacts` deliberately stays set.
-  func failOpen() {
+  ///
+  /// `artifactPath` is the path the failed acquire reported as it resolved, or
+  /// `nil` if it never got that far. Recorded because a throw is not evidence
+  /// that nothing was written: acquisition creates the log directory before it
+  /// opens the file, and what it left behind is enumerable under the resolved
+  /// name. `nil` leaves `openedPath` as it was — a previous open's artifacts do
+  /// not stop existing because a later open failed.
+  func failOpen(artifactPath: String? = nil) {
     lock.lock()
     defer { lock.unlock() }
+    if let artifactPath { openedPath = artifactPath }
     if state == .opening || state == .closePending { state = .closed }
   }
 

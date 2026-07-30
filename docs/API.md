@@ -184,7 +184,7 @@ const logFile = new FileDestination(createFileSink(), {
 | `lineFramed` | `boolean` | Whether the formatter opted into crash-tail trimming. |
 | `flush(deadlineMs?)` | `BatchFlushOutcome` | `durable` says whether it reached disk. |
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
-| `getLogFilePaths()` | `string[]` | Active file first, then archives. For a consent-gated support upload. |
+| `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
 | `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip and protection each have a bit. |
 | `dispose()` | `void` | Releases the native handle. |
@@ -217,6 +217,13 @@ or a throwing sink; `isEnabled` goes false after three consecutive native
 failures. `NativeConsoleDestinationOptions` adds `subsystem`, `category`,
 `batchSize`, `flushIntervalMs` and `maxPendingEntries` to the common three; the
 README section tabulates them with their defaults.
+
+`category` becomes the logcat tag on Android, where it shares one entry with
+the message: it is capped at 256 bytes, and a category past ~200 bytes shortens
+each entry's message rather than costing its tail. Bytes there are counted as
+JNI encodes them — modified UTF-8, so an emoji costs six — not as
+`toByteArray()` would. On iOS the category is a field of the `os_log` object
+and costs the message nothing. `docs/PARITY.md` has both rows.
 
 <!-- api: NativeConsoleDestination, NativeConsoleDestinationOptions -->
 

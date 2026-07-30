@@ -111,6 +111,173 @@ final class FileSinkLifecycleTests: LogWriterTestCase {
     XCTAssertTrue(lifecycle.beginOpen(), "close is not terminal; dispose is")
   }
 
+  // MARK: - Where the artifact list comes from
+
+  /// The `getLogFilePaths` row, and the one that runs the other way from
+  /// `durable`: a closed sink must still name its files.
+  func testAClosedSinkStillKnowsWhereItsArtifactsAre() throws {
+    let lifecycle = FileSinkLifecycle()
+    let live = try makeHandle()
+    XCTAssertTrue(lifecycle.beginOpen())
+    XCTAssertEqual(lifecycle.finishOpen(live), .installed)
+    _ = lifecycle.beginClose()
+
+    let source = lifecycle.artifactSource()
+    XCTAssertNil(source.handle, "the handle went out with the close")
+    XCTAssertEqual(source.path, live.filePath,
+                   "closing releases a handle; it does not unmake files, and the caller collecting them needs the name")
+  }
+
+  /// The writer's path wins over the caller's spelling of it.
+  ///
+  /// The registry canonicalizes what it is handed — `/var` resolves through to
+  /// `/private/var` on the machine this suite runs on, and a relative path or a
+  /// symlinked ancestor resolves the same way — and the artifacts are under
+  /// *that* name. Enumerating the caller's string after a close would follow a
+  /// symlink that may since have been retargeted, and hand a support upload
+  /// somebody else's directory.
+  func testTheArtifactSourceIsTheWritersResolvedPath() throws {
+    let lifecycle = FileSinkLifecycle()
+    let asked = logsDirectory.appendingPathComponent("nested/../app.log").path
+    let live = try makeHandle()
+    XCTAssertTrue(lifecycle.beginOpen())
+    _ = lifecycle.finishOpen(live)
+
+    XCTAssertNotEqual(asked, live.filePath,
+                      "the spellings have to differ or this proves nothing")
+    XCTAssertEqual(lifecycle.artifactSource().path, live.filePath)
+    _ = lifecycle.beginClose()
+    XCTAssertEqual(lifecycle.artifactSource().path, live.filePath,
+                   "and it survives the close")
+  }
+
+  /// An open still in flight has nothing to enumerate, and says so.
+  ///
+  /// There is no canonical name yet — the directory may not exist to resolve
+  /// through — and the caller's spelling is not an acceptable stand-in. Nothing
+  /// has been accepted through this sink at this point either, so `[]` is the
+  /// true answer rather than a cautious one.
+  func testAnOpenStillInFlightHasNothingToEnumerate() {
+    let lifecycle = FileSinkLifecycle()
+    XCTAssertTrue(lifecycle.beginOpen())
+
+    XCTAssertNil(lifecycle.artifactSource().path)
+    XCTAssertFalse(lifecycle.vacuousSuccess, "but it has already forfeited vacuous success")
+  }
+
+  func testASinkThatNeverOpenedHasNowhereToLook() {
+    let lifecycle = FileSinkLifecycle()
+    let source = lifecycle.artifactSource()
+    XCTAssertNil(source.handle)
+    XCTAssertNil(source.path, "nowhere to look, which is not the same as nothing to find")
+  }
+
+  /// Same reasoning as `created`: a failed acquisition may still have created
+  /// the directory, so what it left stays enumerable.
+  ///
+  /// The path recorded is the one the acquire **reported as it resolved**, not
+  /// one looked up afterwards — and the difference is the whole point. This
+  /// walks the adapter's own sequence: capture the report, let the acquire die,
+  /// record the capture. The symlink is retargeted from inside the report,
+  /// which is exactly the interval a re-resolution after the failure would run
+  /// in, so a second lookup would answer `elsewhere` and the assertion below
+  /// says it does not.
+  func testAFailedOpenRecordsThePathTheAcquireResolved() throws {
+    let manager = FileManager.default
+    let real = root.appendingPathComponent("real")
+    let elsewhere = root.appendingPathComponent("elsewhere")
+    try manager.createDirectory(at: real, withIntermediateDirectories: true)
+    try manager.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+    let link = root.appendingPathComponent("link")
+    try manager.createSymbolicLink(at: link, withDestinationURL: real)
+    let asked = link.appendingPathComponent("app.log").path
+
+    // A live writer on the resolved path, so the second acquire fails *after*
+    // resolution — the only failures that have a resolved path to report.
+    try makeHandle(at: link.appendingPathComponent("app.log"))
+
+    let lifecycle = FileSinkLifecycle()
+    XCTAssertTrue(lifecycle.beginOpen())
+    var reported: String?
+    var retargetError: Error?
+    XCTAssertThrowsError(
+      try registry.acquire(
+        path: asked,
+        policy: LogRotationPolicy(),
+        // Disagrees with the live writer's, which is what makes it throw.
+        lineFramed: false,
+        onResolve: {
+          reported = $0
+          // Between resolution and the failure. Everything after this point
+          // sees a link pointing somewhere the acquire never touched.
+          do {
+            try manager.removeItem(at: link)
+            try manager.createSymbolicLink(at: link, withDestinationURL: elsewhere)
+          } catch {
+            // Kept rather than swallowed — asserted below, where a failure can
+            // still fail the test.
+            retargetError = error
+          }
+        }
+      )
+    ) { error in
+      XCTAssertEqual(error as? LogWriterError, .configConflict)
+      lifecycle.failOpen(artifactPath: reported)
+    }
+
+    // The window has to have actually moved. If the retarget quietly failed, a
+    // second lookup would land on `real` as well and every assertion below
+    // would hold for a build that re-resolves — green, and proving nothing.
+    XCTAssertNil(retargetError, "the retarget has to happen or this proves nothing")
+    let elsewherePath = try XCTUnwrap(realpathString(elsewhere.path))
+    XCTAssertEqual(realpathString(link.path), elsewherePath,
+                   "the link has to point somewhere else now")
+
+    XCTAssertNotEqual(asked, reported, "the spellings have to differ or this proves nothing")
+    let realPath = try XCTUnwrap(realpathString(real.path))
+    XCTAssertEqual(lifecycle.artifactSource().path,
+                   URL(fileURLWithPath: realPath).appendingPathComponent("app.log").path,
+                   "the acquire resolved through the link as it was, and that is what is kept")
+    XCTAssertFalse(try XCTUnwrap(lifecycle.artifactSource().path).hasPrefix(elsewherePath),
+                   "a lookup after the failure would have followed the retargeted link")
+  }
+
+  /// A failure before resolution leaves nothing recorded.
+  ///
+  /// Not a fallback to the caller's string: resolution is what creates the
+  /// directory, so a failure ahead of it left nothing on disk — and keeping an
+  /// unresolved name is the one thing that lets a symlink created later decide
+  /// what a support upload enumerates.
+  func testAFailureBeforeResolutionRecordsNothing() {
+    let lifecycle = FileSinkLifecycle()
+    XCTAssertTrue(lifecycle.beginOpen())
+
+    var reported: String?
+    XCTAssertThrowsError(
+      try registry.acquire(
+        // Refused by `resolve`'s first line, before it creates anything.
+        path: "",
+        policy: LogRotationPolicy(),
+        lineFramed: true,
+        onResolve: { reported = $0 }
+      )
+    )
+    XCTAssertNil(reported, "resolution never produced a path, so none was reported")
+    lifecycle.failOpen(artifactPath: reported)
+
+    XCTAssertNil(lifecycle.artifactSource().path)
+  }
+
+  /// `realpath`, so the assertions compare what the registry compares.
+  ///
+  /// `/var` is a symlink to `/private/var` on macOS, and the temporary
+  /// directory these tests run in is under it.
+  private func realpathString(_ path: String) -> String? {
+    guard let resolved = realpath(path, nil) else { return nil }
+    defer { free(resolved) }
+    return String(cString: resolved)
+  }
+
   // MARK: - Close racing open
 
   /// Close wins, and the acquisition that lands afterwards is discarded.

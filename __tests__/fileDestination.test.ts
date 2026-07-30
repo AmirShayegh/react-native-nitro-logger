@@ -651,3 +651,49 @@ describe('FileDestination — through the Logger', () => {
     expect(records(writer).map((r) => r.message)).toEqual(['final']);
   });
 });
+
+/**
+ * The double is only worth anything if it can fail the way the real thing
+ * fails, and answer the way the real thing answers.
+ *
+ * These are `FileSinkLifecycle`'s no-live-handle rules — the table both native
+ * adapters derive from — asserted against the in-memory sink. The double had
+ * two divergences from it: it named a `failedPath` for a deletion nobody
+ * attempted, and it hardcoded `durable: false` even for a sink that never
+ * opened, where the claim is vacuously true. Neither was reachable through
+ * `FileDestination`, which short-circuits before a disposed sink; both would
+ * have been inherited by the next caller that was not guarded.
+ */
+describe('MemoryFileSink — the no-handle rules the natives follow', () => {
+  test('a closed sink that wrote files cannot claim a durable purge', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.appendBatch('{"m":1}\n', 1);
+    sink.close(1000);
+
+    const outcome = sink.clearLogs(1000);
+
+    expect(outcome.durable).toBe(false);
+    expect(outcome.deletedCount).toBe(0);
+    expect(outcome.rebound).toBe(false);
+    // Nothing was attempted, so nothing failed. A path here reports a deletion
+    // failure for a file no one tried to delete.
+    expect(outcome.failedPaths).toEqual([]);
+  });
+
+  test('a sink that never opened purges vacuously, not falsely', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.close(1000);
+
+    const outcome = sink.clearLogs(1000);
+
+    // Nothing was ever created, so "every artifact is gone" holds with nothing
+    // to check. `false` here would re-arm a compliance failure for a sink that
+    // cannot owe one.
+    expect(outcome.durable).toBe(true);
+    expect(outcome.failedPaths).toEqual([]);
+    expect(outcome.rebound).toBe(false);
+  });
+});

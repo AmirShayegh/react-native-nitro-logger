@@ -262,6 +262,30 @@ final class LogRotationTests: LogWriterTestCase {
       XCTAssertTrue(FileManager.default.fileExists(atPath: path))
     }
   }
+
+  /// The same list with the writer gone — what a sink that has been closed
+  /// answers. Closing releases a handle; it does not delete files, and a
+  /// support collector needs their names either way.
+  func testArtifactPathsListsTheSameFilesWithNoLiveWriter() throws {
+    let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 100))
+    for _ in 0..<6 { write(handle, record) }
+    let live = handle.logFilePaths()
+    _ = handle.close(deadlineMs: 1000)
+
+    let dead = LogWriter.artifactPaths(at: logURL)
+
+    XCTAssertEqual(Set(dead), Set(live),
+                   "the files did not move when the writer went away")
+    XCTAssertGreaterThan(dead.count, 1, "no archives rotated, so this compared almost nothing")
+  }
+
+  /// The one case that answers with nothing: a path where no file was ever
+  /// written. The active name is included only when it is really there, so a
+  /// collector is never sent to open a file that does not exist.
+  func testArtifactPathsAtAnUntouchedPathIsEmpty() {
+    XCTAssertEqual(
+      LogWriter.artifactPaths(at: logsDirectory.appendingPathComponent("never-opened.log")), [])
+  }
 }
 
 // MARK: - Gzip verification

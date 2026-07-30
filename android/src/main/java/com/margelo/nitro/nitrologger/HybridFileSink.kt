@@ -117,6 +117,12 @@ class HybridFileSink : HybridFileSinkSpec() {
       )
     }
 
+    // Written by `acquire` the moment it resolves, so the failure path below
+    // has the canonical name without asking the filesystem a second question.
+    // Still null if resolution itself failed — nothing was resolved, and `path`
+    // as spelled here is not a stand-in for a name the registry produced.
+    var resolvedPath: String? = null
+
     val acquired = try {
       LogWriterRegistry.shared.acquire(
         path = path,
@@ -125,12 +131,19 @@ class HybridFileSink : HybridFileSinkSpec() {
         // the startup scan must not trim a trailing record, because it cannot
         // tell a torn one from an intentional newline.
         lineFramed = lineFramed ?: false,
-        platform = AndroidPlatformIo
+        platform = AndroidPlatformIo,
+        onResolve = { resolvedPath = it }
       )
     } catch (e: Throwable) {
       // Failed attempts have to release the claim, or a retry is refused
       // forever.
-      lifecycle.failOpen()
+      //
+      // The resolved path goes with it: `acquire` creates the log directory
+      // before it opens the file, so a throw can still leave artifacts, and
+      // they are under the canonical name. Null — resolution never got that
+      // far — means there is nothing to enumerate, which is exactly what
+      // should be recorded.
+      lifecycle.failOpen(resolvedPath)
       throw e
     }
 
@@ -241,8 +254,17 @@ class HybridFileSink : HybridFileSinkSpec() {
     outcome.status.degraded.toDouble()
   )
 
-  override fun getLogFilePaths(): Array<String> =
-    current()?.logFilePaths()?.toTypedArray() ?: emptyArray()
+  override fun getLogFilePaths(): Array<String> {
+    // Not `current()?.logFilePaths() ?: emptyArray()`. Closing releases a
+    // handle; it does not delete files, and `[]` from a closed sink tells a
+    // support-upload flow there is nothing to collect over logs that are still
+    // on the device. See the `getLogFilePaths` row of [FileSinkLifecycle]'s
+    // table, and the iOS twin, which is the same shape.
+    val (live, path) = lifecycle.artifactSource()
+    if (live != null) return live.logFilePaths().toTypedArray()
+    val opened = path ?: return emptyArray()
+    return LogFileWriter.artifactPaths(File(opened)).toTypedArray()
+  }
 
   override fun clearLogs(deadlineMs: Double): ClearOutcome {
     // Never opened: nothing was created, so "every artifact is gone" holds
