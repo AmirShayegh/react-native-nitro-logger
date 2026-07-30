@@ -254,6 +254,22 @@ public final class LogWriter {
   /// injection and the twin test, and iOS had neither.
   public typealias Steady = () -> Int64
 
+  /// The wall clock, injectable — the twin of Android's `clock`.
+  ///
+  /// Distinct from [Steady] and used for the opposite kind of question. Age
+  /// rotation and archive retention ask "how old is this file", which is a claim
+  /// about calendar time that has to survive a restart, so it is measured
+  /// against the same clock that stamped the file rather than against a
+  /// monotonic counter that resets with the process.
+  ///
+  /// It is injectable for the reason [Steady] is: without it, an age is only
+  /// testable by sleeping, and a test that sleeps 200 ms against a 50 ms
+  /// threshold is a test whose result depends on how loaded the machine is.
+  /// Under `swift test --parallel` that stopped being hypothetical — more than
+  /// the threshold could elapse between creating the file and writing to it, so
+  /// the write itself rotated and the assertions moved by one.
+  public typealias Clock = () -> Date
+
   public let fileURL: URL
   public let canonicalPath: String
   let policy: LogRotationPolicy
@@ -264,6 +280,7 @@ public final class LogWriter {
   private let rawWrite: RawWrite
   private let compressor: Compressor
   private let steady: Steady
+  private let clock: Clock
 
   // MARK: State behind `stateLock` — cheap, never held across I/O
 
@@ -291,6 +308,9 @@ public final class LogWriter {
   /// is idempotent, because a writer that fails to open has both to run.
   private var lockDescriptor: Int32 = -1
   private var currentFileSize: UInt64 = 0
+  /// A placeholder only. `init` overwrites it with the file's real creation
+  /// date before anything reads it; the injected `clock` does not exist yet at
+  /// property-initialiser time, which is why this one literal stays.
   private var currentFileStart = Date()
   /// Monotonic ms of the last reopen attempt; nil until one has been made, so
   /// the very first attempt is never held back by an uninitialised timestamp.
@@ -326,6 +346,7 @@ public final class LogWriter {
     rawWrite: RawWrite? = nil,
     compressor: Compressor? = nil,
     steady: Steady? = nil,
+    clock: Clock? = nil,
     directoryShortfall: LogSecureFile.Shortfall = []
   ) throws {
     self.fileURL = fileURL
@@ -341,6 +362,7 @@ public final class LogWriter {
       #endif
     }
     self.steady = steady ?? Self.steadyMillis
+    self.clock = clock ?? { Date() }
     self.queue = DispatchQueue(label: "com.nitrologger.filewriter")
     queue.setSpecific(key: queueKey, value: true)
 
@@ -378,7 +400,7 @@ public final class LogWriter {
     handle = opened.handle
     descriptor = opened.descriptor
     currentFileSize = Self.size(of: opened.descriptor)
-    currentFileStart = Self.creationDate(of: fileURL)
+    currentFileStart = fileStart(created: opened.created)
 
     trimTornTailIfFramed()
     sweepRetention()
@@ -422,6 +444,12 @@ public final class LogWriter {
   /// `fstat` afterwards rejects anything that is not a regular file, so a FIFO
   /// left in place cannot wedge the writer on open either.
   ///
+  /// The `O_EXCL` probe below does not reopen that window. It is a second
+  /// `open`, not a check-then-open: each call decides the file it gets from its
+  /// own flags, and `O_CREAT | O_EXCL` refuses an existing name *including a
+  /// symlink*. Whichever call returns the descriptor, it was protected on the
+  /// way in and the checks after it run on that descriptor.
+  ///
   /// The mode is applied through the descriptor rather than the path for the
   /// same reason — `fchmod` acts on the file already held.
   ///
@@ -434,16 +462,30 @@ public final class LogWriter {
   /// meaning for the regular file that survives the check.
   private static func openForAppending(
     at url: URL
-  ) -> (handle: FileHandle, descriptor: Int32, shortfall: LogSecureFile.Shortfall)? {
+  ) -> (handle: FileHandle, descriptor: Int32, shortfall: LogSecureFile.Shortfall, created: Bool)? {
     // `O_RDWR`, not `O_WRONLY`: the startup tail scan reads through this exact
     // descriptor so that the offsets it computes and the `ftruncate` it applies
     // are guaranteed to concern the same inode. `pread` on a write-only
     // descriptor fails with `EBADF`, which would silently skip crash recovery.
-    let fd = Darwin.open(
-      url.path,
-      O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
-      mode_t(LogSecureFile.fileMode)
-    )
+    let appendFlags = O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+
+    // `O_EXCL` first, only to learn whether this call is the one that made the
+    // file. `open(2)` will not otherwise say, and the answer picks the clock
+    // that stamps the file's age — see `fileStart(created:)`, where getting it
+    // wrong makes every write after a rotation rotate again.
+    var created = true
+    var fd = Darwin.open(
+      url.path, appendFlags | O_CREAT | O_EXCL, mode_t(LogSecureFile.fileMode))
+    if fd < 0 {
+      // Deliberately not conditioned on `EEXIST`. Whatever refused the
+      // exclusive open, the ordinary one is the call that decides, and it
+      // reports its own failure below. `O_CREAT` stays on it so a file
+      // unlinked between the two calls is still created rather than failing
+      // `ENOENT`; that race reports `created: false` for a file it did make,
+      // which costs one age measured against a creation date of a moment ago.
+      created = false
+      fd = Darwin.open(url.path, appendFlags | O_CREAT, mode_t(LogSecureFile.fileMode))
+    }
     guard fd >= 0 else { return nil }
 
     var info = stat()
@@ -468,7 +510,29 @@ public final class LogWriter {
       Darwin.close(fd)
       return nil
     }
-    return (FileHandle(fileDescriptor: fd, closeOnDealloc: true), fd, shortfall)
+    return (FileHandle(fileDescriptor: fd, closeOnDealloc: true), fd, shortfall, created)
+  }
+
+  /// The instant this file's age is measured from.
+  ///
+  /// A file this open just created is stamped from `clock()`; one that was
+  /// already there is stamped from the filesystem. They are two different
+  /// timebases and the distinction is the whole point.
+  ///
+  /// A file created a moment ago is zero seconds old *by the writer's clock*,
+  /// whatever the filesystem says — so taking its real creation date while the
+  /// writer measures against an injected clock standing anywhere else makes the
+  /// fresh file instantly over-age. Rotation is where that bites: it renames
+  /// the file away and reopens a new one, so a wrong stamp here means the next
+  /// write rotates again, and the one after that, for as long as writing
+  /// continues.
+  ///
+  /// The filesystem date is right for the other case and only that one. An
+  /// existing file's age has to survive the process that created it, which is
+  /// why this is calendar time rather than the monotonic `steady` — and there
+  /// the two bases legitimately meet, because a real file carries a real date.
+  private func fileStart(created: Bool) -> Date {
+    created ? clock() : Self.creationDate(of: fileURL, fallback: clock())
   }
 
   private static func size(of descriptor: Int32) -> UInt64 {
@@ -477,9 +541,15 @@ public final class LogWriter {
     return UInt64(max(0, info.st_size))
   }
 
-  private static func creationDate(of url: URL) -> Date {
+  /// The filesystem's creation date, or `fallback` when it will not say.
+  ///
+  /// `fallback` is passed rather than defaulted to `Date()` because this is the
+  /// value age rotation measures against: taking the real clock here while the
+  /// writer runs on an injected one would make a fresh file look arbitrarily old
+  /// or arbitrarily young to the very check that reads it.
+  private static func creationDate(of url: URL, fallback: Date) -> Date {
     let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-    return (attributes?[.creationDate] as? Date) ?? Date()
+    return (attributes?[.creationDate] as? Date) ?? fallback
   }
 
   /// Cuts a torn trailing record left by a crash — but only when the producer
@@ -751,7 +821,7 @@ public final class LogWriter {
       // which archives the file again and again until pruning has eaten every
       // real archive.
       currentFileSize = 0
-      currentFileStart = Date()
+      currentFileStart = clock()
       writesSinceHealthCheck = 0
       return false
     }
@@ -759,7 +829,7 @@ public final class LogWriter {
     handle = opened.handle
     descriptor = opened.descriptor
     currentFileSize = Self.size(of: opened.descriptor)
-    currentFileStart = Self.creationDate(of: fileURL)
+    currentFileStart = fileStart(created: opened.created)
     writesSinceHealthCheck = 0
     return true
   }
@@ -1446,7 +1516,7 @@ public final class LogWriter {
     guard steady() >= rotationBlockedUntil else { return }
     let tooBig = currentFileSize >= policy.maxFileSizeBytes
     let tooOld = policy.maxFileAgeSeconds.map {
-      Date().timeIntervalSince(currentFileStart) >= $0
+      clock().timeIntervalSince(currentFileStart) >= $0
     } ?? false
     guard tooBig || tooOld else { return }
     rotationAttempts += 1
@@ -1456,7 +1526,7 @@ public final class LogWriter {
 
     let archiveURL = fileURL
       .deletingLastPathComponent()
-      .appendingPathComponent("\(fileURL.lastPathComponent).\(Self.rotationStamp())")
+      .appendingPathComponent("\(fileURL.lastPathComponent).\(Self.rotationStamp(at: clock()))")
 
     do {
       try FileManager.default.moveItem(at: fileURL, to: archiveURL)
@@ -1529,9 +1599,12 @@ public final class LogWriter {
     return formatter
   }()
 
-  private static func rotationStamp() -> String {
+  /// `at` rather than reading the clock here: this is `static`, and the
+  /// instant an archive is named after should be the same one the writer is
+  /// measuring ages against.
+  private static func rotationStamp(at instant: Date) -> String {
     let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
-    return "\(stampFormatter.string(from: Date()))_\(suffix)"
+    return "\(stampFormatter.string(from: instant))_\(suffix)"
   }
 
   // MARK: - Retention (queue only)
@@ -1574,7 +1647,7 @@ public final class LogWriter {
     // Oldest first for age, then count, then total size — each pass works on
     // what the previous one left.
     if let maxAge = policy.maxArchiveAgeSeconds {
-      let cutoff = Date().addingTimeInterval(-maxAge)
+      let cutoff = clock().addingTimeInterval(-maxAge)
       let expired = archives.filter { $0.modified < cutoff }
       expired.forEach(remove)
       archives.removeAll { entry in expired.contains { $0.url == entry.url } }
@@ -1914,7 +1987,7 @@ public final class LogWriter {
       }
 
       currentFileSize = 0
-      currentFileStart = Date()
+      currentFileStart = clock()
       // Deletion succeeded whether or not a fresh file could be opened, and
       // `durable` describes the deletion — that is what a compliance caller
       // asked about. Whether the writer is usable again is a separate fact,

@@ -112,43 +112,51 @@ final class LogBurstTests: LogWriterTestCase {
   /// The backpressure loop polls status from the JavaScript thread while the
   /// writer thread is busy. That must never block, and must never hand back a
   /// number that has been half-updated.
+  ///
+  /// The writer queue is **gated shut** for the duration rather than merely
+  /// loaded up, and that is what makes this deterministic. Racing a producer
+  /// against a poll loop asks whether the machine scheduled the poller before
+  /// the producer finished, which under `swift test --parallel` it sometimes did
+  /// not — the loop ran zero times and the test failed having proven nothing.
+  /// With the queue gated, "status does not wait behind writer I/O" is not a
+  /// latency measurement at all: every poll below happens while a task is
+  /// provably stuck on the queue, so a `status()` that took the queue would
+  /// deadlock instead of merely being slow.
   func testStatusPollingStaysResponsiveUnderLoad() throws {
     let handle = try makeHandle(policy: LogRotationPolicy(maxFileSizeBytes: 10_000_000))
-    // A semaphore rather than an XCTestExpectation: this loop polls until the
-    // writer finishes, and an expectation may only be waited on once.
-    let finished = DispatchSemaphore(value: 0)
+    let release = stall(handle)
+    // Before the first assertion, so a failing one cannot leave the writer
+    // wedged and turn a clear failure into a teardown that waits out deadlines.
+    // Signalling twice is harmless — nothing is waiting the second time — and
+    // teardown signals it again anyway.
+    defer { release() }
 
-    DispatchQueue.global().async {
-      for index in 0..<5_000 {
-        var result = handle.appendBatch(self.line(index), entryCount: 1)
-        while !result.accepted, result.rejectReason == .full {
-          result = handle.appendBatch(self.line(index), entryCount: 1)
-        }
-      }
-      finished.signal()
+    // Enough to put real bytes in flight behind the gate. These are accepted
+    // into the queue and cannot drain, so `queuedBytes` is non-zero by
+    // construction rather than by luck.
+    var accepted = 0
+    for index in 0..<200 where handle.appendBatch(line(index), entryCount: 1).accepted {
+      accepted += 1
     }
+    XCTAssertGreaterThan(accepted, 0, "the gate should not have refused everything")
 
-    var slowest: TimeInterval = 0
-    var polls = 0
     var sawWorkInFlight = false
-    while finished.wait(timeout: .now() + .milliseconds(1)) == .timedOut {
-      let started = Date()
+    for _ in 0..<50 {
       let status = handle.status()
-      slowest = max(slowest, Date().timeIntervalSince(started))
-      polls += 1
       if status.queuedBytes > 0 { sawWorkInFlight = true }
       XCTAssertGreaterThanOrEqual(status.queuedBytes, 0)
       XCTAssertLessThanOrEqual(status.queuedBytes, LogWriter.hardCapBytes)
       XCTAssertGreaterThanOrEqual(status.lostEntries, 0)
     }
 
-    // How many polls fit depends on how fast the machine drains, so the count
-    // is only a guard against the loop never running. The claim under test is
-    // the latency, and that a poll landed while bytes really were in flight.
-    XCTAssertGreaterThan(polls, 0, "the poll loop should have run while writing")
-    XCTAssertTrue(sawWorkInFlight, "at least one poll should have caught the writer busy")
-    XCTAssertLessThan(slowest, 0.25, "getStatus must not wait behind writer I/O")
+    XCTAssertTrue(
+      sawWorkInFlight,
+      "the writer is gated with accepted bytes behind it, so status must see them"
+    )
+
+    release()
     XCTAssertTrue(handle.flush(deadlineMs: 10_000).durable)
+    XCTAssertEqual(handle.status().queuedBytes, 0, "the gate lifted and the queue drained")
   }
 
   /// The whole lifecycle at once: writing, rotating, compressing, purging, and

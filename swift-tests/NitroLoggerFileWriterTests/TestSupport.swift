@@ -69,7 +69,8 @@ class LogWriterTestCase: XCTestCase {
     lineFramed: Bool = true,
     rawWrite: LogWriter.RawWrite? = nil,
     compressor: LogWriter.Compressor? = nil,
-    steady: LogWriter.Steady? = nil
+    steady: LogWriter.Steady? = nil,
+    clock: LogWriter.Clock? = nil
   ) throws -> LogFileHandle {
     let handle = try registry.acquire(
       path: (url ?? logURL).path,
@@ -77,7 +78,8 @@ class LogWriterTestCase: XCTestCase {
       lineFramed: lineFramed,
       rawWrite: rawWrite,
       compressor: compressor,
-      steady: steady
+      steady: steady,
+      clock: clock
     )
     openHandles.append(handle)
     return handle
@@ -134,6 +136,26 @@ class LogWriterTestCase: XCTestCase {
     names().filter { $0 != "app.log" && $0 != LogWriter.lockName("app.log") }
   }
 
+  /// Backdates every current archive's modification time.
+  ///
+  /// Archive retention asks how old a *file* is, and the filesystem's answer is
+  /// the input — not the clock. So an expiry test moves the file rather than the
+  /// clock: advancing the clock would age the archives this rotation is about to
+  /// create just as much as the one it is meant to expire, and the sweep would
+  /// take both.
+  ///
+  /// The counterpart to [WallClock], which is for the other kind of age: how
+  /// long the *open* file has been open, which the writer tracks in memory.
+  func backdateArchives(by seconds: TimeInterval) throws {
+    let when = Date().addingTimeInterval(-seconds)
+    for name in archiveNames() {
+      try FileManager.default.setAttributes(
+        [.modificationDate: when],
+        ofItemAtPath: logsDirectory.appendingPathComponent(name).path
+      )
+    }
+  }
+
   /// Appends and waits for the write to land, so assertions do not race.
   @discardableResult
   func write(_ handle: LogFileHandle, _ text: String, entries: Int = 1) -> LogAppendResult {
@@ -163,6 +185,50 @@ final class SteadyClock {
   func advance(_ by: Int64) {
     lock.lock()
     millis += by
+    lock.unlock()
+  }
+}
+
+/// A wall clock the test moves by hand, for ages and retention cutoffs.
+///
+/// Locked for the same reason [SteadyClock] is: the writer reads it on its own
+/// queue while the test advances it from the test thread.
+///
+/// It exists because the alternative is sleeping. An age test that sleeps
+/// 200 ms against a 50 ms threshold is really asserting that the machine
+/// scheduled it promptly, and under `swift test --parallel` that assumption
+/// broke: more than the threshold could pass between creating the file and
+/// writing to it, so the *write* rotated and every later count was off by one.
+/// Moving the clock instead makes the same tests exact and instant.
+final class WallClock {
+  private let lock = NSLock()
+  private var current: Date
+
+  /// Starts at the real now, and then never moves on its own.
+  ///
+  /// Real now rather than a fixed instant because not everything this clock is
+  /// compared against comes from it. The writer stamps a file it *creates* from
+  /// the clock, but an archive's modification date and a pre-existing file's
+  /// creation date are written by the filesystem in real time. A clock parked
+  /// in 2023 would make every one of those look like it came from the future,
+  /// and nothing would ever age out.
+  ///
+  /// Frozen is the property that matters. Nothing rotates or expires until the
+  /// test says so, which is what removes the race — and it means an `advance`
+  /// should be generous relative to the threshold, since the gap between
+  /// constructing this and creating the file is real elapsed time working
+  /// against it.
+  init(_ start: Date = Date()) { current = start }
+
+  var now: Date {
+    lock.lock()
+    defer { lock.unlock() }
+    return current
+  }
+
+  func advance(_ by: TimeInterval) {
+    lock.lock()
+    current = current.addingTimeInterval(by)
     lock.unlock()
   }
 }

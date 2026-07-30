@@ -66,6 +66,10 @@ public final class LogWriterRegistry {
     /// `monotonic`, and forwarding it here is the only way a test can reach it:
     /// writers are only ever built through this call.
     steady: LogWriter.Steady? = nil,
+    /// Wall clock for age rotation and archive retention — see `LogWriter.Clock`.
+    /// Forwarded here for the same reason `steady` is: writers are only ever
+    /// built through this call, so this is the only place a test can reach it.
+    clock: LogWriter.Clock? = nil,
     /// Reports the canonical path, once, the instant resolution produces it.
     ///
     /// For the caller that has to answer "where are the artifacts" after this
@@ -139,6 +143,7 @@ public final class LogWriterRegistry {
         rawWrite: rawWrite,
         compressor: compressor,
         steady: steady,
+        clock: clock,
         directoryShortfall: resolved.shortfall
       )
       writers[resolved.canonicalPath] = writer
