@@ -195,8 +195,14 @@ platforms is a bug report nobody can reproduce.
 
 The rows below are the places where they genuinely differ, and why. Everything
 not listed here is the same on both platforms and covered by suites that assert
-the same invariants: 122 XCTest cases and 102 JUnit cases, neither of which needs
-a simulator or an emulator.
+the same invariants: 151 XCTest cases and 123 JUnit cases, neither of which
+needs a simulator or an emulator.
+
+One Android suite does need a device. `AndroidPlatformIo` is every
+`android.system.Os` call the writer makes, and a JVM cannot make them — the JVM
+job exercises `PlatformIo.Jvm`, a different implementation of the same
+interface. Its 13 cases run on an emulator at API 24 and 34, and are the only
+part of either platform's coverage that is not free.
 
 | Concern | iOS | Android | Consequence |
 | ------- | --- | ------- | ----------- |
@@ -207,8 +213,40 @@ a simulator or an emulator.
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
 | Deadlines | `DispatchTime` everywhere a wait or backoff is measured: the writer's queue waits, reopen/rotation backoffs, the purge lock, and the registry's close-drain waits (a `pthread_cond_timedwait_relative_np` condition, since `NSCondition` can only wait against a `Date`) | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently. Through 0.1.2 the registry's three waits were realtime — an NTP step during teardown could stretch a 200 ms close budget to the 30 s ceiling |
 | Sink lifecycle | `FileSinkLifecycle` (`ios/FileSinkLifecycle.swift`), which carries the transition table | `FileSinkLifecycle.kt`, the same states and transitions | **intended to be identical, and pinned by matching transition-table suites** — not identical *by construction*: these are two hand-written implementations of one table and can drift, which is what the paired suites exist to catch. A row added to one belongs in the other. Through 0.1.2 the rules lived in the two adapters instead, with no test on either, and they disagreed: with no live handle, `flush` and `close` reported `durable: true` on iOS and `false` on Android, in **both** the never-opened and the closed-after-open state. Now both answer `true` only where the claim is vacuous |
+| Releasing a sink nobody closed | `deinit`, which is deterministic: the descriptor and the registry slot come back whether or not JavaScript ran | nothing equivalent — `finalize()` exists but cannot run (see below) | on Android `close()` or `dispose()` is load-bearing, not a tidy-up |
 | Console chunk size | 900 bytes per `os_log` entry | 3800 bytes per logcat entry | the platform limits genuinely differ; the behaviour around them — `(i/n)` markers, 8-chunk ceiling, a truncation notice that fits inside its own entry — is identical |
 | Console split boundary | grapheme clusters (`Character`) | code points | iOS also keeps combining sequences whole; Android only guarantees surrogate pairs are not cut. Both prevent replacement characters, which is the corruption that matters — see below |
+
+## Why an unclosed Android sink stays open
+
+On iOS, a `FileSink` that goes out of scope releases its writer: `deinit` runs
+deterministically, hands the handle back to the registry, and the descriptor
+and the slot are free. Nothing on the JavaScript side has to cooperate.
+
+Android has no equivalent, and the `finalize()` in `HybridFileSink` is not one.
+Nitro's `HybridObject.CxxPart` holds a `HybridData` whose C++ side holds a JNI
+*global* reference back to that same `CxxPart`; a global reference is a garbage
+collection root, so the cycle is rooted outside the Java heap and the object is
+never collected. `CxxPart` also holds the sink strongly. Only
+`HybridData.resetNative()` breaks the cycle, and the only thing that reaches it
+is `dispose()`.
+
+Two consequences worth designing around:
+
+- **`close()` — or `dispose()` — is part of the contract on Android**, not
+  housekeeping. `FileDestination` does this for you; a raw sink does not.
+- **A development reload leaks a writer.** Metro tears the JavaScript context
+  down without running any of it, so nothing closes the sink. The writer keeps
+  the registry slot and the descriptor until the process ends, and the next
+  `open` with a *different* rotation config is refused `CONFIG_CONFLICT`
+  against a sink nothing can reach. Reopening with the same config is fine —
+  the registry shares the existing writer — so this bites when you edit
+  rotation settings and reload. Restarting the app clears it.
+
+This is a known gap, deliberately not papered over: the mechanisms that would
+release the claim without an observable termination signal can produce two live
+writers for one path, which is worse than the leak. `SPIKE-C13.md` in the
+repository records what would close it.
 
 ## Why the console split boundary differs
 

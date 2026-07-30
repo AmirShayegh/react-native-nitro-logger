@@ -44,6 +44,11 @@ android {
   defaultConfig {
     minSdkVersion getExtOrDefault("minSdkVersion")
 
+    // For `AndroidPlatformIoTest`, which is the only thing in this library that
+    // needs a device: it exercises the `android.system.Os` implementation of
+    // `PlatformIo`, whose whole job is the syscalls a JVM cannot make.
+    testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
     externalNativeBuild {
       cmake {
         cppFlags "-frtti -fexceptions -Wall -fstack-protector-all"
@@ -121,4 +126,12 @@ dependencies {
   implementation project(":react-native-nitro-modules")
 
   testImplementation "junit:junit:4.13.2"
+
+  // Deliberately not Robolectric. Robolectric shadows `android.system.Os`, so a
+  // suite written against it would replace zero coverage of `AndroidPlatformIo`
+  // with coverage of a *different* implementation — which is the defect this
+  // suite exists to close, restated.
+  androidTestImplementation "junit:junit:4.13.2"
+  androidTestImplementation "androidx.test:runner:1.6.2"
+  androidTestImplementation "androidx.test.ext:junit:1.2.1"
 }

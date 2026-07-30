@@ -41,19 +41,30 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   /**
-   * The release that happens whether or not anything asked for one, and the
-   * reason this class needs both.
+   * **This cannot run on Nitro 0.36, and is kept as the hook it would be if
+   * that changed.** See `SPIKE-C13.md`; the short version:
    *
-   * A Metro reload tears the JavaScript context down without running any of
-   * it, so a JS `dispose()` is never a guarantee. Without this the writer
-   * survives the reload holding the registry slot and the descriptor, and the
-   * next `open` with a different rotation config fails `CONFIG_CONFLICT`
-   * against a sink nothing can reach to close — an every-reload failure during
-   * development. iOS gets this from `deinit`; on ART the equivalent is
-   * `finalize`, deprecated and still the only hook there is.
+   * `HybridObject.CxxPart` holds a `HybridData` whose C++ side holds a JNI
+   * *global* reference back to that same `CxxPart`. A global reference is a GC
+   * root, so the cycle is rooted outside the Java heap and ART can never
+   * collect it — and `CxxPart.javaPart` pins this object along with it. Only
+   * `HybridData.resetNative()` breaks that, which is reached only through
+   * `dispose()`. So an object nobody disposes is immortal, and its finalizer
+   * never runs.
    *
-   * Best effort by nature: the finalizer thread may never run this. It is a
-   * backstop under `dispose`, not a replacement for it.
+   * Which matters because a Metro reload tears the JavaScript context down
+   * without running any of it: no `close()`, no `dispose()`. The writer
+   * survives holding the registry slot and the descriptor, and the next `open`
+   * with a different rotation config fails `CONFIG_CONFLICT` against a sink
+   * nothing can reach — an every-reload failure during development, and it is
+   * still open. iOS has no equivalent problem: `deinit` is not a finalizer and
+   * runs deterministically.
+   *
+   * Left in place rather than deleted because the alternatives are worse than
+   * the leak — a claim that expires on a timer or on the next `open` produces
+   * *two* live writers for one path — and because the day Nitro breaks that
+   * cycle this becomes correct with no other change. Removing it would take
+   * the reasoning with it.
    */
   @Suppress("removal", "DEPRECATION")
   protected fun finalize() {

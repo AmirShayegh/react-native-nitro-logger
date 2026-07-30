@@ -132,6 +132,70 @@ jobs:
           cd example/android
           ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain
 
+  # `AndroidPlatformIo` — the only part of the Android writer that is not
+  # JVM-testable, and through 0.1.2 the only part in no test at all.
+  #
+  # `test-android` above exercises `PlatformIo.Jvm`: a *different*
+  # implementation of the same interface, written for the desktop JVM. Every
+  # `android.system.Os` call the library actually makes on a device was
+  # uncovered while that job's green tick read as "the Android writer is
+  # tested". Robolectric would not have closed it either — it shadows
+  # `android.system.Os`, so the suite would cover a third implementation.
+  #
+  # Two API levels, and the low one is not ceremony. `java.nio.file` is API 26
+  # and this library supports 24, so `PlatformIo.Jvm.Nio` is held in a separate
+  # nested object precisely so that `AndroidPlatformIo`'s `restrictToOwner`
+  # fallback can resolve `Jvm` without dragging it in. If that split ever
+  # breaks, the symptom is a `NoClassDefFoundError` — an `Error`, which passes
+  # straight through every `catch (Exception)` in the file — and API 24 is the
+  # only place it is observable.
+  test-android-instrumented:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [24, 34]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Install JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Generate nitrogen code
+        run: yarn nitrogen
+
+      # The runner image ships KVM but leaves it root-only; without this the
+      # emulator silently falls back to software rendering and times out.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run the instrumented suite
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          # `default` carries the Google APIs images' extras without their
+          # size; `google_apis` is only needed for Play Services, which this
+          # library does not touch.
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # A single ABI, because the emulator only runs one and building the
+          # other three is minutes of NDK work for artifacts nothing installs.
+          script: ORG_GRADLE_PROJECT_reactNativeArchitectures=x86_64 ./scripts/check-android-instrumented.sh
+
   build-library:
     runs-on: ubuntu-latest
 

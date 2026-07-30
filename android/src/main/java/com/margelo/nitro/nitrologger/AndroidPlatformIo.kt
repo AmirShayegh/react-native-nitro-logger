@@ -20,6 +20,32 @@ import java.io.FileDescriptor
  * a `catch (Exception)` would contain.
  */
 object AndroidPlatformIo : PlatformIo {
+  /**
+   * The modes every artifact this package writes must end up with.
+   *
+   * Hoisted out of the `chmod` call because Kotlin has no octal literal, so
+   * these are decimal and a transposed digit is not something reading the call
+   * site catches. Named here, they can be pinned by a test rather than
+   * restated by one — a test that spelled `448` a second time would agree with
+   * whatever this file said.
+   *
+   * `448` is `0700`, `384` is `0600`.
+   */
+  internal const val DIRECTORY_MODE = 448
+  internal const val FILE_MODE = 384
+
+  /**
+   * The bits of `st_mode` a mode argument can set — `07777`, so the three
+   * permission triples plus setuid/setgid/sticky.
+   *
+   * Masked rather than compared whole: the rest of `st_mode` is the file type,
+   * which `chmod` neither sets nor could change.
+   */
+  internal const val MODE_MASK = 4095
+
+  internal fun wantedMode(isDirectory: Boolean): Int =
+    if (isDirectory) DIRECTORY_MODE else FILE_MODE
+
   override fun linkCount(descriptor: FileDescriptor): Int = try {
     if (!descriptor.valid()) -1 else Os.fstat(descriptor).st_nlink.toInt()
   } catch (_: Throwable) {
@@ -75,14 +101,51 @@ object AndroidPlatformIo : PlatformIo {
     true
   }
 
-  override fun restrictToOwner(file: File, isDirectory: Boolean): Boolean = try {
+  /**
+   * Tightens the mode, then **reads it back** and answers on what is actually
+   * on the file.
+   *
+   * A successful `chmod` is not evidence that the mode took. Android mounts
+   * filesystems that quietly ignore it — the FUSE layer over shared storage
+   * derives permissions from the mount and returns success for any `chmod`,
+   * and a FAT-formatted volume has no mode bits to set — and every one of
+   * those returns 0 while leaving the file exactly as readable as it was. The
+   * only honest source for "is this file owner-only" is the file.
+   *
+   * `stat`, not `lstat`: `chmod` resolves the final symlink, so the inode this
+   * verifies has to be the one `chmod` acted on. `lstat` would report the
+   * link's own mode — `0777` on Linux, always — and fail every time. (The
+   * writer refuses a symlinked leaf before it gets here; that is a separate
+   * check with a separate reason, and this must not silently double as it.)
+   *
+   * The verdict covers the fallback too, which is the point of doing it after
+   * both: `java.io`'s permission helpers cannot express `0700` in one step, so
+   * whether they arrived somewhere acceptable is exactly the question, and
+   * their own return values only report that the calls were made.
+   *
+   * False here is a `protection` degradation, not a failure — see [PlatformIo].
+   */
+  override fun restrictToOwner(file: File, isDirectory: Boolean): Boolean {
+    val wanted = wantedMode(isDirectory)
+
     // chmod through the path rather than the java.io.File permission helpers:
     // those go through three separate syscalls with observable intermediate
     // states, and cannot express 0700 in one step.
-    Os.chmod(file.absolutePath, if (isDirectory) 448 /* 0700 */ else 384 /* 0600 */)
-    true
-  } catch (_: Throwable) {
-    PlatformIo.Jvm.restrictToOwner(file, isDirectory)
+    val attempted = try {
+      Os.chmod(file.absolutePath, wanted)
+      true
+    } catch (_: Throwable) {
+      PlatformIo.Jvm.restrictToOwner(file, isDirectory)
+    }
+
+    return try {
+      attempted && (Os.stat(file.absolutePath).st_mode and MODE_MASK) == wanted
+    } catch (_: Throwable) {
+      // Cannot say, and cannot say has to read as "not tightened": the caller
+      // records a degradation, and claiming protection this code never
+      // confirmed is the one direction that matters.
+      false
+    }
   }
 
   /**

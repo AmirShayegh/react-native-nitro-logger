@@ -692,7 +692,12 @@ class LogFileWriterTest {
     w.settleForTesting()
 
     val artifacts = directory.listFiles()!!.filter { it.isFile }
-    assertTrue("nothing rotated, so this asserted nothing", artifacts.size > 1)
+    // Archives by name, not `artifacts.size > 1`. The age sidecar is written on
+    // every open, so `{app.log, app.log.meta}` satisfies a bare count with zero
+    // rotations — the guard would have been green on a writer that never
+    // rotated at all, which is the failure it was put there to rule out.
+    assertTrue("nothing rotated, so this asserted nothing",
+               artifacts.any { LogFileWriter.isArchiveName(it.name, "app.log") })
     for (artifact in artifacts) {
       assertEquals("$artifact is readable by more than its owner",
                    ownerOnlyFile, mode(artifact))
@@ -739,10 +744,8 @@ class LogFileWriterTest {
   }
 
   /**
-   * `noBackupFilesDir` is the other half of the at-rest story and is asserted
-   * nowhere here on purpose: it comes from `HybridFileSink.defaultLogDirectory`
-   * via an Android `Context`, which does not exist under JUnit. It is covered
-   * by the on-device pass, not by a stub that would only restate the source.
+   * The writer records what it could not do; it does not pretend to have done
+   * it, and it does not refuse to log over it.
    */
   @Test
   fun `the writer reports rather than repairs a directory it cannot secure`() {
