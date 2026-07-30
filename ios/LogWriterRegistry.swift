@@ -423,7 +423,16 @@ public final class LogFileHandle {
     // would race the rebind below with nothing to arbitrate the two.
     guard state == .active, !purging else {
       condition.unlock()
-      return LogClearOutcome(deletedCount: 0, failedPaths: [], durable: false)
+      // Name the file. `failedPaths` means "artifacts this call did not remove
+      // and which, as far as it can tell, are still there" — and on a refusal
+      // nothing was deleted, so the log file certainly is. The writer's own
+      // refusals already answer this way (`LogFileWriter.clearLogs` on purge-lock
+      // contention and on a blown deadline), so an empty array here made the two
+      // levels of the same class disagree about the same fact; Android named the
+      // path at both. Bridge-observable: a `ClearOutcome.failedPaths` that was
+      // empty now carries one path on this branch.
+      return LogClearOutcome(
+        deletedCount: 0, failedPaths: [writer.fileURL.path], durable: false)
     }
     purging = true
     condition.unlock()

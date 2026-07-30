@@ -1447,12 +1447,26 @@ class LogFileWriter internal constructor(
         try {
           terminated = true
           closeCurrentStream()
-          // After the stream, before anyone is told: the claim must outlast
-          // every byte this writer will ever put on disk, or a replacement
-          // process can start appending while the last batch is still landing.
-          releaseExclusiveLock()
-          onTerminated?.invoke()
+          closeFaultForTesting?.invoke()
         } finally {
+          // All three in `finally`, and no `catch`. A `Throwable` escaping
+          // `closeCurrentStream` still propagates and still kills this worker —
+          // something genuinely went wrong and pretending otherwise would be
+          // worse — but it must not take the path's claim with it.
+          // `closeCurrentStream` catches `Exception`, not `Throwable`, so an
+          // `Error` escaping here used to strand `closing[path]` for the life of
+          // the process: every later open on that path refused with the disk
+          // perfectly healthy.
+          //
+          // The order is the same one the stream-then-claim rule always had: the
+          // claim must outlast every byte this writer will ever put on disk, or a
+          // replacement process can start appending while the last batch is still
+          // landing.
+          releaseExclusiveLock()
+          // A throwing callback must not cost us the latch. Swallowing is right
+          // here and only here — this is registry bookkeeping with nowhere to
+          // report, and the caller is still waiting on `done`.
+          runCatching { onTerminated?.invoke() }
           done.countDown()
         }
       }
@@ -1930,6 +1944,23 @@ class LogFileWriter internal constructor(
   fun shutdownExecutorForTesting() {
     executor.shutdownNow()
   }
+
+  /**
+   * Makes the close barrier throw, standing in for an `Error` escaping the
+   * stream close.
+   *
+   * There is no natural way to produce one from a test: `closeCurrentStream`
+   * catches `Exception` around the only call that can fail, and the stream is a
+   * plain `FileOutputStream`. This hook runs exactly where an escaping
+   * `Throwable` would — after the stream is shut, before the claim goes back —
+   * so a test using it proves the `finally` returns the claim, not that the hook
+   * works.
+   *
+   * Set it and the writer's worker thread dies on the next close. Nothing resets
+   * it; a test that sets it is finished with that writer.
+   */
+  @Volatile
+  var closeFaultForTesting: (() -> Unit)? = null
 
   /** Blocks the executor until the returned lambda is called. */
   fun stallForTesting(): () -> Unit {

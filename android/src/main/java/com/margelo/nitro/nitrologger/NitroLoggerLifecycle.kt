@@ -37,7 +37,21 @@ internal class NitroLoggerLifecycle(context: ReactApplicationContext) :
    * is running" — a constructed-but-never-initialized module is one whose
    * `invalidate` may still be called, and ending an epoch that never began
    * would be a claim about a runtime that never ran.
+   *
+   * **`@Volatile`, and it is load-bearing.** `initialize()` and `invalidate()`
+   * are not guaranteed to run on the same thread, and
+   * [ReactInstanceEpoch.begin]'s own lock is released *before* this field is
+   * written — so it establishes no happens-before edge for it. Without the
+   * annotation, `invalidate()` may read a stale `null`: the epoch never ends,
+   * `releaseOwner` never sweeps, and the reload leak this class exists to close
+   * comes back silently, on some devices and not others.
+   *
+   * The read-then-clear below is deliberately not atomic. It does not need to
+   * be: two `invalidate()` calls racing would both read the same token and
+   * [ReactInstanceEpoch.end] is idempotent — the second `live.remove` finds
+   * nothing and returns.
    */
+  @Volatile
   private var token: Long? = null
 
   override fun getName(): String = NAME

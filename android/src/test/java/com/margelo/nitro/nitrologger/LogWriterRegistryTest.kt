@@ -236,6 +236,47 @@ class LogWriterRegistryTest {
     assertFalse(outcome.rebound)
   }
 
+  // `failedPaths` means "still there, as far as this call can tell", and a
+  // refusal deleted nothing — so the log file qualifies. iOS returned an empty
+  // array here through 0.2.0 while its own writer-level refusals named the path;
+  // this is the anchor for the side that was already right.
+  @Test
+  fun `a refused purge names the file it did not delete`() {
+    val handle = acquire(File(directory, "app.log").absolutePath)
+    // The writer's own answer, not the string this test passed in: acquisition
+    // resolves the path through realpath, and on macOS the temp directory
+    // arrives under `/var` and comes back under `/private/var`.
+    val resolved = handle.filePath
+    handle.close(1000.0)
+
+    val outcome = handle.clearLogs(1000.0)
+    assertFalse(outcome.durable)
+    assertEquals(0, outcome.deletedCount)
+    assertEquals(listOf(resolved), outcome.failedPaths)
+  }
+
+  // The claim has to come back even when the barrier dies. `closeCurrentStream`
+  // catches Exception, not Throwable, so an Error escaping it used to strand
+  // `closing[path]` for the life of the process — every later open on that path
+  // refused, with the disk perfectly healthy.
+  @Test
+  fun `a close whose barrier throws still frees the path`() {
+    val path = File(directory, "app.log").absolutePath
+    val first = acquire(path)
+    first.writerForTesting.closeFaultForTesting = { throw AssertionError("barrier fault") }
+
+    first.close(1000.0)
+
+    assertEquals(
+      "the Error must not have taken the path's claim with it",
+      0,
+      registry.closingCountForTesting
+    )
+    val second = acquire(path)
+    assertNotSame(first, second)
+    assertTrue(second.appendBatch("fresh\n", 1).accepted)
+  }
+
   // The close budget is one budget, not one per wait.
   @Test
   fun `close spends a single budget across every wait it does`() {

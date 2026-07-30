@@ -1300,14 +1300,21 @@ public final class LogWriter {
     let group = DispatchGroup()
     group.enter()
     queue.async { [self] in
-      terminated = true
-      closeCurrentHandle()
-      // After the handle, before anyone is told: the claim must outlast every
+      // `defer`, so the ordering is structural rather than incidental. Nothing
+      // in this block throws today, so this is not a behaviour change — it is
+      // the guarantee the Kotlin twin needs a `finally` to get, written the same
+      // way here so the next edit to either cannot quietly break one of them.
+      //
+      // The order is the stream-then-claim rule: the claim must outlast every
       // byte this writer will ever put on disk, or a replacement process can
       // start appending while the last batch is still landing.
-      releaseExclusiveLock()
-      onTerminated?()
-      group.leave()
+      defer {
+        releaseExclusiveLock()
+        onTerminated?()
+        group.leave()
+      }
+      terminated = true
+      closeCurrentHandle()
     }
     // Whatever the flush left of the budget, and nothing more. A deadline
     // already in the past makes this return at once rather than wait afresh.

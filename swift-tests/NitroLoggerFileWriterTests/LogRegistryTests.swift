@@ -298,6 +298,21 @@ final class LogRegistryTests: LogWriterTestCase {
     XCTAssertTrue(write(keeper, "and keeps going\n").accepted)
   }
 
+  /// `failedPaths` means "still there, as far as this call can tell". A refusal
+  /// deleted nothing, so the log file qualifies — and this level used to say
+  /// otherwise while the writer's own refusals (`clearLogs` on purge-lock
+  /// contention, and on a blown deadline) already named the path. Android named
+  /// it at both levels; iOS disagreed with itself.
+  func testARefusedPurgeNamesTheFileItDidNotDelete() throws {
+    let handle = try makeHandle()
+    _ = handle.close(deadlineMs: 1000)
+
+    let outcome = handle.clearLogs(deadlineMs: 1000)
+    XCTAssertFalse(outcome.durable)
+    XCTAssertEqual(outcome.deletedCount, 0)
+    XCTAssertEqual(outcome.failedPaths, [logURL.path])
+  }
+
   // MARK: - Ownership across close
 
   /// Eviction and close are not one atomic step, and between them the map has

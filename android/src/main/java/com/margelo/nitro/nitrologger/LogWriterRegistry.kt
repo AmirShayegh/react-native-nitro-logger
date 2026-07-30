@@ -520,6 +520,13 @@ class LogFileHandle internal constructor(
   val filePath: String get() = writer.file.absolutePath
 
   /**
+   * The writer behind this handle, for tests that need to reach its injected
+   * seams while still going through the registry — the Kotlin twin of Swift's
+   * accessor of the same name. Nothing in production reads it.
+   */
+  internal val writerForTesting: LogFileWriter get() = writer
+
+  /**
    * Whether this handle may still speak for the writer.
    *
    * Every entry point below is gated on it, and on ACTIVE specifically rather
