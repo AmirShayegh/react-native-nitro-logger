@@ -3,8 +3,6 @@ package com.margelo.nitro.nitrologger
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
 import java.io.File
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 /**
  * The Nitro adapter. Everything interesting is in [LogFileWriter]; this
@@ -18,49 +16,18 @@ import kotlin.concurrent.withLock
 @DoNotStrip
 class HybridFileSink : HybridFileSinkSpec() {
   /**
-   * Guards [handle] and [mayHaveArtifacts] together, matching the iOS adapter.
+   * The handle, the artifacts flag, and every rule about which combinations are
+   * legal — see [FileSinkLifecycle], and `ios/FileSinkLifecycle.swift` for the
+   * full transition table.
    *
-   * They have to move under one lock rather than being individually volatile:
-   * the question `clearLogs` asks is the *pair* — no handle AND nothing was
-   * ever created. Reading them separately lets a close land in between and
-   * produce "no handle, never opened", which is the one answer that is never
-   * true and the one that reports a durable purge over surviving files.
+   * Kept out of this file on purpose. This class needs nitrogen-generated code
+   * to compile, so while these rules lived here they went untested on both
+   * platforms — which is how the two adapters came to answer the same question
+   * differently.
    */
-  private val lock = ReentrantLock()
-  private var handle: LogFileHandle? = null
+  private val lifecycle = FileSinkLifecycle()
 
-  /**
-   * Whether this sink may have put anything on disk.
-   *
-   * A null handle conflates two states that owe the caller opposite answers:
-   * nothing was ever created, and the files are still there but out of reach.
-   *
-   * Set *before* the acquisition attempt, not after it succeeds. Acquiring
-   * creates the log directory and can then fail on the file itself, so a throw
-   * is not evidence that nothing was written — and this flag exists precisely
-   * to keep a later purge from claiming otherwise. Never cleared: closing
-   * releases the handle, it does not unmake the files.
-   */
-  private var mayHaveArtifacts = false
-
-  /**
-   * An [open] past its check and inside `acquire`.
-   *
-   * Published so a second open is refused instead of racing to install a handle
-   * over the first one's, and so [close] can tell "nothing here" from
-   * "something is on its way".
-   */
-  private var opening = false
-
-  /**
-   * A [close] that arrived while [opening] was true.
-   *
-   * That close had no handle to flush and has already returned; this tells the
-   * in-flight open to throw away what it acquired rather than install it.
-   */
-  private var closePending = false
-
-  private fun current(): LogFileHandle? = lock.withLock { handle }
+  private fun current(): LogFileHandle? = lifecycle.current()
 
   /**
    * The manual release, which JavaScript can call and usually does not.
@@ -94,23 +61,25 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   /**
-   * Deliberately routed through [close] rather than reaching for the handle
-   * directly. `close` is the one place that also records [closePending], and a
-   * `dispose` racing an in-flight `open` is exactly when that matters: JS can
-   * call `dispose` from another thread while `open` is inside `acquire`, and
-   * without the flag that acquisition installs a live writer into a sink
-   * nothing can reach to release. (`finalize` cannot hit that race — a thread
-   * inside `open` keeps the object reachable — but it costs nothing to be
-   * right by construction rather than by argument.)
+   * Terminal, unlike [close]: JavaScript may legitimately close a sink and open
+   * it again, but a disposed object must not be reopened.
    *
-   * Idempotent: `close` detaches under the lock, so a second call finds
+   * Routed through the lifecycle rather than reaching for the handle directly,
+   * because a `dispose` racing an in-flight `open` is exactly when that
+   * matters: JS can call `dispose` from another thread while `open` is inside
+   * `acquire`, and without recording it that acquisition installs a live writer
+   * into an object nothing can reach to release. (`finalize` cannot hit that
+   * race — a thread inside `open` keeps the object reachable — but it costs
+   * nothing to be right by construction rather than by argument.)
+   *
+   * Idempotent: the detach happens under the lock, so a second call finds
    * nothing. Both callers above can fire for the same object.
    *
    * Zero deadline: a teardown must not wait on a wedged disk, and on the
    * finalizer thread blocking would stall every other object's release.
    */
   private fun releaseHandle() {
-    runCatching { close(0.0) }
+    runCatching { lifecycle.beginDispose().handle?.close(0.0) }
   }
 
   override val defaultLogDirectory: String
@@ -126,25 +95,15 @@ class HybridFileSink : HybridFileSinkSpec() {
     }
 
   override fun open(path: String, rotation: RotationConfig?, lineFramed: Boolean?) {
-    lock.withLock {
-      // `opening` counts as open. Acquisition does real I/O — creates the
-      // directory, opens the file, may scan a torn tail — so the lock is not
-      // held across it, or every `getStatus` would queue behind disk latency,
-      // which is the one thing that call must not do. The in-flight attempt is
-      // published instead, and a second one is refused rather than allowed to
-      // acquire a writer that would overwrite the first: the loser's handle
-      // would be unreachable, and unreachable means a later purge never
-      // deletes its files.
-      if (handle != null || opening) {
-        throw LogWriterException(
-          LogWriterException.Kind.CONFIG_CONFLICT,
-          "this sink is already open"
-        )
-      }
-      opening = true
-      closePending = false
-      // Before the attempt: see [mayHaveArtifacts].
-      mayHaveArtifacts = true
+    // Refused rather than allowed to race a second acquisition: the loser's
+    // handle would be unreachable, and unreachable means a later purge never
+    // deletes its files. The lock is not held across the acquisition, which
+    // does real I/O — see [FileSinkLifecycle].
+    if (!lifecycle.beginOpen()) {
+      throw LogWriterException(
+        LogWriterException.Kind.CONFIG_CONFLICT,
+        "this sink is already open"
+      )
     }
 
     val acquired = try {
@@ -158,24 +117,20 @@ class HybridFileSink : HybridFileSinkSpec() {
         platform = AndroidPlatformIo
       )
     } catch (e: Throwable) {
-      // Failed attempts have to clear the flag, or a retry is refused forever.
-      lock.withLock { opening = false }
+      // Failed attempts have to release the claim, or a retry is refused
+      // forever.
+      lifecycle.failOpen()
       throw e
     }
 
-    val abandon = lock.withLock {
-      opening = false
-      val pending = closePending
-      closePending = false
-      // A close that arrived mid-acquisition found nothing to hand back and has
-      // already returned. Installing now would leave a live writer holding a
-      // descriptor nothing can reach or release.
-      if (!pending) handle = acquired
-      pending
-    }
-
+    // A close that arrived mid-acquisition found nothing to hand back and has
+    // already returned. Installing now would leave a live writer holding a
+    // descriptor nothing can reach or release.
+    //
     // Zero deadline: the caller has already been told this sink is closed.
-    if (abandon) acquired.close(0.0)
+    if (lifecycle.finishOpen(acquired) == FileSinkLifecycle.Installation.ABANDON) {
+      acquired.close(0.0)
+    }
   }
 
   private fun policyOf(rotation: RotationConfig?): LogRotationPolicy {
@@ -232,24 +187,38 @@ class HybridFileSink : HybridFileSinkSpec() {
   }
 
   override fun flush(deadlineMs: Double): FlushOutcome {
-    val live = current() ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
+    // One snapshot, so the handle and the answer to give without one cannot
+    // disagree about which instant they describe.
+    val (live, durableWithoutHandle) = lifecycle.snapshot()
+    if (live == null) return noHandleOutcome(durableWithoutHandle)
     return outcomeOf(live.flush(deadlineMs))
   }
 
   override fun close(deadlineMs: Double): FlushOutcome {
-    // Detached before the close runs, so a concurrent caller cannot pick up a
-    // handle that is on its way out.
-    val live = lock.withLock {
-      val current = handle
-      handle = null
-      // Nothing to close, but an acquisition is in flight and will finish after
-      // this returns. Recording the intent keeps that writer from being
-      // installed into a sink the caller has already closed.
-      if (current == null && opening) closePending = true
-      current
-    } ?: return FlushOutcome(false, false, 0.0, 0.0, 0.0, 0.0, 0.0)
+    // Detaching also records the close against an acquisition still in flight,
+    // which keeps that writer from being installed into a sink the caller has
+    // already closed.
+    val detached = lifecycle.beginClose()
+    val live = detached.handle ?: return noHandleOutcome(detached.durableWithoutHandle)
     return outcomeOf(live.close(deadlineMs))
   }
+
+  /**
+   * What [flush] and [close] answer when there is no handle to ask.
+   *
+   * `durable` is the whole question, and it differs between the two states that
+   * produce no handle. Never opened: nothing was ever accepted, so "every
+   * accepted byte reached storage" holds with nothing to check. Opened and
+   * since closed: the files are out of reach and this object cannot vouch for
+   * them — `true` there would tell the JavaScript batcher to mark loss notices
+   * confirmed that may never have reached disk, including after a close that
+   * timed out with bytes still pending.
+   *
+   * This used to be an unconditional `false`, which re-armed notices for a sink
+   * that could not owe any; iOS used to be an unconditional `true`.
+   */
+  private fun noHandleOutcome(durable: Boolean) =
+    FlushOutcome(durable, false, 0.0, 0.0, 0.0, 0.0, 0.0)
 
   private fun outcomeOf(outcome: LogFlushOutcome) = FlushOutcome(
     outcome.durable,
@@ -278,9 +247,8 @@ class HybridFileSink : HybridFileSinkSpec() {
     // separate reads would show "no handle, nothing created", which is the one
     // combination that is never true and the one that lies in the dangerous
     // direction.
-    val live = lock.withLock {
-      handle ?: return ClearOutcome(0.0, emptyArray(), !mayHaveArtifacts, false)
-    }
+    val (live, durableWithoutHandle) = lifecycle.snapshot()
+    if (live == null) return ClearOutcome(0.0, emptyArray(), durableWithoutHandle, false)
     val outcome = live.clearLogs(deadlineMs)
     return ClearOutcome(
       outcome.deletedCount.toDouble(),

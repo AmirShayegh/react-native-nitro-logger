@@ -13,37 +13,14 @@ import NitroModules
 /// under XCTest in about a second instead of by hand on a simulator. Anything
 /// that grows logic in this file has been put in the wrong place.
 final class HybridFileSink: HybridFileSinkSpec {
-  private let lock = NSLock()
-  private var handle: LogFileHandle?
-
-  /// Whether this sink may have put anything on disk.
+  /// The handle, the artifacts flag, and every rule about which combinations
+  /// are legal — see `FileSinkLifecycle`, which carries the transition table.
   ///
-  /// `handle == nil` conflates two states that owe the caller opposite answers.
-  /// A sink that created nothing can say "everything is deleted" vacuously. A
-  /// sink whose files are on disk but out of reach cannot — and reporting a
-  /// durable purge over those is the worst lie in the API, because the only
-  /// caller who asks is the one deleting patient data on request.
-  ///
-  /// Set *before* the acquisition attempt rather than after it succeeds.
-  /// Acquiring creates the log directory and can then fail on the file itself,
-  /// so a throw out of `acquire` is not evidence that nothing was written.
-  ///
-  /// Never cleared once set: `close` releases the handle, it does not unmake
-  /// the files.
-  private var mayHaveArtifacts = false
-
-  /// An `open` past its check and inside `acquire`.
-  ///
-  /// Published so a second `open` is refused instead of racing to install a
-  /// handle over the first one's, and so `close` can tell "nothing here" from
-  /// "something is on its way".
-  private var opening = false
-
-  /// A `close` that arrived while `opening` was true.
-  ///
-  /// The close had no handle to flush and has already returned; this tells the
-  /// in-flight `open` to throw away what it acquired rather than install it.
-  private var closePending = false
+  /// Kept out of this file on purpose. This class cannot be built without
+  /// Nitro and so cannot be in the test target, and while these rules lived
+  /// here they were untested on both platforms — which is how the two adapters
+  /// came to give different answers to the same question.
+  private let lifecycle = FileSinkLifecycle()
 
   /// The native finalizer, which is the whole reason the refcount is native.
   ///
@@ -51,12 +28,8 @@ final class HybridFileSink: HybridFileSinkSpec {
   /// not a guarantee — but this deinit is. Releasing here hands the descriptor
   /// and the registry slot back even when nothing on the JS side got to run.
   deinit {
-    lock.lock()
-    let live = handle
-    handle = nil
-    lock.unlock()
     // Zero deadline: a teardown deinit must not wait on a wedged disk.
-    _ = live?.close(deadlineMs: 0)
+    _ = lifecycle.beginDispose().handle?.close(deadlineMs: 0)
   }
 
   var defaultLogDirectory: String {
@@ -66,32 +39,12 @@ final class HybridFileSink: HybridFileSinkSpec {
   }
 
   func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws {
-    lock.lock()
-    // `opening` counts as open. Acquisition does real I/O — it creates the
-    // directory, opens the file, and may scan a torn tail — so the lock cannot
-    // be held across it without putting every `getStatus` behind disk latency,
-    // which is the one thing that call is documented not to do. Instead the
-    // in-flight attempt is published, and a second one is refused rather than
-    // being allowed to acquire a writer that would overwrite the first: the
-    // loser's handle would be unreachable, and unreachable means a later purge
-    // never deletes its files.
-    let busy = handle != nil || opening
-    if !busy {
-      opening = true
-      closePending = false
-      // Recorded before the attempt: see `mayHaveArtifacts`.
-      mayHaveArtifacts = true
-    }
-    lock.unlock()
-    guard !busy else {
+    // Refused rather than allowed to race a second acquisition: the loser's
+    // handle would be unreachable, and unreachable means a later purge never
+    // deletes its files. The lock is not held across the acquisition, which
+    // does real I/O — see `FileSinkLifecycle`.
+    guard lifecycle.beginOpen() else {
       throw RuntimeError.error(withMessage: "FileSink: already open")
-    }
-
-    // However this attempt ends, it is no longer in flight afterwards.
-    defer {
-      lock.lock()
-      opening = false
-      lock.unlock()
     }
 
     let acquired: LogFileHandle
@@ -104,34 +57,19 @@ final class HybridFileSink: HybridFileSinkSpec {
         // tell a torn one from an intentional newline.
         lineFramed: lineFramed ?? false
       )
-    } catch LogWriterError.configConflict {
-      throw RuntimeError.error(
-        withMessage: "FileSink: another destination already opened this file with a different configuration")
-    } catch LogWriterError.symlinkEscape {
-      throw RuntimeError.error(withMessage: "FileSink: the log path is a symbolic link")
-    } catch LogWriterError.stillClosing {
-      // Distinct from the others because it is the one worth retrying: a
-      // previous destination on this file has not finished shutting down, and
-      // opening a second writer alongside it is exactly what must not happen.
-      throw RuntimeError.error(
-        withMessage: "FileSink: the previous destination for this file is still closing")
     } catch {
-      // Deliberately payload-free. An `errno` description or a path is exactly
-      // the kind of string that carries a username, and this message crosses
-      // into JavaScript where something will eventually log it.
-      throw RuntimeError.error(withMessage: "FileSink: could not open the log file")
+      // One exit, whatever went wrong. A failure that leaves the attempt
+      // published refuses every later open for the life of the object, and
+      // spreading the release across one clause per error kind is how the
+      // clause added next gets forgotten.
+      lifecycle.failOpen()
+      throw Self.openFailure(error)
     }
 
-    lock.lock()
     // A close that arrived mid-acquisition found nothing to hand back and has
     // already returned. Installing now would leave a live writer holding a
     // descriptor that nothing can reach or release.
-    let abandon = closePending
-    closePending = false
-    if !abandon { handle = acquired }
-    lock.unlock()
-
-    if abandon {
+    if lifecycle.finishOpen(acquired) == .abandon {
       // Zero deadline: the caller has already been told this sink is closed.
       _ = acquired.close(deadlineMs: 0)
     }
@@ -160,26 +98,23 @@ final class HybridFileSink: HybridFileSinkSpec {
   }
 
   func flush(deadlineMs: Double) throws -> FlushOutcome {
-    guard let handle = current() else {
-      // Nothing was ever accepted through this sink, so "every accepted byte
-      // reached storage" holds vacuously. Reporting otherwise would have the
-      // JavaScript side retry a flush that can never have anything to do.
-      return Self.emptyOutcome()
+    // One snapshot, so the handle and the answer to give without one cannot
+    // disagree about which instant they describe.
+    let (live, durableWithoutHandle) = lifecycle.snapshot()
+    guard let handle = live else {
+      return Self.noHandleOutcome(durable: durableWithoutHandle)
     }
     return Self.flushOutcome(handle.flush(deadlineMs: deadlineMs))
   }
 
   func close(deadlineMs: Double) throws -> FlushOutcome {
-    lock.lock()
-    let live = handle
-    handle = nil
-    // Nothing to close, but an acquisition is in flight and will finish after
-    // this returns. Recording the intent is what keeps that writer from being
-    // installed into a sink the caller has already closed.
-    if live == nil && opening { closePending = true }
-    lock.unlock()
-
-    guard let live else { return Self.emptyOutcome() }
+    // Detaching also records the close against an acquisition still in flight,
+    // which is what keeps that writer from being installed into a sink the
+    // caller has already closed.
+    let detached = lifecycle.beginClose()
+    guard let live = detached.handle else {
+      return Self.noHandleOutcome(durable: detached.durableWithoutHandle)
+    }
     return Self.flushOutcome(live.close(deadlineMs: deadlineMs))
   }
 
@@ -192,10 +127,7 @@ final class HybridFileSink: HybridFileSinkSpec {
     // close land in between and produce "no handle, nothing created" — the one
     // combination that is never true, and the one that lies in the direction
     // that matters.
-    lock.lock()
-    let live = handle
-    let created = mayHaveArtifacts
-    lock.unlock()
+    let (live, durableWithoutHandle) = lifecycle.snapshot()
 
     guard let handle = live else {
       // Nothing created: "every artifact is gone" holds vacuously. `rebound`
@@ -209,7 +141,7 @@ final class HybridFileSink: HybridFileSinkSpec {
       // `close` nils the handle above before that branch is reachable, so the
       // honest answer has to be produced here.
       return ClearOutcome(
-        deletedCount: 0, failedPaths: [], durable: !created, rebound: false)
+        deletedCount: 0, failedPaths: [], durable: durableWithoutHandle, rebound: false)
     }
     let outcome = handle.clearLogs(deadlineMs: deadlineMs)
     return ClearOutcome(
@@ -220,13 +152,34 @@ final class HybridFileSink: HybridFileSinkSpec {
     )
   }
 
-  private func current() -> LogFileHandle? {
-    lock.lock()
-    defer { lock.unlock() }
-    return handle
-  }
+  private func current() -> LogFileHandle? { lifecycle.current() }
 
   // MARK: - Marshalling
+
+  /// Maps an acquisition failure to a message that can cross into JavaScript.
+  ///
+  /// Payload-free by construction. An `errno` description or a path is exactly
+  /// the kind of string that carries a username, and this message ends up
+  /// somewhere that logs it.
+  private static func openFailure(_ error: Error) -> Error {
+    switch error as? LogWriterError {
+    case .configConflict:
+      return RuntimeError.error(
+        withMessage: "FileSink: another destination already opened this file with a different configuration")
+    case .symlinkEscape:
+      return RuntimeError.error(withMessage: "FileSink: the log path is a symbolic link")
+    case .stillClosing:
+      // Distinct from the others because it is the one worth retrying: a
+      // previous destination on this file has not finished shutting down, and
+      // opening a second writer alongside it is exactly what must not happen.
+      return RuntimeError.error(
+        withMessage: "FileSink: the previous destination for this file is still closing")
+    case .openFailed, .none:
+      // `openFailed` carries a path or an `errno` description, so its payload
+      // is dropped here rather than forwarded.
+      return RuntimeError.error(withMessage: "FileSink: could not open the log file")
+    }
+  }
 
   /// Numbers arrive as `Double` because that is what JavaScript has. The
   /// clamping lives in `LogRotationPolicy.init`, which is also where the Kotlin
@@ -275,8 +228,20 @@ final class HybridFileSink: HybridFileSinkSpec {
     )
   }
 
-  private static func emptyOutcome() -> FlushOutcome {
-    FlushOutcome(durable: true, timedOut: false, pendingBytes: 0,
+  /// What `flush` and `close` answer when there is no handle to ask.
+  ///
+  /// `durable` is the whole question, and it is not the same in both of the
+  /// states that produce no handle — see the table on `FileSinkLifecycle`.
+  ///
+  /// - Never opened: nothing was ever accepted through this sink, so "every
+  ///   accepted byte reached storage" holds with nothing to check.
+  /// - Opened and since closed: the files are out of reach and this object
+  ///   cannot vouch for them. `true` here would tell the JavaScript batcher to
+  ///   mark loss notices confirmed that may never have reached disk — including
+  ///   after a close that timed out with bytes still pending, which is exactly
+  ///   when the claim is worst.
+  private static func noHandleOutcome(durable: Bool) -> FlushOutcome {
+    FlushOutcome(durable: durable, timedOut: false, pendingBytes: 0,
                  queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)
   }
 

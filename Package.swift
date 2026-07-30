@@ -34,6 +34,7 @@ let package = Package(
         "LogFileWriter.swift",
         "LogWriterRegistry.swift",
         "LogSecureFile.swift",
+        "FileSinkLifecycle.swift",
         "Gzip.swift",
         "NativeConsoleWriter.swift",
       ]
