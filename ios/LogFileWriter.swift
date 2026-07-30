@@ -209,6 +209,17 @@ public final class LogWriter {
   /// is the one where it fails, and a real gzip failure needs a full disk.
   public typealias Compressor = (URL, URL) -> Bool
 
+  /// Monotonic milliseconds, injectable so a backoff can be waited out in a
+  /// test without waiting.
+  ///
+  /// Separate from the wall clock on purpose, and the separation is the thing
+  /// under test rather than a convenience: backoffs ask "has enough time passed
+  /// since the last failure", which an NTP correction or a user changing the
+  /// date must never re-answer. Without a seam here, replacing the monotonic
+  /// source with `Date()` left every Swift test green — Android had this
+  /// injection and the twin test, and iOS had neither.
+  public typealias Steady = () -> Int64
+
   public let fileURL: URL
   public let canonicalPath: String
   let policy: LogRotationPolicy
@@ -218,6 +229,7 @@ public final class LogWriter {
   private let queueKey = DispatchSpecificKey<Bool>()
   private let rawWrite: RawWrite
   private let compressor: Compressor
+  private let steady: Steady
 
   // MARK: State behind `stateLock` — cheap, never held across I/O
 
@@ -274,6 +286,7 @@ public final class LogWriter {
     lineFramed: Bool,
     rawWrite: RawWrite? = nil,
     compressor: Compressor? = nil,
+    steady: Steady? = nil,
     directoryShortfall: LogSecureFile.Shortfall = []
   ) throws {
     self.fileURL = fileURL
@@ -288,6 +301,7 @@ public final class LogWriter {
       return false
       #endif
     }
+    self.steady = steady ?? Self.steadyMillis
     self.queue = DispatchQueue(label: "com.nitrologger.filewriter")
     queue.setSpecific(key: queueKey, value: true)
 
@@ -631,14 +645,14 @@ public final class LogWriter {
     if terminated { return nil }
 
     if !ignoringBackoff, let last = lastReopenAttempt,
-       Self.steadyMillis() - last < Self.reopenBackoffMs {
+       steady() - last < Self.reopenBackoffMs {
       return nil
     }
     attemptReopen()
     return handle
   }
 
-  /// Monotonic milliseconds since boot.
+  /// Monotonic milliseconds since boot. The production `steady`.
   ///
   /// `DispatchTime` rather than `Date` for every elapsed-time question asked
   /// within one process lifetime — backoffs, deadlines, the purge lock. It
@@ -648,13 +662,18 @@ public final class LogWriter {
   /// The deliberate exceptions are the questions that span restarts: file age
   /// and archive-retention cutoffs are measured against filesystem timestamps,
   /// which have to be calendar time because an uptime clock restarts at zero.
+  ///
+  /// Reached through the `steady` property rather than called directly, so a
+  /// test can substitute for it. Calling `Self.steadyMillis()` at a backoff
+  /// site would compile and pass every existing test while silently ignoring
+  /// the injection — which is how this went untested in the first place.
   private static func steadyMillis() -> Int64 {
     Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
   }
 
   @discardableResult
   private func attemptReopen() -> Bool {
-    lastReopenAttempt = Self.steadyMillis()
+    lastReopenAttempt = steady()
     closeCurrentHandle()
 
     if let shortfall = try? LogSecureFile.createDirectory(at: fileURL.deletingLastPathComponent()) {
@@ -878,7 +897,7 @@ public final class LogWriter {
 
   private func rotateIfNeeded() {
     guard let live = handle else { return }
-    guard Self.steadyMillis() >= rotationBlockedUntil else { return }
+    guard steady() >= rotationBlockedUntil else { return }
     let tooBig = currentFileSize >= policy.maxFileSizeBytes
     let tooOld = policy.maxFileAgeSeconds.map {
       Date().timeIntervalSince(currentFileStart) >= $0
@@ -900,7 +919,7 @@ public final class LogWriter {
       // a directory someone removed — would otherwise retry on every single
       // batch, turning a degraded log into a busy one.
       note(.rotation)
-      rotationBlockedUntil = Self.steadyMillis() + Self.rotationBackoffMs
+      rotationBlockedUntil = steady() + Self.rotationBackoffMs
       attemptReopen()
       return
     }

@@ -62,6 +62,10 @@ public final class LogWriterRegistry {
     lineFramed: Bool,
     rawWrite: LogWriter.RawWrite? = nil,
     compressor: LogWriter.Compressor? = nil,
+    /// Monotonic clock for backoffs — see `LogWriter.Steady`. Kotlin's twin is
+    /// `monotonic`, and forwarding it here is the only way a test can reach it:
+    /// writers are only ever built through this call.
+    steady: LogWriter.Steady? = nil,
     /// Reports the canonical path, once, the instant resolution produces it.
     ///
     /// For the caller that has to answer "where are the artifacts" after this
@@ -134,6 +138,7 @@ public final class LogWriterRegistry {
         lineFramed: lineFramed,
         rawWrite: rawWrite,
         compressor: compressor,
+        steady: steady,
         directoryShortfall: resolved.shortfall
       )
       writers[resolved.canonicalPath] = writer

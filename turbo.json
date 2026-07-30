@@ -50,12 +50,17 @@
       // `inputs` reduced to the single literal "package.json", with the daemon
       // off, and on the previous config, so it is neither these globs nor
       // anything in this repo. It is safe in the only direction that matters —
-      // a hash that varies can miss, never falsely hit — and the CI cache probe
-      // treats a hit as an optimisation rather than asserting one, so the
-      // effect is that these builds always run. Left alone deliberately; the
-      // sensitivity above was verified by comparing the SET of hashes over six
-      // runs before and after an edit, which is disjoint under this config and
-      // identical under the old one.
+      // a hash that varies can miss, never falsely hit — so the effect is that
+      // these builds always run. Left alone deliberately; the sensitivity above
+      // was verified by comparing the SET of hashes over six runs before and
+      // after an edit, which is disjoint under this config and identical under
+      // the old one. A single sample proves nothing here, in either direction.
+      //
+      // CI used to compound the flap rather than absorb it: a separate `--dry`
+      // probe computed its own hash and skipped the toolchain setup on a hit,
+      // while the build that followed computed another. A hit on one and a miss
+      // on the other left gradle running with no JDK, or `xcodebuild` with no
+      // Pods. The probe is gone and setup is unconditional.
       "inputs": [
         "$TURBO_ROOT$/package.json",
         "$TURBO_ROOT$/nitro.json",
@@ -92,11 +97,26 @@
       // why sources are listed rather than directories. The podspec is the
       // library's: `*.podspec` alone looked for example/*.podspec, which does
       // not exist. Pods/ and build/ are excluded by not being named — they are
-      // outputs, and hashing an output is how a hash stops being stable. The
-      // library's own sources are `ios/*.swift` rather than `ios/**` for that
-      // same reason: nothing builds into ios/ today, but a directory glob is a
-      // standing invitation for whatever lands there next, and the file list
-      // there is seven Swift files.
+      // outputs, and hashing an output is how a hash stops being stable.
+      //
+      // The library's own source globs mirror the podspec's `source_files`
+      // exactly, extension for extension, because the podspec is what decides
+      // what gets compiled: `ios/**/*.{swift,m,mm}` and `cpp/**/*.{hpp,cpp}`.
+      // They previously read `ios/*.swift` — flat, Swift only — which is not
+      // the same set. Nothing lives in the gap today (ios/ is eight Swift
+      // files and there is no cpp/ directory), so this was latent rather than
+      // broken; but a .mm file, or a subdirectory, would have compiled into
+      // the build while leaving the hash byte-identical, and a cache that
+      // reports success for sources it never saw is the one failure this
+      // whole rewrite exists to remove. Extensions rather than `ios/**`: the
+      // narrower glob still refuses to hash whatever build output lands there
+      // next, which was the original reason for listing files.
+      //
+      // `cpp/**` matches nothing today, exactly like the root
+      // `react-native.config.js` glob above, and is listed for the same
+      // reason — the podspec already compiles it, so the day it appears the
+      // hash must already be watching it. A glob matching no file costs
+      // nothing.
       //
       // The .xcworkspace is here and not only the .xcodeproj because the
       // workspace is what xcodebuild opens once CocoaPods has been through.
@@ -118,7 +138,11 @@
         "$TURBO_ROOT$/package.json",
         "$TURBO_ROOT$/nitro.json",
         "$TURBO_ROOT$/*.podspec",
-        "$TURBO_ROOT$/ios/*.swift",
+        "$TURBO_ROOT$/ios/**/*.swift",
+        "$TURBO_ROOT$/ios/**/*.m",
+        "$TURBO_ROOT$/ios/**/*.mm",
+        "$TURBO_ROOT$/cpp/**/*.hpp",
+        "$TURBO_ROOT$/cpp/**/*.cpp",
         "$TURBO_ROOT$/nitrogen/**",
         "$TURBO_ROOT$/src/**",
         "$TURBO_ROOT$/react-native.config.js",

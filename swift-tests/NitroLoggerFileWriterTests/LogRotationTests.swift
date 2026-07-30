@@ -223,6 +223,50 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertTrue(contents().count > 64, "and the file keeps growing")
   }
 
+  /// The backoff window above is measured on the monotonic clock, and this is
+  /// the test that says so.
+  ///
+  /// Its sibling proves the window exists; nothing proved *which clock* bounds
+  /// it. Replacing the monotonic source with `Date()` left every Swift test
+  /// green — Android had both the injection and a clock test, iOS had neither,
+  /// and that asymmetry is what this closes. A backoff asks "has enough time
+  /// passed since the last failure", and an NTP correction stepping the wall
+  /// clock back an hour must never re-answer it: rotation would wedge for the
+  /// hour, on a file that is already oversized and failing to rotate.
+  ///
+  /// What it does not prove: the wall clock is not injectable on this platform,
+  /// so this pins that the backoff *follows the seam* rather than demonstrating
+  /// a real backwards NTP step. File age still reads `Date` deliberately — it
+  /// is measured against a creation time from a previous run — and no
+  /// assertion here covers that path.
+  func testTheRotationBackoffIsMeasuredOnTheInjectedMonotonicClock() throws {
+    let clock = SteadyClock()
+    let handle = try makeHandle(policy: sizePolicy(bytes: 64), steady: { clock.now })
+    write(handle, record)
+
+    TestFlags.makeImmutable(logsDirectory)
+    defer { chflags(logsDirectory.path, 0) }
+
+    for _ in 0..<10 { write(handle, record) }
+    let attempts = handle.writerForTesting.rotationAttemptsForTesting
+    XCTAssertEqual(attempts, 1, "the first failure opened the backoff window")
+
+    // Real time passes while these run. The window is not measured in it, so
+    // it does not move.
+    for _ in 0..<10 { write(handle, record) }
+    XCTAssertEqual(handle.writerForTesting.rotationAttemptsForTesting, 1,
+                   "a clock that has not moved leaves the window shut")
+
+    // Past the window on the only clock that counts. Nothing else changed: the
+    // fault is still in force and the file is still over its threshold.
+    clock.advance(5_001)
+    write(handle, record)
+
+    XCTAssertEqual(handle.writerForTesting.rotationAttemptsForTesting, 2,
+                   "past the window, rotation is tried again")
+    XCTAssertEqual(archiveNames().count, 0, "and the fault really was still in force")
+  }
+
   func testFailedPruneReportsDegradation() throws {
     let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 1))
     write(handle, record)

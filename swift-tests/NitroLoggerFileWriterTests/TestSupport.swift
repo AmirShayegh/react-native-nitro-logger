@@ -55,14 +55,16 @@ class LogWriterTestCase: XCTestCase {
     policy: LogRotationPolicy = LogRotationPolicy(),
     lineFramed: Bool = true,
     rawWrite: LogWriter.RawWrite? = nil,
-    compressor: LogWriter.Compressor? = nil
+    compressor: LogWriter.Compressor? = nil,
+    steady: LogWriter.Steady? = nil
   ) throws -> LogFileHandle {
     let handle = try registry.acquire(
       path: (url ?? logURL).path,
       policy: policy,
       lineFramed: lineFramed,
       rawWrite: rawWrite,
-      compressor: compressor
+      compressor: compressor,
+      steady: steady
     )
     openHandles.append(handle)
     return handle
@@ -118,6 +120,30 @@ class LogWriterTestCase: XCTestCase {
     let result = handle.appendBatch(text, entryCount: entries)
     handle.writerForTesting.settleForTesting()
     return result
+  }
+}
+
+/// A monotonic clock the test moves by hand.
+///
+/// Locked rather than a bare `var` captured by the closure: the writer reads it
+/// on its own queue while the test advances it from the test thread, which is a
+/// data race the sanitizer is right to flag.
+final class SteadyClock {
+  private let lock = NSLock()
+  private var millis: Int64
+
+  init(_ start: Int64 = 0) { millis = start }
+
+  var now: Int64 {
+    lock.lock()
+    defer { lock.unlock() }
+    return millis
+  }
+
+  func advance(_ by: Int64) {
+    lock.lock()
+    millis += by
+    lock.unlock()
   }
 }
 
