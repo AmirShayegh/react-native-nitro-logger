@@ -23,5 +23,13 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      <!-- The C13 reload harness. Test-only, and unreachable from outside this
+           package: it opens a log file and deliberately never closes it. -->
+      <activity
+        android:name=".C13HarnessActivity"
+        android:label="C13 reload harness"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="false" />
     </application>
 </manifest>

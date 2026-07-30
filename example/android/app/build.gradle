@@ -84,7 +84,20 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
+
+    // The reload harness runs against the *release* build type, and that is not
+    // incidental. A debug build serves its JavaScript from Metro, which is not
+    // running on a CI emulator, and reloads through the dev-support path rather
+    // than the one a shipped app takes. Release bundles the JavaScript into the
+    // APK and destroys-and-recreates the instance the way production does, so
+    // the teardown under test is the teardown that ships.
+    //
+    // Signing is already the debug keystore for both types, which is what lets
+    // instrumentation attach to a non-debuggable app: the test APK carries the
+    // same certificate.
+    testBuildType "release"
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -116,4 +129,12 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // Versions pinned to match the library module's own androidTest set, so the
+    // two instrumented suites cannot drift onto different runners.
+    androidTestImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test:rules:1.6.1"
+    androidTestImplementation "androidx.test:core-ktx:1.6.1"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
 }
