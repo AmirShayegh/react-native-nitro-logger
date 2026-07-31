@@ -39,15 +39,18 @@ and each of them fails in a way that looks like something else.
 - **iOS: `cd ios && pod install`** after installing. The pods carry the
   vendored Swift writer and the generated Nitro bindings; a stale `Podfile.lock`
   builds an app whose binary does not contain them.
-- **Android: JDK 17.** The Gradle module targets it, and an older JDK fails in
-  the Kotlin compile with a class-version error that names a file in this
-  library rather than the JDK.
+- **Android: JDK 17.** The Gradle module targets it
+  (`JavaVersion.VERSION_17`). Check what Gradle is actually using with
+  `./gradlew --version` — the JVM it reports is the one that matters, and it is
+  not always the one on your `PATH`.
 
 They fail at different times, which is the fastest way to tell them apart.
 
-**At build time.** A JDK older than 17 never produces an app: the Kotlin compile
-fails with a class-file version error naming a file in this library. Nothing
-below applies — there is nothing to run.
+**At build time.** A JDK older than 17 fails the Android build, so there is no
+app and nothing below applies. Which phase reports it varies — the Android
+Gradle plugin often rejects the JVM while configuring, before this library is
+compiled at all — so the reliable check is `./gradlew --version` rather than
+matching an error string.
 
 **At module resolution.** A missing `react-native-nitro-modules` fails when the
 import is resolved, so it reads as a bundler error about a package that is not
