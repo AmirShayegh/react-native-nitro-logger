@@ -302,6 +302,20 @@ deps.logger.info(`user ${id}`); // NOT reported — the literal says it is not o
 The property name is the fallback for when nothing in the file settles the
 question — `this.logger`, a parameter, an import from elsewhere — and reading
 it first would report ordinary code on the strength of a field's spelling.
+
+"Settles the question" means the value was understood, not merely found.
+`{ logger: getLogger() }` is a value this analysis can see and cannot
+classify, because a factory call is the boundary it stops at — and that is
+the shape a real logger most often arrives in, so the name still decides
+there:
+
+```js
+const deps = { logger: getLogger() };
+deps.logger.info(`patient ${id} admitted`); // still reported
+```
+
+A name that was looked at, or a construction that was examined and rejected,
+is an answer. A call, a conditional, or anything else opaque is not.
 It is also less precise: `{ logger: Log.scoped(…) }` read from the name is
 "some logger", read from the literal is a `ScopedLogger`, which takes no
 third-argument subsystem, so a warning about one would be about an argument

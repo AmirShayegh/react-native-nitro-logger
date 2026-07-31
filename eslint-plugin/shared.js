@@ -1893,6 +1893,24 @@ function describeMethodReference(context, node, args) {
  * `'scoped'`, which is what makes the rules stop looking for a third-argument
  * subsystem a `ScopedLogger` does not take.
  *
+ * ## Which nulls count as an answer
+ *
+ * Reading the property is not the same as understanding what it holds.
+ * `{ logger: getLogger() }` resolves to a candidate and
+ * [classifyReceiver] returns `null` for it — not because the value is not a
+ * logger, but because it is a factory call at the interprocedural boundary
+ * this plugin stops at. Treating that as "read, and not a logger" would
+ * suppress the name hint and silence a real logger call that was checked
+ * before this walk existed. That is the *dangerous* direction: a false
+ * negative in a privacy rule looks exactly like compliance.
+ *
+ * So [decidedClassification] separates the two, on the same line
+ * `classifyReceiver` already draws for bindings: a name — an identifier or a
+ * member expression — was looked at and answered, and a construction was
+ * examined and rejected; a call, a conditional, an `await` or anything else
+ * opaque was not. An undecided candidate makes this whole walk answer
+ * `undefined`, which hands the question back to the name.
+ *
  * ## What this deliberately does not reach
  *
  * `this.audit.info(…)`. `receiverPropertyCandidates` resolves a container
@@ -1917,16 +1935,26 @@ function classifyPropertyReceiver(context, node, callNode) {
   );
   if (candidates.length === 0) return undefined;
 
-  const classified = candidates.map((value) =>
-    classifyReceiver(context, value)
+  const classified = candidates.map((value) => ({
+    value,
+    receiver: classifyReceiver(context, value),
+  }));
+  const opaque = classified.filter(
+    (entry) => entry.receiver === null && !decidedClassification(entry.value)
   );
+
   // Exactly one possible value: it is what the property holds, so its own
   // classification stands — including `null`, which is the answer for
   // `const deps = { analytics }; deps.analytics.info(x)` and has to stay one.
-  if (classified.length === 1) return classified[0];
-  // Several, and at least one is a logger. Which runs is unknowable, so the
-  // rules apply — but never as the singleton, whose provenance is exactly what
-  // is in doubt.
+  // Unless nothing was decided about it, in which case the name still knows
+  // more than this walk does.
+  if (classified.length === 1) {
+    return opaque.length > 0 ? undefined : classified[0].receiver;
+  }
+  // Several, and at least one is a logger — or at least one is unreadable,
+  // which cannot be ruled out as one. Which runs is unknowable, so the rules
+  // apply — but never as the singleton, whose provenance is exactly what is in
+  // doubt.
   //
   // No rule currently distinguishes the two: every consumer of the
   // classification branches on `'scoped'` against everything else, and TRUST
@@ -1936,7 +1964,40 @@ function classifyPropertyReceiver(context, node, callNode) {
   // this line is a forward constraint rather than a behaviour anything can
   // observe today, and it is stated that way rather than credited with
   // protection it does not currently provide.
-  return classified.some((value) => value !== null) ? 'ambiguous' : null;
+  return classified.some((entry) => entry.receiver !== null) ||
+    opaque.length > 0
+    ? 'ambiguous'
+    : null;
+}
+
+/**
+ * Was `classifyReceiver`'s `null` an answer, or a shrug?
+ *
+ * The two are different facts and the difference decides whether the property
+ * name still gets a say. This draws the line where `classifyReceiver` already
+ * draws it for a binding's initializer:
+ *
+ *   - a **name** — an identifier, or a member expression — was looked at. The
+ *     name heuristic is the answer for those and it applies here too, so a
+ *     `null` means "this is not spelled like a logger", which is a decision.
+ *   - a **construction** was examined by `classifyConstruction` and found not
+ *     to be a logger. `classifyReceiver` calls that evidence in as many words,
+ *     and `loggerClassNames` depends on it continuing to mean something.
+ *   - anything else — a call, a conditional, an `await`, a template — was not
+ *     understood. `getLogger()` is the canonical one, and it is exactly the
+ *     shape a real logger arrives in.
+ *
+ * Undecided is the safe answer to be wrong about: it costs a fallback to the
+ * name, which is what the analysis did before this walk existed.
+ */
+function decidedClassification(node) {
+  const current = unwrap(node);
+  if (!current) return false;
+  return (
+    current.type === 'Identifier' ||
+    current.type === 'MemberExpression' ||
+    current.type === 'NewExpression'
+  );
 }
 
 /**

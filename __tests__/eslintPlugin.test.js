@@ -151,6 +151,13 @@ describe('no-dynamic-message', () => {
       // has no third parameter — so reporting one would warn about an argument
       // the runtime never looks at.
       `${IMPORT_LOG} const holder = { logger: Log.scoped('c') }; holder.logger.info('m', {}, sub);`,
+      // A construction is a DECIDED non-logger — `classifyConstruction` looked
+      // and said so — which is what keeps `loggerClassNames` able to narrow.
+      'const deps = { logger: new Widget() }; deps.logger.info(`user ${id}`);',
+      // An opaque value in a field spelled like anything else stays silent,
+      // exactly as it did before the walk existed: neither the value nor the
+      // name says logger.
+      'const deps = { audit: getLogger() }; deps.audit.info(`user ${id}`);',
       // KNOWN LIMITATION, pinned: `this.<field>` is not followed even when
       // the field initializer is in the same class. Resolving it means
       // matching a class field against the instance a method runs on, which
@@ -617,6 +624,28 @@ describe('no-dynamic-message', () => {
       // same walk.
       {
         code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info.call(null, patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Reading the container must not SILENCE what the name already caught.
+      // `getLogger()` is a candidate the walk can see and cannot classify —
+      // the factory boundary this plugin stops at, and the shape a real
+      // logger most often arrives in. Answering "read, and not a logger"
+      // there would take a checked call site outside all four rules, which is
+      // the dangerous direction: a false negative in a privacy rule looks
+      // exactly like compliance. So an undecided candidate hands the question
+      // back to the name.
+      {
+        code: 'const deps = { logger: getLogger() }; deps.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const deps = { logger: flag ? a : b }; deps.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Several candidates, one of them unreadable: it cannot be ruled out as
+      // a logger, so the rules apply.
+      {
+        code: 'const deps = { logger: analytics }; function later() { deps.logger.info(`patient ${id}`); } deps.logger = getLogger(); later();',
         errors: [{ messageId: 'dynamic' }],
       },
       // Assigned rather than in the literal, and through `Object.assign` —
