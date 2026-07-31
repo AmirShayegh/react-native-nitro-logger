@@ -18,6 +18,18 @@
       },
       "default": "./lib/module/index.js"
     },
+    "./unstable": {
+      "react-native-nitro-logger-source": "./src/unstable.ts",
+      "require": {
+        "types": "./lib/typescript/commonjs/src/unstable.d.ts",
+        "default": "./lib/commonjs/unstable.js"
+      },
+      "import": {
+        "types": "./lib/typescript/module/src/unstable.d.ts",
+        "default": "./lib/module/unstable.js"
+      },
+      "default": "./lib/module/unstable.js"
+    },
     "./eslint-plugin": "./eslint-plugin/index.js",
     "./package.json": "./package.json"
   },

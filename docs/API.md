@@ -211,9 +211,9 @@ The durable one. Rotation, gzip, retention, crash-tail recovery, bounded
 buffering, and a deadline-bounded purge.
 
 ```ts
-import { FileDestination, createFileSink, JsonLinesFormatter } from 'react-native-nitro-logger';
+import { createFileDestination, JsonLinesFormatter } from 'react-native-nitro-logger';
 
-const logFile = new FileDestination(createFileSink(), {
+const logFile = createFileDestination({
   formatter: new JsonLinesFormatter(),
   rotation: {
     maxFileSizeBytes: 10 * 1024 * 1024,
@@ -298,9 +298,9 @@ already compressed are copied in byte for byte and the active file is
 compressed in beside them, on the writer's own queue and after a flush.
 
 ```ts
-import { FileDestination as FileDestination3, createFileSink as createFileSink3 } from 'react-native-nitro-logger';
+import { createFileDestination as createFileDestination3 } from 'react-native-nitro-logger';
 
-const supportable = new FileDestination3(createFileSink3());
+const supportable = createFileDestination3();
 const bundle = supportable.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
 
 if (bundle.complete && bundle.path !== '') {
@@ -537,12 +537,11 @@ This is the timer that runs `FileDestination.maintain()` for you.
 
 ```ts
 import {
-  FileDestination as FileDestination2,
-  createFileSink as createFileSink2,
+  createFileDestination as createFileDestination2,
   scheduleMaintenance,
 } from 'react-native-nitro-logger';
 
-const maintained = new FileDestination2(createFileSink2());
+const maintained = createFileDestination2();
 const stopMaintenance = scheduleMaintenance({
   destination: maintained,
   intervalMs: 10 * 60 * 1000,
@@ -588,14 +587,35 @@ it: `maxFrames` and `bundleNames`, defaulting to the two constants below.
 
 ## Native sinks
 
-`createFileSink()` and `createNativeConsoleSink()` construct the Nitro hybrid
-objects. Call them once and hand the result to a destination; the destination
-owns the handle from then on and releases it on `dispose()`.
+`createFileDestination(options?)` and `createNativeConsoleDestination(options?)`
+are how you get a destination on the real native sink, and are what the samples
+above use. Each constructs the Nitro hybrid object and hands it to the
+destination, which owns the handle from then on and releases it on `dispose()`.
+Both throw rather than degrade: a missing native module, a failed open, or a
+config conflict with a writer already open on that path. A file destination
+that silently writes nowhere is worse than one that refuses to be built.
 
-`FileSink` and `NativeConsoleSink` are the Nitro interfaces. `FileSinkLike` and
-`NativeConsoleSinkLike` are structural equivalents, which is what lets tests
-drive a destination without a native runtime — and what lets you substitute
-your own implementation.
+The constructors stay public because a `FileSinkLike` double is how a
+destination is tested, and substituting your own implementation is a legitimate
+thing to want.
+
+`createFileSink()` and `createNativeConsoleSink()` build the raw sinks on their
+own. **They live at `react-native-nitro-logger/unstable` from 0.3.0**, still
+re-exported from the root for this release and moving out at the next major.
+The separate entry point is a warning about stability, and it does not make
+them safe: a raw `clearLogs()` bumps the writer generation, which makes *every*
+`FileDestination` on that file stale — including ones the caller does not know
+about. Nothing notifies them. Each finds out when it next tries to write, has
+the append rejected as a stale generation, fences itself and loses that record;
+from then on it reports `isEnabled: false` until something calls `reopen()`.
+Purge through the destination when you have one.
+
+`FileSink` and `NativeConsoleSink` are the Nitro interfaces. They are defined
+at `/unstable` now and, like the two factories, stay re-exported from the root
+through 0.3.0. `FileSinkLike` and `NativeConsoleSinkLike` are structural
+equivalents that stay at the root for good — they are what lets tests drive a
+destination without a native runtime, and what you implement to substitute your
+own.
 
 `RotationConfig` requires `maxFileSizeBytes`, `maxArchivedFilesCount` and
 `compressArchives` — all three, since a rotation policy that left any of them
@@ -631,7 +651,7 @@ next process lock a fresh file and write alongside the first. It holds no log
 bytes. A filesystem that cannot lock raises the `exclusivity` bit and logging
 continues — refusing to log would be the worse answer.
 
-<!-- api: createFileSink, createNativeConsoleSink, FileSink, NativeConsoleSink, FileSinkLike, NativeConsoleSinkLike, RotationConfig, SinkStatus -->
+<!-- api: createFileDestination, createNativeConsoleDestination, createFileSink, createNativeConsoleSink, FileSink, NativeConsoleSink, FileSinkLike, NativeConsoleSinkLike, RotationConfig, SinkStatus -->
 
 ### Native call results
 
@@ -698,12 +718,11 @@ a mask instead of a message.
 ```ts
 import {
   Log as Logger6,
-  FileDestination as FileDestination6,
-  createFileSink as createFileSink6,
+  createFileDestination as createFileDestination6,
   describeDegradation,
 } from 'react-native-nitro-logger';
 
-const watched = new FileDestination6(createFileSink6());
+const watched = createFileDestination6();
 const problems = describeDegradation(watched.degradation());
 if (problems.length > 0) {
   Logger6.warning('logging degraded', { degraded: problems.join(',') }, 'diagnostics');
@@ -756,7 +775,9 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `CollectForSupportOptions`
 - `CollectOutcome`
 - `ConsoleDestination`
+- `createFileDestination`
 - `createFileSink`
+- `createNativeConsoleDestination`
 - `createNativeConsoleSink`
 - `DEFAULT_BUNDLE_NAMES`
 - `DEFAULT_MAX_FRAMES`

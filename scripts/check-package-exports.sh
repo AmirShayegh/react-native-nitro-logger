@@ -71,6 +71,10 @@ test('jest resolves the package to a CommonJS entry', () => {
   const resolved = require.resolve('react-native-nitro-logger');
   console.log('JEST_RESOLVED=' + resolved.split('node_modules/').pop());
 });
+test('jest resolves the unstable subpath to a CommonJS entry', () => {
+  const resolved = require.resolve('react-native-nitro-logger/unstable');
+  console.log('JEST_RESOLVED_UNSTABLE=' + resolved.split('node_modules/').pop());
+});
 EOF
 
 echo "==> installing the tarball into a consumer project"
@@ -105,8 +109,64 @@ resolves "node require" "react-native-nitro-logger/lib/commonjs/index.js" "$CJS"
 ESM="$(node --input-type=module -e "console.log((await import.meta.resolve('react-native-nitro-logger')).split('node_modules/').pop())" 2>/dev/null)"
 resolves "node import " "react-native-nitro-logger/lib/module/index.js" "$ESM"
 
-JEST="$(npx jest __tests__/resolution.test.js 2>&1 | grep -o 'JEST_RESOLVED=.*' | head -1 | cut -d= -f2-)"
+JEST_OUT="$(npx jest __tests__/resolution.test.js 2>&1)"
+JEST="$(grep -o 'JEST_RESOLVED=.*' <<< "$JEST_OUT" | head -1 | cut -d= -f2-)"
 resolves "jest        " "react-native-nitro-logger/lib/commonjs/index.js" "$JEST"
+
+# ---------------------------------------------------------------------------
+# ./unstable — the second entry point, held to the same standard
+# ---------------------------------------------------------------------------
+# The raw Nitro sinks moved here in 0.3.0. A subpath that resolves for `import`
+# and not for `require` is a package that works until someone's Jest touches it,
+# which is the exact failure the root entry was fixed for in 0.1.3 — so it is
+# checked the same three ways rather than assumed to inherit anything.
+echo "==> which entry each condition selects for ./unstable"
+CJS_U="$(node -e "console.log(require.resolve('react-native-nitro-logger/unstable').split('node_modules/').pop())" 2>/dev/null)"
+resolves "node require /unstable" "react-native-nitro-logger/lib/commonjs/unstable.js" "$CJS_U"
+
+ESM_U="$(node --input-type=module -e "console.log((await import.meta.resolve('react-native-nitro-logger/unstable')).split('node_modules/').pop())" 2>/dev/null)"
+resolves "node import  /unstable" "react-native-nitro-logger/lib/module/unstable.js" "$ESM_U"
+
+JEST_U="$(grep -o 'JEST_RESOLVED_UNSTABLE=.*' <<< "$JEST_OUT" | head -1 | cut -d= -f2-)"
+resolves "jest         /unstable" "react-native-nitro-logger/lib/commonjs/unstable.js" "$JEST_U"
+
+echo "==> ./unstable carries the names it promises"
+# Resolution is not the whole claim: bob compiles the whole src tree, so a
+# subpath can resolve to a file that exists and exports nothing under the name
+# promised — a rename inside src/ does exactly that, silently.
+#
+# Read, never loaded, for the reason at the top of this file: importing this
+# package outside an app fails on `react-native` itself (Flow syntax in a
+# CommonJS context), so a load-based probe would report a missing export for a
+# module that is perfectly fine. What this proves is that each built artifact
+# declares the name; that calling it works needs a device, which is what the
+# min-rn jobs are for.
+NAMES="$(node -e '
+  const fs = require("fs"), path = require("path");
+  const pkg = process.argv[1];
+  const want = ["createFileSink", "createNativeConsoleSink"];
+  const targets = [
+    ["lib/commonjs/unstable.js", (src, n) => new RegExp("exports\\." + n + "\\s*=").test(src)],
+    ["lib/module/unstable.js", (src, n) => new RegExp("export\\b[^;]*\\b" + n + "\\b").test(src)],
+    ["lib/typescript/commonjs/src/unstable.d.ts", (src, n) => new RegExp("declare (function|const) " + n + "\\b").test(src)],
+    ["lib/typescript/module/src/unstable.d.ts", (src, n) => new RegExp("declare (function|const) " + n + "\\b").test(src)],
+  ];
+  const problems = [];
+  for (const [rel, has] of targets) {
+    const file = path.join(pkg, rel);
+    if (!fs.existsSync(file)) { problems.push(rel + ": missing"); continue; }
+    const src = fs.readFileSync(file, "utf8");
+    const missing = want.filter((n) => !has(src, n));
+    if (missing.length) problems.push(rel + ": no export of " + missing.join(", "));
+  }
+  console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS");
+' "$PKG" 2>&1)"
+if [[ "$NAMES" == PASS* ]]; then
+  note ok "every built /unstable artifact exports both sink factories"
+else
+  note FAIL "${NAMES#FAIL|}"
+  failures=$((failures + 1))
+fi
 
 echo "==> each entry is the dialect its condition promises"
 # A file is only CommonJS if BOTH the syntax and the nearest `type` marker say
@@ -142,17 +202,21 @@ echo "==> the types each condition points at exist"
 TYPES="$(node -e '
   const fs = require("fs"), path = require("path");
   const pkg = process.argv[1];
-  const map = JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf8")).exports["."];
+  const exp = JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf8")).exports;
   const problems = [];
-  for (const cond of ["require", "import"]) {
-    const t = map[cond] && map[cond].types;
-    if (!t) { problems.push(cond + ": no types condition"); continue; }
-    if (!fs.existsSync(path.join(pkg, t))) problems.push(cond + ": types missing at " + t);
+  for (const entry of [".", "./unstable"]) {
+    const map = exp[entry];
+    if (!map) { problems.push(entry + ": no export map entry"); continue; }
+    for (const cond of ["require", "import"]) {
+      const t = map[cond] && map[cond].types;
+      if (!t) { problems.push(entry + " " + cond + ": no types condition"); continue; }
+      if (!fs.existsSync(path.join(pkg, t))) problems.push(entry + " " + cond + ": types missing at " + t);
+    }
   }
   console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS");
 ' "$PKG" 2>&1)"
 if [[ "$TYPES" == PASS* ]]; then
-  note ok "require and import each ship their own declarations"
+  note ok "both entries ship declarations for require and import"
 else
   note FAIL "${TYPES#FAIL|}"
   failures=$((failures + 1))
@@ -173,7 +237,7 @@ echo "==> what Metro selects"
 METRO="$(node -e '
   const fs = require("fs"), path = require("path");
   const [pkgDir, fixture] = process.argv.slice(1);
-  const exp = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).exports["."];
+  const all = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).exports;
 
   // The condition sets Metro actually uses, read from Metro itself.
   const sets = {};
@@ -199,17 +263,22 @@ METRO="$(node -e '
     return null;
   };
 
+  // Both entries, because `default` is load-bearing for each of them and a
+  // subpath that falls through to the wrong artifact is invisible to Node.
+  const wanted = { ".": "./lib/module/index.js", "./unstable": "./lib/module/unstable.js" };
   const problems = [];
-  for (const [label, conditions] of Object.entries(sets)) {
-    const got = pick(exp, conditions);
-    if (got !== "./lib/module/index.js") {
-      problems.push(`${label} (${JSON.stringify(conditions)}) -> ${got}, expected ./lib/module/index.js`);
+  for (const [entry, want] of Object.entries(wanted)) {
+    for (const [label, conditions] of Object.entries(sets)) {
+      const got = pick(all[entry], conditions);
+      if (got !== want) {
+        problems.push(`${entry} ${label} (${JSON.stringify(conditions)}) -> ${got}, expected ${want}`);
+      }
     }
   }
   console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + Object.keys(sets).join(", "));
 ' "$PKG" "$FIXTURE" 2>&1)"
 if [[ "$METRO" == PASS* ]]; then
-  note ok "falls through to default -> lib/module (${METRO#PASS|})"
+  note ok "both entries fall through to default -> lib/module (${METRO#PASS|})"
 else
   note FAIL "${METRO#FAIL|}"
   failures=$((failures + 1))
@@ -219,7 +288,7 @@ echo "==> the source condition stays out of a consumer's way"
 # `react-native-nitro-logger-source` exists for the in-repo example app. If a
 # consumer ever resolved through it they would get TypeScript, which their
 # bundler is under no obligation to compile.
-if grep -q "src/index.tsx" <<< "$CJS$ESM$JEST"; then
+if grep -qE "src/(index\.tsx|unstable\.ts)" <<< "$CJS$ESM$JEST$CJS_U$ESM_U$JEST_U"; then
   note FAIL "a consumer resolved to src/ — the source condition leaked"
   failures=$((failures + 1))
 else

@@ -2,11 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Text, View, StyleSheet, Pressable, ScrollView } from 'react-native';
 import {
   Log,
-  FileDestination,
-  NativeConsoleDestination,
   JsonLinesFormatter,
-  createFileSink,
-  createNativeConsoleSink,
+  createFileDestination,
+  createNativeConsoleDestination,
   installErrorHandler,
   flushOnBackground,
   UNCAUGHT_ERROR_MESSAGE,
@@ -67,7 +65,7 @@ export default function App() {
   const started = useRef(false);
 
   const destination = useMemo(() => {
-    return new FileDestination(createFileSink(), {
+    return createFileDestination({
       formatter: new JsonLinesFormatter(),
       rotation: ROTATION,
       // Deliberately small, so the burst below actually reaches the
@@ -79,7 +77,7 @@ export default function App() {
 
   // Not named `console`: that would shadow the global this file logs through.
   const osLog = useMemo(() => {
-    return new NativeConsoleDestination(createNativeConsoleSink(), {
+    return createNativeConsoleDestination({
       subsystem: OSLOG_SUBSYSTEM,
       category: 'harness',
     });

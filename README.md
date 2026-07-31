@@ -31,12 +31,11 @@ npm install react-native-nitro-logger react-native-nitro-modules
 import {
   Log,
   ConsoleDestination,
-  FileDestination,
-  createFileSink,
+  createFileDestination,
 } from 'react-native-nitro-logger';
 
 Log.addDestination(new ConsoleDestination());
-Log.addDestination(new FileDestination(createFileSink()));
+Log.addDestination(createFileDestination());
 
 Log.info('app started');
 Log.warning('retrying upload', { attempt: 2, statusCode: 503 });
@@ -157,7 +156,7 @@ build where reveal is possible is a build for synthetic data only.
 ## Writing to a file
 
 ```ts
-const file = new FileDestination(createFileSink(), {
+const file = createFileDestination({
   rotation: {
     maxFileSizeBytes: 10 * 1024 * 1024,
     maxArchivedFilesCount: 5,
@@ -214,12 +213,11 @@ Console.app, Xcode, and `adb logcat`.
 ```ts
 import {
   Log,
-  NativeConsoleDestination,
-  createNativeConsoleSink,
+  createNativeConsoleDestination,
 } from 'react-native-nitro-logger';
 
 Log.addDestination(
-  new NativeConsoleDestination(createNativeConsoleSink(), {
+  createNativeConsoleDestination({
     subsystem: 'com.example.app',
     category: 'network',
   })

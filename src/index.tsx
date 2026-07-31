@@ -1,6 +1,8 @@
-import { NitroModules } from 'react-native-nitro-modules';
-import type { FileSink } from './specs/FileSink.nitro';
-import type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
+import { FileDestination } from './destinations/FileDestination';
+import type { FileDestinationOptions } from './destinations/FileDestination';
+import { NativeConsoleDestination } from './destinations/NativeConsoleDestination';
+import type { NativeConsoleDestinationOptions } from './destinations/NativeConsoleDestination';
+import { createFileSink, createNativeConsoleSink } from './unstable';
 
 // ── Public API ──────────────────────────────────────────────────────────────
 export { Log, Logger } from './Logger';
@@ -110,11 +112,36 @@ export type {
   JsonLinesFormatterOptions,
 } from './formatters/JsonLinesFormatter';
 
-// ── Spike-era raw sink access ───────────────────────────────────────────────
-// Used by the example app's M0 harness; becomes internal once the
-// FileDestination (M4/M5) and NativeConsoleDestination (M6) wrap these.
+/**
+ * A `FileDestination` on the real native sink — the ordinary way to get one.
+ *
+ * `new FileDestination(createFileSink(), options)` says the same thing and
+ * makes a caller name a type it has no other reason to hold. The constructor
+ * stays public because a `FileSinkLike` double is how this is tested, and that
+ * is a legitimate thing to want.
+ *
+ * Throws what the constructor throws: a missing native module, an open
+ * failure, or a config conflict with a writer already open on that path. A
+ * file destination that silently writes nowhere is worse than one that refuses
+ * to be constructed.
+ */
+export function createFileDestination(
+  options: FileDestinationOptions = {}
+): FileDestination {
+  return new FileDestination(createFileSink(), options);
+}
+
+/** A `NativeConsoleDestination` on the real native sink. Same reasoning. */
+export function createNativeConsoleDestination(
+  options: NativeConsoleDestinationOptions = {}
+): NativeConsoleDestination {
+  return new NativeConsoleDestination(createNativeConsoleSink(), options);
+}
+
+// ── Native call results ─────────────────────────────────────────────────────
+// The shapes the native calls return, and the rotation config they take. Root
+// exports because a `FileSinkLike` implementation has to construct them.
 export type {
-  FileSink,
   RotationConfig,
   RejectReason,
   SinkStatus,
@@ -123,14 +150,13 @@ export type {
   ClearOutcome,
   CollectOutcome,
 } from './specs/FileSink.nitro';
+
+// ── Raw sink access ─────────────────────────────────────────────────────────
+// Re-exported here through 0.3.0 and moving out at the next major: the sinks
+// themselves now live behind `react-native-nitro-logger/unstable`, which is
+// where a caller that genuinely wants the layer below a destination should
+// import them from. See `src/unstable.ts` for what that layer does not do for
+// you.
+export type { FileSink } from './specs/FileSink.nitro';
 export type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
-
-export function createFileSink(): FileSink {
-  return NitroModules.createHybridObject<FileSink>('FileSink');
-}
-
-export function createNativeConsoleSink(): NativeConsoleSink {
-  return NitroModules.createHybridObject<NativeConsoleSink>(
-    'NativeConsoleSink'
-  );
-}
+export { createFileSink, createNativeConsoleSink } from './unstable';
