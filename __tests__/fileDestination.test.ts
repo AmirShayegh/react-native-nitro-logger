@@ -7,6 +7,7 @@ import { utf8Length } from '../src/utf8';
 import type { LogEntry } from '../src/types';
 import type { LogFormatter } from '../src/formatters/types';
 import { MemoryWriter } from './helpers/MemoryFileSink';
+import type { MemoryFileSink } from './helpers/MemoryFileSink';
 import type { ClearOutcome } from '../src/specs/FileSink.nitro';
 
 const at = Date.UTC(2026, 6, 27, 12, 15, 30, 842);
@@ -258,7 +259,10 @@ describe('FileDestination — maintain', () => {
     expect(destination.degradation()).toBe(0b001);
 
     // Someone else purged underneath it. The files this one would sweep are
-    // the new generation's.
+    // the new generation's. `other` has to be *open* to purge: a handle that
+    // never opened has no live handle to delete through, and both natives
+    // refuse it — see the no-handle rows of `FileSinkLifecycle`'s table.
+    other.open(sink.openedPath!, undefined, true);
     other.clearLogs(1000);
     destination.write(entry({ message: 'fences it' }));
     destination.flush(1000);
@@ -392,7 +396,9 @@ describe('FileDestination — collectForSupport', () => {
 
     // Someone else purged underneath it. The files this one would pack are the
     // new generation's, and a bundle built from them would be a stale read of
-    // somebody else's log.
+    // somebody else's log. `other` is opened first because a handle that never
+    // opened cannot purge — the natives answer that with no deletion at all.
+    other.open(sink.openedPath!, undefined, true);
     other.clearLogs(1000);
     destination.write(entry({ message: 'fences it' }));
     destination.flush(1000);
@@ -926,47 +932,306 @@ describe('FileDestination — through the Logger', () => {
 });
 
 /**
- * The double is only worth anything if it can fail the way the real thing
- * fails, and answer the way the real thing answers.
+ * The double, against the table both native adapters implement.
  *
- * These are `FileSinkLifecycle`'s no-live-handle rules — the table both native
- * adapters derive from — asserted against the in-memory sink. The double had
- * two divergences from it: it named a `failedPath` for a deletion nobody
- * attempted, and it hardcoded `durable: false` even for a sink that never
- * opened, where the claim is vacuously true. Neither was reachable through
- * `FileDestination`, which short-circuits before a disposed sink; both would
- * have been inherited by the next caller that was not guarded.
+ * Every row here is a question asked with **no live handle**, which is the
+ * whole of `FileSinkLifecycle`'s no-handle contract: what a sink answers when
+ * it was never opened, and what it answers once it has been closed. The two
+ * differ on exactly one bit — whether files may exist — and both adapters
+ * derive every answer below from it.
+ *
+ * This double had drifted from that table on four rows: it accepted batches on
+ * a sink that was never opened, reported an unfinished collect where the
+ * natives report a finished one with nothing in it, drained on a flush after
+ * close, and named a `failedPath` for a deletion nobody attempted. None was
+ * reachable through `FileDestination`, which short-circuits first — which is
+ * exactly why they survived. A double is only worth having if it answers the
+ * way the real thing answers, including on the paths today's callers guard.
+ *
+ * ## What these do NOT prove
+ *
+ * That the natives answer this way. Nothing in a Jest process can execute
+ * Swift or Kotlin. These pin the double against the table as read; the paired
+ * native suites pin each adapter against the same table, and until W3's
+ * `FileSinkAnswers` extraction lands the adapters' own answers are reachable
+ * only through the min-rn smoke jobs.
  */
-describe('MemoryFileSink — the no-handle rules the natives follow', () => {
-  test('a closed sink that wrote files cannot claim a durable purge', () => {
-    const writer = new MemoryWriter();
-    const sink = writer.attach();
+describe('MemoryFileSink — the no-handle rows both adapters implement', () => {
+  /** A sink that was never opened: no handle, and nothing can exist yet. */
+  function neverOpened(): MemoryFileSink {
+    return new MemoryWriter().attach();
+  }
+
+  /** A sink that opened, wrote, and closed: no handle, and files may exist. */
+  function openedThenClosed(): MemoryFileSink {
+    const sink = new MemoryWriter().attach();
     sink.open('/memory/logs/app.log', undefined, true);
     sink.appendBatch('{"m":1}\n', 1);
     sink.close(1000);
+    return sink;
+  }
 
-    const outcome = sink.clearLogs(1000);
+  describe.each([
+    ['never opened', neverOpened, true],
+    ['opened then closed', openedThenClosed, false],
+  ])('%s', (_label, make, vacuous) => {
+    test('refuses a batch as closed, with a zeroed status', () => {
+      const result = make().appendBatch('{"m":2}\n', 1);
 
-    expect(outcome.durable).toBe(false);
-    expect(outcome.deletedCount).toBe(0);
-    expect(outcome.rebound).toBe(false);
-    // Nothing was attempted, so nothing failed. A path here reports a deletion
-    // failure for a file no one tried to delete.
-    expect(outcome.failedPaths).toEqual([]);
+      expect(result.accepted).toBe(false);
+      expect(result.rejectReason).toBe('closed');
+      // Zeroed, not the last status the handle had. There is no handle to ask.
+      expect(result.queuedBytes).toBe(0);
+      expect(result.degraded).toBe(0);
+    });
+
+    test('reports a zeroed status', () => {
+      expect(make().getStatus()).toEqual({
+        queuedBytes: 0,
+        lostBytes: 0,
+        lostEntries: 0,
+        degraded: 0,
+      });
+    });
+
+    test('sweeps nothing and says so', () => {
+      const sink = make();
+      expect(sink.maintain(1000)).toEqual({
+        queuedBytes: 0,
+        lostBytes: 0,
+        lostEntries: 0,
+        degraded: 0,
+      });
+      // The sweep belongs to whoever holds the writer now. It must not run.
+      expect(sink.maintainCalls).toEqual([1000]);
+    });
+
+    test('has finished collecting, with nothing to collect', () => {
+      const outcome = make().collectLogs(1000, 1_000_000);
+
+      expect(outcome.path).toBe('');
+      expect(outcome.byteCount).toBe(0);
+      // The row that matters: `true`. A support flow that treated this as a
+      // failure would show an error for an app that simply has no logs yet.
+      expect(outcome.complete).toBe(true);
+      expect(outcome.truncated).toBe(false);
+    });
+
+    test(`flushes without draining, durable=${vacuous}`, () => {
+      const outcome = make().flush(1000);
+
+      expect(outcome.durable).toBe(vacuous);
+      expect(outcome.timedOut).toBe(false);
+      expect(outcome.pendingBytes).toBe(0);
+    });
+
+    test('closes idempotently, with the same answer', () => {
+      const sink = make();
+      const first = sink.close(1000);
+      const second = sink.close(1000);
+
+      expect(second).toEqual(first);
+      expect(second.durable).toBe(vacuous);
+    });
+
+    test(`purges vacuously=${vacuous}, attempting nothing`, () => {
+      const outcome = make().clearLogs(1000);
+
+      expect(outcome.durable).toBe(vacuous);
+      expect(outcome.deletedCount).toBe(0);
+      // Nothing was attempted, so nothing failed. A path here reports a
+      // deletion failure for a file no one tried to delete.
+      expect(outcome.failedPaths).toEqual([]);
+      // Nothing to rebind onto, whichever side of the bit this is.
+      expect(outcome.rebound).toBe(false);
+    });
   });
 
-  test('a sink that never opened purges vacuously, not falsely', () => {
+  /**
+   * Closing releases a handle. It does not delete files, and the paths have to
+   * keep coming back — `[]` from a closed sink tells a support-upload flow
+   * there is nothing to collect over logs still sitting on the device.
+   */
+  test('a closed sink still lists what it left behind', () => {
+    expect(openedThenClosed().getLogFilePaths()).toEqual([
+      '/memory/logs/app.log',
+    ]);
+    expect(neverOpened().getLogFilePaths()).toEqual([]);
+  });
+
+  test('and lists archives when a test stages them', () => {
+    const sink = openedThenClosed();
+    sink.artifactPaths = [
+      '/memory/logs/app.log',
+      '/memory/logs/app.log.20260101T000000Z_abcd.gz',
+    ];
+    expect(sink.getLogFilePaths()).toHaveLength(2);
+  });
+
+  /**
+   * A failed open forfeits vacuous success, and does not get it back.
+   *
+   * `acquire` creates the log directory before it opens the file, so a throw
+   * is not evidence that nothing was written. A double that only set the bit
+   * on success would let a half-failed open claim a durable compliance purge
+   * over a directory it had just made.
+   */
+  test('a sink whose open threw cannot claim a vacuous purge', () => {
     const writer = new MemoryWriter();
-    const sink = writer.attach();
-    sink.close(1000);
+    const first = writer.attach();
+    first.open('/memory/logs/app.log', undefined, true);
+
+    const second = writer.attach();
+    // Same writer, different path: the double refuses, the way the registry
+    // refuses a conflicting configuration.
+    expect(() =>
+      second.open('/memory/logs/other.log', undefined, true)
+    ).toThrow();
+
+    expect(second.clearLogs(1000).durable).toBe(false);
+    expect(second.flush(1000).durable).toBe(false);
+  });
+
+  /**
+   * The hatch, and its limits.
+   *
+   * The double must be able to lie the way a native across a bridge can lie —
+   * a status reporting bytes queued on a sink that has none is a real thing a
+   * caller has to survive. It is deliberately confined to two answers, because
+   * a double that can be told what to say about its own *lifecycle* cannot
+   * disagree with the caller, and disagreeing is the entire job.
+   */
+  test('a hostile status is merged over the computed one', () => {
+    const sink = neverOpened();
+    sink.hostileStatus = { queuedBytes: 4096, degraded: 0b100 };
+
+    const status = sink.getStatus();
+    expect(status.queuedBytes).toBe(4096);
+    expect(status.degraded).toBe(0b100);
+    // Merged, not replaced: the fields it does not name keep their real values.
+    expect(status.lostEntries).toBe(0);
+  });
+
+  test('a hostile clear outcome is merged over the computed one', () => {
+    const sink = openedThenClosed();
+    sink.hostileClear = { durable: true, deletedCount: 99 };
 
     const outcome = sink.clearLogs(1000);
-
-    // Nothing was ever created, so "every artifact is gone" holds with nothing
-    // to check. `false` here would re-arm a compliance failure for a sink that
-    // cannot owe one.
     expect(outcome.durable).toBe(true);
-    expect(outcome.failedPaths).toEqual([]);
+    expect(outcome.deletedCount).toBe(99);
     expect(outcome.rebound).toBe(false);
+  });
+
+  /**
+   * Answers are fresh objects, not shared constants.
+   *
+   * The no-handle answers are built from module-level constants, and handing
+   * one back unchanged would let a caller that mutates a status it was given
+   * change what every later call on every sink reports. A real bridge marshals
+   * a new value each time and has no such failure mode; a double that does is
+   * a source of cross-test contamination that looks like a real bug.
+   */
+  test('a mutated status does not poison the next one', () => {
+    const first = neverOpened();
+    const status = first.getStatus();
+    (status as { queuedBytes: number }).queuedBytes = 9999;
+
+    expect(first.getStatus().queuedBytes).toBe(0);
+    expect(neverOpened().getStatus().queuedBytes).toBe(0);
+    expect(neverOpened().maintain(1000).queuedBytes).toBe(0);
+  });
+
+  /**
+   * A live handle comes from `open`, and there is no other way to get one.
+   *
+   * Staging "this sink's handle is gone" is legitimate; staging "this sink has
+   * a handle it never acquired" is a state no adapter can be in, and the point
+   * of computing every answer from the state is that a test cannot script its
+   * way into one.
+   */
+  test('a handle cannot be conjured by assignment', () => {
+    const sink = neverOpened();
+    expect(() => {
+      sink.closed = false;
+    }).toThrow(/open\(\)/);
+  });
+
+  /**
+   * A purge deletes artifacts, including the archives a test staged.
+   *
+   * The two outcomes differ: a purge that rebound recreated the log file and
+   * nothing else, and one that could not reopen left the directory empty.
+   * Reporting the pre-purge list for either would have a support flow offer
+   * files a compliance deletion has already removed.
+   */
+  test('a durable purge takes the staged archives with it', () => {
+    const sink = new MemoryWriter().attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = [
+      '/memory/logs/app.log',
+      '/memory/logs/app.log.20260101T000000Z_abcd.gz',
+    ];
+    sink.appendBatch('{"m":1}\n', 1);
+    sink.flush(1000);
+
+    expect(sink.clearLogs(1000).rebound).toBe(true);
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toEqual(['/memory/logs/app.log']);
+  });
+
+  test('a purge that cannot reopen leaves nothing to list', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = ['/memory/logs/app.log', '/memory/logs/app.log.gz'];
+    writer.reopenFails = true;
+
+    const outcome = sink.clearLogs(1000);
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toEqual([]);
+  });
+
+  /**
+   * A failed deletion leaves the list alone, because the files are still there.
+   */
+  test('a failed purge keeps listing what it could not delete', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = ['/memory/logs/app.log', '/memory/logs/app.log.gz'];
+    writer.clearFails = true;
+
+    expect(sink.clearLogs(1000).durable).toBe(false);
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toHaveLength(2);
+  });
+
+  /**
+   * Rotation is a forwarding pin, not an implementation, and that is on
+   * purpose.
+   *
+   * A second rotation implementation living in a test double drifts from the
+   * two real ones and produces confidence that is worse than a stated gap. So
+   * the double records what it was handed and rotates nothing; size, age and
+   * archive limits are pinned in the native suites, where the code that
+   * implements them lives.
+   */
+  test('rotation config is recorded and not acted on', () => {
+    const sink = new MemoryWriter().attach();
+    const rotation = {
+      maxFileSizeBytes: 8,
+      maxArchivedFilesCount: 3,
+      compressArchives: false,
+    };
+    sink.open('/memory/logs/app.log', rotation, true);
+
+    sink.appendBatch('{"m":"much longer than eight bytes"}\n', 1);
+    sink.flush(1000);
+
+    expect(sink.openedRotation).toBe(rotation);
+    expect(sink.getLogFilePaths()).toEqual(['/memory/logs/app.log']);
   });
 });
