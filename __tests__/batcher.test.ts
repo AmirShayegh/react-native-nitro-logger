@@ -415,6 +415,10 @@ describe('Batcher — backpressure', () => {
     const noticeLine = notice({ entries: 1, bytes: 21 });
     expect(sent.endsWith(`${noticeLine}\n`)).toBe(true);
 
+    // `+ 1` for the notice's own newline, which is the whole of the
+    // difference between "one notice" and what the payload actually grows by:
+    // record terminators are inside `maxBatchBytes` because `add` counts one
+    // into every measurement, and the notice's is inside nothing.
     const withoutNotice = sent.length - (noticeLine.length + 1);
     expect(withoutNotice).toBeLessThanOrEqual(50);
     expect(sent.length).toBeGreaterThan(50);

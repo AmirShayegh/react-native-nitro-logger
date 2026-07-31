@@ -76,12 +76,17 @@ export interface BatcherOptions {
   /**
    * Largest single batch of RECORDS. Default 256 KB.
    *
-   * **Records only.** A consolidated loss notice is appended after this
-   * budget has been spent and does not count against it, so the batch handed
-   * to the sink is up to `maxBatchBytes` of records PLUS one rendered notice.
-   * Deliberate: charging the notice against the same budget would let a large
-   * one starve the records out of their own batch, which is the pipeline's
-   * diagnostics jamming the pipeline.
+   * **Records only, terminators included.** {@link Batcher.add} counts one
+   * byte of framing into every record it measures, so this budget is the
+   * whole of what the records contribute to the payload.
+   *
+   * A consolidated loss notice is appended after that budget has been spent
+   * and does not count against it — neither its own bytes nor the newline the
+   * join gives it. So the batch handed to the sink is up to `maxBatchBytes`
+   * of records plus one rendered notice plus one framing byte. Deliberate:
+   * charging the notice against the same budget would let a large one starve
+   * the records out of their own batch, which is the pipeline's diagnostics
+   * jamming the pipeline.
    *
    * The size of that notice is not this class's to bound. `renderNotice` is
    * caller-supplied and {@link Batcher.noticeText} asks only that it return a

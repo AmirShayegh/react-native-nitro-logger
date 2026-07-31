@@ -86,9 +86,16 @@ export interface FileDestinationOptions {
    * this destination**. A consolidated loss notice goes through the same
    * `boundedNotice` limit as any record and is then appended to a batch whose
    * record budget is already spent, so the largest batch this destination
-   * hands its sink is `maxBatchBytes + maxEntryBytes` — 320 KB at both
-   * defaults, not 256. Raising this raises that, which is why the two numbers
-   * are worth reading together.
+   * hands its sink is `maxBatchBytes + maxEntryBytes + 1` — 320 KB and one
+   * byte at both defaults, not 256 KB. Raising this raises that, which is why
+   * the two numbers are worth reading together.
+   *
+   * The stray byte is the notice's own newline, and it is not an accident of
+   * arithmetic. This limit measures a RENDERED RECORD, which is why
+   * {@link Rendered} says it excludes the terminator: framing is the
+   * batcher's, so a record's newline is counted in `maxBatchBytes` (see
+   * `Batcher.add`, which adds one to every measurement) while the notice's is
+   * counted nowhere, because the notice is appended after the budget closes.
    *
    * The bound comes from here, not from `Batcher`: that class takes
    * `renderNotice` from its caller and does not police the result. See
