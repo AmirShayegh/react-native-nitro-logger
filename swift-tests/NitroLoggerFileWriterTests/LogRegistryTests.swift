@@ -948,4 +948,42 @@ final class LogRegistryTests: LogWriterTestCase {
     XCTAssertTrue(LogDegradation(rawValue: handle.status().degraded).contains(.exclusivity),
                   "and the caller has to be able to find out")
   }
+
+  /// A purge that arrives after the close barrier still deletes, and does not
+  /// reopen.
+  ///
+  /// **A parity anchor, not a fix.** iOS has always behaved this way: the block
+  /// is enqueued on the serial queue, so it lands *behind* the terminate
+  /// barrier and runs after it rather than being refused by it. Android, whose
+  /// executor refuses submissions once shut down, caught that refusal in a
+  /// blanket handler and through 0.2.0 deleted nothing while reporting
+  /// `durable: false`.
+  ///
+  /// So this pins the answer Android has now been changed to give, on the side
+  /// that already gave it — which is the half of a parity claim that otherwise
+  /// nobody checks. Deliberately reaches the writer directly: the handle is
+  /// closed by this point and refuses on its own, which is a different rule
+  /// tested elsewhere.
+  func testAPurgeAfterTheCloseBarrierStillDeletes() throws {
+    let handle = try makeHandle(policy: LogRotationPolicy(maxFileSizeBytes: 64))
+    let writer = handle.writerForTesting
+    for _ in 0..<6 { write(handle, String(repeating: "x", count: 39) + "\n") }
+    XCTAssertFalse(archiveNames().isEmpty, "the test needs artifacts to delete")
+
+    _ = handle.close(deadlineMs: 1000)
+
+    let (outcome, _) = writer.clearLogs(deadlineMs: 2000)
+
+    XCTAssertTrue(outcome.durable, "a post-close purge deleted nothing")
+    XCTAssertGreaterThan(outcome.deletedCount, 0)
+    XCTAssertEqual(outcome.failedPaths, [])
+    XCTAssertFalse(
+      outcome.rebound, "a purge after the barrier must not reopen the file it just deleted")
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: logURL.path),
+      "the purge reopened the file it had just deleted")
+    XCTAssertEqual(
+      names().filter { LogWriter.isArtifactName($0, baseName: "app.log") }, [],
+      "artifacts survived a purge that reported durable")
+  }
 }

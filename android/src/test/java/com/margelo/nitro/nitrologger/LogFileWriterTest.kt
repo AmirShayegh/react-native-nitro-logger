@@ -463,6 +463,143 @@ class LogFileWriterTest {
     assertEquals("after\n", File(directory, "app.log").readText())
   }
 
+  /**
+   * A purge that arrives after the close barrier still deletes.
+   *
+   * The call is a compliance purge, and the case is ordinary: a destination is
+   * disposed and the app then asks for the logs to be erased. Through 0.2.0
+   * Android deleted **nothing** here and reported `durable = false` — the
+   * executor was shut down, the submission was refused, and the refusal was
+   * caught by a blanket `catch (Exception)` that treated "I could not schedule
+   * the work" as "the deletion failed". iOS had always behaved as documented,
+   * because its block reaches the queue before the barrier rather than being
+   * refused by it, so the two platforms disagreed about the one call where
+   * disagreeing matters most.
+   *
+   * It runs inline now, once `awaitTermination` has established that no
+   * executor task can ever run again.
+   */
+  @Test
+  fun `a purge that lands after the close barrier still deletes`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
+    repeat(4) {
+      w.write("0123456789012345\n")
+      now += 1_000
+    }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+    assertTrue(directory.list()!!.isNotEmpty())
+
+    // The executor is shut down from here on, so the purge below cannot be
+    // scheduled at all.
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertTrue("a post-close purge deleted nothing", outcome.durable)
+    assertTrue("nothing was counted as deleted", outcome.deletedCount > 0)
+    assertTrue(outcome.failedPaths.isEmpty())
+    val survivors = directory.list()!!.filter { LogFileWriter.isArtifactName(it, "app.log") }
+    assertTrue("artifacts survived a purge that reported durable: $survivors", survivors.isEmpty())
+  }
+
+  /**
+   * The inline path must not start while the executor is still draining.
+   *
+   * `shutdown()` refuses new submissions but lets queued tasks finish, so
+   * "refused" does not mean "finished" — and a sweep racing a task that is
+   * still moving these files has two mutators and can report durable over an
+   * artifact about to be rewritten. `awaitTermination` returning false is the
+   * only thing standing between those two, and the honest answer when it does
+   * is that nothing was deleted.
+   */
+  @Test
+  fun `a purge that lands while the executor is still draining is not durable`() {
+    val w = writer()
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+
+    // Wedge the executor, then close: the barrier queues behind the stall and
+    // never runs, `close` gives up on its own budget, and `shutdown()` still
+    // happens on the way out. The executor is now shutting down but very much
+    // not terminated.
+    val release = w.stallForTesting()
+    try {
+      w.close(1, 50.0)
+
+      val (outcome, _) = w.clearLogs(50.0)
+
+      assertFalse("a purge claimed durability over a draining executor", outcome.durable)
+      assertEquals(listOf(File(directory, "app.log").absolutePath), outcome.failedPaths)
+      assertEquals(0, outcome.deletedCount)
+      assertTrue(
+        "the file was deleted by a purge that reported it was not",
+        File(directory, "app.log").exists()
+      )
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * The inline purge reports a failure; it does not throw one.
+   *
+   * The trap is a Kotlin/Java rule rather than anything about purging: an
+   * exception raised inside a `catch` block does **not** flow into a sibling
+   * `catch` of the same `try`. The inline path lives inside the
+   * `RejectedExecutionException` handler, so the blanket handler beside it
+   * cannot cover it, and a throwing `list()`, `delete()` or `syncDirectory`
+   * would escape `clearLogs` outright — while the identical failure on the
+   * executor path stays inside the task, leaves the outcome at its non-durable
+   * initial value, and returns normally.
+   *
+   * A purge that throws on one path and returns on the other is exactly the
+   * divergence this workstream exists to remove, so the inline call has its own
+   * `try`.
+   */
+  @Test
+  fun `an inline purge that fails reports it rather than throwing`() {
+    val hostile = object : PlatformIo by PlatformIo.Jvm {
+      override fun syncDirectory(directory: File): Boolean =
+        throw RuntimeException("the volume went away mid-purge")
+    }
+    val w = writer(platform = hostile)
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertFalse("a purge that could not finish claimed durability", outcome.durable)
+    assertEquals(listOf(File(directory, "app.log").absolutePath), outcome.failedPaths)
+  }
+
+  /**
+   * The inline purge deletes and stops there.
+   *
+   * Reopening after the close barrier would leak a stream for the life of the
+   * process and leave a fresh empty `app.log` where a purge had just promised
+   * nothing. Note this does **not** consult `terminated`: a close whose own
+   * barrier submission was rejected leaves that flag false over a dead
+   * executor, so the inline path passes `reopenIfClean = false` outright.
+   */
+  @Test
+  fun `an inline purge never reopens the log file`() {
+    val w = writer()
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertTrue(outcome.durable)
+    assertFalse("a post-close purge rebound a handle onto a dead writer", outcome.rebound)
+    assertFalse(
+      "the purge reopened the file it had just deleted",
+      File(directory, "app.log").exists()
+    )
+  }
+
   // Writing pre-purge data into the fresh file would resurrect exactly what the
   // user asked to be deleted.
   @Test

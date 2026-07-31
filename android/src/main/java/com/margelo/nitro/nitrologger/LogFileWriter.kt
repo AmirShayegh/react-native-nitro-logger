@@ -1849,93 +1849,42 @@ class LogFileWriter internal constructor(
       try {
         executor.execute {
           try {
-            closeCurrentStream()
-
-            // An unreadable directory is NOT an empty one. Sweeping an empty
-            // list would report a durable purge while every artifact sat
-            // untouched behind a permissions or I/O failure — the worst
-            // possible lie for this particular call to tell. `list()` returns
-            // null for both "not a directory" and "could not read it", so
-            // absence has to be established separately.
-            val names = directory.list()
-            val directoryAbsent =
-              names == null && platform.lookup(directory) == PlatformIo.Presence.ABSENT
-            if (names == null && !directoryAbsent) {
-              outcome = LogClearOutcome(0, listOf(directory.absolutePath), durable = false)
-              return@execute
-            }
-
-            var deleted = 0
-            val failures = mutableListOf<String>()
-            for (name in (names ?: emptyArray())) {
-              if (!isArtifactName(name, baseName)) continue
-              val target = File(directory, name)
-              if (target.delete()) {
-                deleted += 1
-                continue
-              }
-              // `delete()` said no. Only a platform that positively reports the
-              // path as gone lets this count as deleted — something else removed
-              // it between the listing and here. `File.exists()` cannot make
-              // that distinction: it returns false for an absent file and for
-              // one behind a permissions or I/O failure alike, and treating the
-              // second as the first is how a purge reports `durable = true` over
-              // artifacts still sitting on disk. For this call, of every lie
-              // available, that is the worst one.
-              if (platform.lookup(target) == PlatformIo.Presence.ABSENT) {
-                deleted += 1
-              } else {
-                // The path is this package's own artifact name, not user
-                // content.
-                failures.add(target.absolutePath)
-              }
-            }
-
-            if (failures.isNotEmpty()) {
-              outcome = LogClearOutcome(deleted, failures, durable = false)
-              return@execute
-            }
-
-            // `delete()` returning true only means the change is in the
-            // directory's in-memory state. Until the directory itself is
-            // synced, a crash or a power loss can bring every one of those
-            // names back — and this call exists precisely to promise they are
-            // gone.
-            if (!directoryAbsent && !platform.syncDirectory(directory)) {
-              outcome = LogClearOutcome(deleted, listOf(directory.absolutePath), durable = false)
-              return@execute
-            }
-
-            val current = stateLock.withLock { generation }
-            if (current != fenced) {
-              outcome = LogClearOutcome(deleted, emptyList(), durable = false)
-              return@execute
-            }
-
-            currentFileSize = 0
-            currentFileStart = clock()
-            // The purge took the sidecar with everything else, so a rotation
-            // that never managed to record its time has nothing left to
-            // reconcile: the file that follows is new, not rotated.
-            pendingFileStart = null
-            // Deletion succeeded whether or not a fresh file could be opened,
-            // and `durable` describes the deletion — that is what a compliance
-            // caller asked about. Whether the writer is usable again is a
-            // separate fact, reported separately, because a handle that rebinds
-            // onto a writer with no stream would accept records and lose them.
-            //
-            // A purge that lands after the close barrier still deletes — that
-            // is the whole point of the call — but it must not reopen.
-            outcome = LogClearOutcome(
-              deletedCount = deleted,
-              failedPaths = emptyList(),
-              durable = true,
-              rebound = if (terminated) false else reopen()
-            )
+            outcome = sweepArtifacts(fenced, reopenIfClean = !terminated)
           } finally {
             done.countDown()
           }
         }
+      } catch (_: RejectedExecutionException) {
+        // The executor is shut down, which only [close] does. The deletion
+        // still has to happen — that is the whole point of this call, and a
+        // compliance purge that silently did nothing because the destination
+        // had just been disposed is the worst version of this failing. It runs
+        // inline instead, once the executor is provably finished.
+        //
+        // Through 0.2.0 this branch deleted nothing and reported
+        // `durable = false`, which contradicted the comment two screens up
+        // saying a purge landing after the close barrier still deletes. iOS
+        // already behaved as documented, because its block was on the queue
+        // before the barrier rather than refused by it.
+        //
+        // Its own `try`, and not a reliance on the `catch (Exception)` below:
+        // an exception raised inside a `catch` block does **not** flow into a
+        // sibling clause of the same `try`. Without this, a throwing
+        // `directory.list()`, `delete()` or `syncDirectory` would escape
+        // `clearLogs` entirely — where the very same failure on the executor
+        // path stays inside the task, leaves `outcome` at its non-durable
+        // initial value, and returns normally. A purge that throws on one path
+        // and returns on the other is the divergence this whole item is about.
+        return try {
+          purgeInline(fenced, expiry)
+        } catch (_: Exception) {
+          // Named, not empty. A sweep that died partway cannot say what it
+          // removed, and "as far as this call can tell the artifacts are still
+          // there" is the fail-closed answer every other refusal here gives.
+          // `Error` is deliberately not caught: a linkage failure or an OOM is
+          // not a purge that declined.
+          LogClearOutcome(0, listOf(file.absolutePath), durable = false)
+        } to fenced
       } catch (_: Exception) {
         return LogClearOutcome(0, listOf(file.absolutePath), durable = false) to fenced
       }
@@ -1955,6 +1904,134 @@ class LogFileWriter internal constructor(
     } finally {
       purgeLock.unlock()
     }
+  }
+
+  /**
+   * The purge itself: close the stream, delete every artifact, sync, and — only
+   * on a clean sweep, and only if [reopenIfClean] — open a fresh file.
+   *
+   * Extracted rather than inlined in the executor task because there are now
+   * two callers, the task and [purgeInline], and they must not drift. The
+   * difference between them is one parameter; everything a compliance caller
+   * is told comes from here.
+   *
+   * **Runs with exactly one mutator, always.** On the executor path that is the
+   * executor. On the inline path it is the calling thread, after
+   * `awaitTermination` has established that no task can ever run again.
+   */
+  private fun sweepArtifacts(fenced: Long, reopenIfClean: Boolean): LogClearOutcome {
+    closeCurrentStream()
+
+    // An unreadable directory is NOT an empty one. Sweeping an empty list would
+    // report a durable purge while every artifact sat untouched behind a
+    // permissions or I/O failure — the worst possible lie for this particular
+    // call to tell. `list()` returns null for both "not a directory" and "could
+    // not read it", so absence has to be established separately.
+    val names = directory.list()
+    val directoryAbsent =
+      names == null && platform.lookup(directory) == PlatformIo.Presence.ABSENT
+    if (names == null && !directoryAbsent) {
+      return LogClearOutcome(0, listOf(directory.absolutePath), durable = false)
+    }
+
+    var deleted = 0
+    val failures = mutableListOf<String>()
+    for (name in (names ?: emptyArray())) {
+      if (!isArtifactName(name, baseName)) continue
+      val target = File(directory, name)
+      if (target.delete()) {
+        deleted += 1
+        continue
+      }
+      // `delete()` said no. Only a platform that positively reports the path as
+      // gone lets this count as deleted — something else removed it between the
+      // listing and here. `File.exists()` cannot make that distinction: it
+      // returns false for an absent file and for one behind a permissions or
+      // I/O failure alike, and treating the second as the first is how a purge
+      // reports `durable = true` over artifacts still sitting on disk. For this
+      // call, of every lie available, that is the worst one.
+      if (platform.lookup(target) == PlatformIo.Presence.ABSENT) {
+        deleted += 1
+      } else {
+        // The path is this package's own artifact name, not user content.
+        failures.add(target.absolutePath)
+      }
+    }
+
+    if (failures.isNotEmpty()) {
+      return LogClearOutcome(deleted, failures, durable = false)
+    }
+
+    // `delete()` returning true only means the change is in the directory's
+    // in-memory state. Until the directory itself is synced, a crash or a power
+    // loss can bring every one of those names back — and this call exists
+    // precisely to promise they are gone.
+    if (!directoryAbsent && !platform.syncDirectory(directory)) {
+      return LogClearOutcome(deleted, listOf(directory.absolutePath), durable = false)
+    }
+
+    val current = stateLock.withLock { generation }
+    if (current != fenced) {
+      return LogClearOutcome(deleted, emptyList(), durable = false)
+    }
+
+    currentFileSize = 0
+    currentFileStart = clock()
+    // The purge took the sidecar with everything else, so a rotation that never
+    // managed to record its time has nothing left to reconcile: the file that
+    // follows is new, not rotated.
+    pendingFileStart = null
+    // Deletion succeeded whether or not a fresh file could be opened, and
+    // `durable` describes the deletion — that is what a compliance caller asked
+    // about. Whether the writer is usable again is a separate fact, reported
+    // separately, because a handle that rebinds onto a writer with no stream
+    // would accept records and lose them.
+    //
+    // A purge that lands after the close barrier still deletes — that is the
+    // whole point of the call — but it must not reopen.
+    return LogClearOutcome(
+      deletedCount = deleted,
+      failedPaths = emptyList(),
+      durable = true,
+      rebound = if (reopenIfClean) reopen() else false
+    )
+  }
+
+  /**
+   * The purge for a writer whose executor is gone.
+   *
+   * Reached only when [close] has already shut the executor down, so the
+   * submission in [clearLogs] was refused. `awaitTermination` is the
+   * serialisation point and it is a strong one: `shutdown()` does not discard
+   * queued tasks, it refuses new ones and lets the queue drain, so a `true`
+   * return means every task has completed AND the worker has exited. Because
+   * `ThreadPoolExecutor` signals termination under its own lock, that also
+   * establishes a happens-before edge from the last task to this thread —
+   * every field the executor owns is visible here, and no thread can ever
+   * mutate them again. That is a stronger guarantee than the executor gave
+   * while it was alive.
+   *
+   * **Never reopens.** This path is post-close by construction, so `rebound` is
+   * unconditionally false. It deliberately does not consult `terminated`: a
+   * close whose own barrier submission was rejected leaves that flag false over
+   * a dead executor, and reopening then would leak a descriptor for the life of
+   * the process and leave an empty file where a purge had just promised none.
+   */
+  private fun purgeInline(fenced: Long, expiry: Long): LogClearOutcome {
+    val settled = try {
+      executor.awaitTermination(remaining(expiry), TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+      false
+    }
+    // Not settled means work may still be moving these files. Nothing durable
+    // can be claimed about a directory something else is still writing to, and
+    // the sweep must not start — this is the one thing standing between the
+    // inline path and two mutators.
+    if (!settled) {
+      return LogClearOutcome(0, listOf(file.absolutePath), durable = false)
+    }
+    return sweepArtifacts(fenced, reopenIfClean = false)
   }
 
   /** The generation a handle must rebind to after a durable purge. */
