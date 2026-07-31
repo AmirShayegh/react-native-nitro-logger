@@ -1933,7 +1933,9 @@ function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
   const current = unwrap(node);
   if (!current || current.type !== 'MemberExpression') return undefined;
   // Containers that reference each other resolve to nothing rather than
-  // looping — the same treatment the constant resolver gives a cycle.
+  // looping — the same treatment the constant resolver gives a cycle. `seen`
+  // carries both the member expressions and the variables already on THIS
+  // path; it is a stack, not a global visited set.
   if (seen.has(current)) return undefined;
   seen.add(current);
 
@@ -1949,7 +1951,11 @@ function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
   if (candidates.length === 0) return undefined;
 
   const classified = candidates.map((value) =>
-    classifyCandidate(context, value, callNode, seen)
+    // A copy per candidate. `seen` exists to stop one path revisiting itself;
+    // shared between siblings it would also let the first candidate mark a
+    // node the second legitimately needs to classify, and answer "opaque" for
+    // a value the walk can actually read.
+    classifyCandidate(context, value, callNode, new Set(seen))
   );
   const opaque = classified.filter((receiver) => receiver === undefined);
 
@@ -1985,8 +1991,17 @@ function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
  * "looked at, not a logger" and "cannot see through this", and only the first
  * is evidence:
  *
- *   - an **identifier** had the name heuristic applied, so its `null` means
- *     "not spelled like a logger", which is a decision.
+ *   - an **identifier** is the one that has to be unpicked. `classifyReceiver`
+ *     follows the binding, and when it cannot see through the initializer it
+ *     falls through to the name — so the `null` that comes back may be the
+ *     NAME's answer about a value nothing understood. `const value =
+ *     getLogger(); const holder = { logger: value }` is the factory case with
+ *     one alias in front of it, and reading that `null` as evidence puts it
+ *     straight back. So the binding decides: an initializer that is understood
+ *     and is not a logger is evidence, an opaque one is not, and an identifier
+ *     with nothing behind it — a parameter, an unresolved global, an import
+ *     from elsewhere — is a bare name, which is what the name heuristic is
+ *     for and has always answered.
  *   - a **construction** was examined by `classifyConstruction` and found not
  *     to be a logger. `classifyReceiver` calls that evidence in as many words,
  *     and `loggerClassNames` depends on it continuing to mean something.
@@ -2017,9 +2032,29 @@ function classifyCandidate(context, value, callNode, seen) {
 
   const receiver = classifyReceiver(context, current);
   if (receiver !== null) return receiver;
-  return current.type === 'Identifier' || current.type === 'NewExpression'
-    ? null
-    : undefined;
+  if (current.type === 'NewExpression') return null;
+  if (current.type !== 'Identifier') return undefined;
+
+  const variable = resolveVariable(context, current);
+  // Nothing in this file to see through, so the name was the whole story and
+  // its `null` stands. This is what keeps `{ logger: analytics }` silent.
+  if (!variable) return null;
+  // An alias cycle is dead code, but "cannot see through this" is the safe
+  // thing to say about it.
+  if (seen.has(variable)) return undefined;
+  seen.add(variable);
+
+  // An import was looked at: it is not this package's `Log`, and a module that
+  // exports something else is the same class of evidence as `analytics`.
+  const def = singleDef(variable);
+  if (def && def.type === 'ImportBinding') return null;
+
+  // A parameter, or a binding with no initializer to read: a bare name again.
+  const init = bindingInit(variable);
+  if (!init) return null;
+
+  // Otherwise the question is exactly this question, one alias in.
+  return classifyCandidate(context, init, callNode, seen);
 }
 
 /**

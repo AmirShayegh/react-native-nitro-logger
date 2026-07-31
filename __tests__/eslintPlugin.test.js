@@ -162,6 +162,29 @@ describe('no-dynamic-message', () => {
       // the walk recurses rather than reading `inner.audit` off its own
       // spelling. Here the inner literal settles it: not a logger, silent.
       'const inner = { audit: analytics }; const holder = { logger: inner.audit }; holder.logger.info(`user ${id}`);',
+      // An alias in front of the value changes nothing about it. These are
+      // the decided ones: the initializer was understood and is not a logger,
+      // so the outer `logger` spelling does not override it.
+      'const value = analytics; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
+      'const value = new Widget(); const holder = { logger: value }; holder.logger.info(`user ${id}`);',
+      `import { audit } from './x'; const holder = { logger: audit }; holder.logger.info(\`user \${id}\`);`,
+      // A parameter has no initializer to see through, so it is a bare name
+      // like any other, and a bare name is what the heuristic answers. Making
+      // it opaque instead would mean doing the same for the unresolved global
+      // in `{ logger: analytics }` above, which is the fixture that fixed the
+      // ORDER of the two analyses in the first place. Where a value crosses a
+      // function boundary is where this plugin stops, deliberately.
+      'function f(value) { const holder = { logger: value }; holder.logger.info(`user ${id}`); }',
+      // The same value reachable twice is still that value. `seen` is a
+      // recursion stack, so the second candidate gets its own copy and its own
+      // real classification — shared, the first would mark the variable and
+      // the second would come back "opaque", widening a settled non-logger to
+      // `ambiguous` and reporting ordinary code.
+      'const v = analytics; const holder = { logger: v }; holder.logger = v; holder.logger.info(`user ${id}`);',
+      'const inner = { audit: analytics }; const holder = { logger: inner.audit }; holder.logger = inner.audit; holder.logger.info(`user ${id}`);',
+      // Including through the nested walk: the inner container is readable and
+      // says `analytics`, and one alias does not launder that.
+      'const inner = { audit: analytics }; const value = inner.audit; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
       // ...and travels outward only when it says logger. `deps.analytics` in
       // a field spelled `audit` leaves nothing anywhere that says logger.
       'const holder = { audit: deps.analytics }; holder.audit.info(`user ${id}`);',
@@ -666,6 +689,39 @@ describe('no-dynamic-message', () => {
       // is a shrug rather than a denial, so the outer name still decides.
       {
         code: 'const holder = { logger: deps.audit }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // An alias does not launder an opaque value either, and this is the
+      // direction that matters: `classifyReceiver` follows the binding, fails
+      // to see through `getLogger()`, and falls through to the NAME — so the
+      // `null` it returns for `value` is a statement about the spelling of a
+      // local variable, not about what it holds. Reading it as evidence puts
+      // the factory case back with one alias in front of it, which is a false
+      // negative in a privacy rule, which looks exactly like compliance.
+      {
+        code: 'const value = getLogger(); const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const value = flag ? a : b; const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Through a chain of them, and through an alias of a container property
+      // that cannot be read.
+      {
+        code: 'const a = getLogger(); const b = a; const holder = { logger: b }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const value = deps.audit; const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Aliases that name each other are dead code, but "cannot see through
+      // this" is the safe thing to say about them, so the outer name decides
+      // and the call is checked. The assertion that matters is that the
+      // resolution terminates at all.
+      {
+        code: 'const a = b; const b = a; const holder = { logger: a }; holder.logger.info(`patient ${id}`);',
         errors: [{ messageId: 'dynamic' }],
       },
       // The other half of that: an unreadable container whose property IS

@@ -18,11 +18,11 @@ public API, and the table says which.
 
 ## How much of this is actually enforced
 
-<!-- test-counts: js=1093/26 swift=247/12 kotlin=240/11 -->
+<!-- test-counts: js=1105/26 swift=247/12 kotlin=240/11 -->
 
 | Target                              | Tests | Suites |
 | ----------------------------------- | ----- | ------ |
-| JavaScript / TypeScript (`jest`)    | 1093  | 26     |
+| JavaScript / TypeScript (`jest`)    | 1105  | 26     |
 | iOS (`swift test`)                  | 247   | 12     |
 | Android (`testDebugUnitTest`)       | 240   | 11     |
 
