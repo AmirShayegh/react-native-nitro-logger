@@ -35,6 +35,7 @@ down to be useful ends up not being used at the layers that need it most.
 | `debug(…)` · `info(…)` · `warning(…)` · `error(…)` · `todo(…)` | `void` | Same shape. |
 | `log(message, options?)` | `void` | The general form; takes `LogOptions` instead of positional arguments. |
 | `logMessage(message, options?)` | `void` | What `log` delegates to. Covered by the ESLint rules for the same reason `log` is. |
+| `passesLevel(level, subsystem?)` | `boolean` | Would this be logged at all? The level methods and `ScopedLogger` ask it before building an options object a filtered call would discard. Public because `ScopedLogger` needs it; you rarely do. |
 | `minimumLevel(level)` | `this` | Global floor. |
 | `subsystem(name, level)` | `this` | Per-subsystem floor, which overrides the global one. |
 | `resetSubsystem(name)` | `this` | Drop a per-subsystem floor. |

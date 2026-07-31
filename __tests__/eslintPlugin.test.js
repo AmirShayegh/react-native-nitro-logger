@@ -1826,6 +1826,7 @@ describe('plugin configs', () => {
       'metadataKeyCatalog', // key names, checked at runtime instead
       'minimumLevel', // level only
       'newCorrelationId', // generates, never accepts
+      'passesLevel', // a level and a subsystem name; answers, emits nothing
       'privacyDefault', // mode only
       'redactAllMetadata', // no arguments
       'removeDestination', // label only

@@ -84,6 +84,26 @@ function expectWrites(slots) {
   };
 }
 
+/**
+ * How many filtered calls one filtered op makes.
+ *
+ * The filtered path is the cheapest thing this library does — after the
+ * subsystem memo landed it is a Map hit and two integer compares, which V8
+ * inlines to a few instructions. Measured one call at a time it read 0.46 ns
+ * against a 0.45 ns empty-loop control, and at that point `bench/floor.js`
+ * is right to refuse the number: a case sitting ON the floor is
+ * indistinguishable from a case whose work was eliminated, whichever it
+ * actually is.
+ *
+ * Sixteen calls per op restores the distance without weakening anything.
+ * The DCE guard still holds — sixteen eliminated calls collapse to the
+ * control exactly as one would — and the comparison the harness exists for
+ * is unaffected, since both sides of a before/after run the same batch. The
+ * `-x16` in these case names is there so nobody reads the number as a
+ * per-call cost; divide by sixteen for that.
+ */
+const FILTERED_BATCH = 16;
+
 const CATALOG = ['requestId', 'route', 'status', 'elapsedMs', 'retries'];
 
 module.exports.cases = [
@@ -93,7 +113,7 @@ module.exports.cases = [
     // unrelated override matters: an empty config Map short-circuits in
     // resolveSubsystemLevel before any walking, and this case exists to
     // price the walk, not the short-circuit.
-    name: 'hotpath.filtered.deep-subsystem',
+    name: 'hotpath.filtered.deep-subsystem-x16',
     setup() {
       const destination = noopDestination();
       const logger = quietLogger()
@@ -102,7 +122,9 @@ module.exports.cases = [
         .subsystem('media', 'error');
       return {
         op() {
-          logger.info('cache warm', undefined, 'ui.checkout.payment.card');
+          for (let i = 0; i < FILTERED_BATCH; i += 1) {
+            logger.info('cache warm', undefined, 'ui.checkout.payment.card');
+          }
           return 0;
         },
         teardown: expectNoWrites(observed.noop),
@@ -110,7 +132,7 @@ module.exports.cases = [
     },
   },
   {
-    name: 'hotpath.filtered.no-subsystem',
+    name: 'hotpath.filtered.no-subsystem-x16',
     setup() {
       const destination = noopDestination();
       const logger = quietLogger()
@@ -118,7 +140,7 @@ module.exports.cases = [
         .minimumLevel('warn');
       return {
         op() {
-          logger.info('cache warm');
+          for (let i = 0; i < FILTERED_BATCH; i += 1) logger.info('cache warm');
           return 0;
         },
         teardown: expectNoWrites(observed.noop),
@@ -231,7 +253,7 @@ module.exports.cases = [
     },
   },
   {
-    name: 'hotpath.filtered.scoped',
+    name: 'hotpath.filtered.scoped-x16',
     setup() {
       const destination = noopDestination();
       const logger = quietLogger()
@@ -240,7 +262,7 @@ module.exports.cases = [
       const scoped = logger.scoped('corr-bench', 'net.http');
       return {
         op() {
-          scoped.info('tick');
+          for (let i = 0; i < FILTERED_BATCH; i += 1) scoped.info('tick');
           return 0;
         },
         teardown: expectNoWrites(observed.noop),

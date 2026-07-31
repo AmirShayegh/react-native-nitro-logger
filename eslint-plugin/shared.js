@@ -112,6 +112,7 @@ const LOGGER_OWN_METHODS = new Set([
   'metadataKeyCatalog',
   'minimumLevel',
   'newCorrelationId',
+  'passesLevel',
   'privacyDefault',
   'redactAllMetadata',
   'removeDestination',
