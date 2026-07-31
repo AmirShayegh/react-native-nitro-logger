@@ -1,4 +1,9 @@
-import type { LogEntry, LogPrimitive, RedactedMetadata } from '../types';
+import type {
+  LogEntry,
+  LogLevel,
+  LogPrimitive,
+  RedactedMetadata,
+} from '../types';
 import type { LogFormatter } from './types';
 import { LEVEL_NAME } from '../levels';
 import { utf8Length } from '../utf8';
@@ -19,8 +24,133 @@ export interface JsonLinesFormatterOptions {
   readonly timestampStyle?: JsonTimestampStyle;
 }
 
-/** Instants JavaScript can represent as a Date but not as ISO 8601. */
+/**
+ * Instants JavaScript can represent as a Date but not as ISO 8601.
+ *
+ * A whole number of seconds, which {@link isoTimestampJson} relies on: an
+ * in-range instant floored to its own second cannot land outside the range.
+ */
 const MAX_ISO_MS = 8.64e15;
+
+/**
+ * Level names pre-quoted, once, at module load.
+ *
+ * Derived from {@link LEVEL_NAME} rather than written out a second time, so
+ * the two cannot drift — a level added in `levels.ts` gets its JSON form here
+ * with no second edit — and quoted by `JSON.stringify` rather than by
+ * splicing, so nothing rests on an argument about what those names contain.
+ */
+const LEVEL_JSON = Object.fromEntries(
+  Object.entries(LEVEL_NAME).map(([level, name]) => [
+    level,
+    JSON.stringify(name),
+  ])
+) as Record<LogLevel, string>;
+
+/*
+ * ## The memos below, and why they are not the state `LogFormatter` forbids
+ *
+ * A section note rather than a doc comment: it belongs to the three caches
+ * together, and attaching it to whichever one happens to be declared first
+ * would say it was about that one.
+ *
+ * `formatters/types.ts` requires that a formatter "must not carry state that
+ * later records depend on", because a formatter counting its own calls is
+ * counting the wrong sequence — plenty of entries are formatted and never
+ * written. The caches here are not that kind of state. Each holds the last
+ * result of a pure function together with the input it came from, and each
+ * checks that input before using the result. What a record *says* is still
+ * derived entirely from the entry it was given: delete every memo and every
+ * byte is unchanged. That is the property the rule protects, and it survives.
+ *
+ * They are module-level rather than per-instance deliberately. One process
+ * commonly holds two `JsonLinesFormatter`s — a file destination and a native
+ * console one — which see the same entry a moment apart, and a shared slot
+ * turns the second rendering of it into three hits instead of three misses.
+ *
+ * One slot each, never a Map. `subsystem` and `correlation` are
+ * caller-supplied strings, and a cache of those that grows is a retention
+ * surface in a package whose whole thesis is that caller-supplied strings are
+ * where the leak is. One slot retains one string — the one the most recent
+ * entry was already carrying.
+ */
+
+/** The whole second {@link isoHead} was rendered for. `NaN` matches nothing. */
+let isoSecond = NaN;
+
+/** `"YYYY-MM-DDTHH:MM:SS.` — everything before the milliseconds. */
+let isoHead = '';
+
+/**
+ * `"2026-07-27T12:15:30.842Z"`, quoted and ready to splice into a record.
+ *
+ * `new Date(ms).toISOString()` measured ~26% of `format()`, and every entry
+ * logged within the same second shares all of its answer but the last three
+ * digits. So the second is rendered on a miss, and the milliseconds are
+ * appended on every call.
+ *
+ * Three details are load-bearing:
+ *
+ * **`Math.trunc` first, because the `Date` constructor does.** `new Date(1.7)`
+ * is the same instant as `new Date(1)`. Without this, a fractional timestamp
+ * — nothing in this package produces one, but `LogEntry.timestamp` is a plain
+ * number and a hand-built entry can — would put a fraction in the millisecond
+ * field, where `Date` would have discarded it.
+ *
+ * **The seconds split is a floor, not a division toward zero.** `-1500` is
+ * `1969-12-31T23:59:58.500Z`: second `-2`, millisecond `500`. Truncating
+ * toward zero gives second `-1` and millisecond `-500`, which renders as
+ * `59.-500`. The `epoch-before-1970` golden is exactly this case.
+ *
+ * **The head is `JSON.stringify`'s own output, cut from the end.** Taking
+ * `slice(0, -5)` off the quoted form drops `SSSZ"` and keeps the opening
+ * quote, so an expanded-year instant (`"+275760-09-13T…`, which `MAX_ISO_MS`
+ * admits) moves the cut rather than breaking it — and no claim about which
+ * characters JSON escapes is needed anywhere, because nothing here re-quotes
+ * a string.
+ */
+function isoTimestampJson(epochMs: number): string {
+  const instant = Math.trunc(epochMs);
+  const second = Math.floor(instant / 1000);
+  if (second !== isoSecond) {
+    const quoted = JSON.stringify(new Date(second * 1000).toISOString());
+    isoHead = quoted.slice(0, -5);
+    isoSecond = second;
+  }
+  const ms = instant - second * 1000;
+  const pad = ms < 10 ? '00' : ms < 100 ? '0' : '';
+  return `${isoHead}${pad}${ms}Z"`;
+}
+
+/**
+ * A one-slot memo over `JSON.stringify` of a string.
+ *
+ * A factory rather than two hand-written pairs of variables so that "one
+ * slot, checked by strict equality, holding one caller string" is written
+ * once. Two separate slots rather than one shared one because a record
+ * carrying both fields would otherwise evict itself twice per entry — a
+ * performance point and only that: crossing the two callers below renders
+ * byte-identical output, verified by mutation, because each miss recomputes.
+ * No test can pin the separation, so this comment is the only record of it.
+ *
+ * A miss costs one string comparison on top of the `stringify` it was going
+ * to do anyway, which is the whole downside for a correlation ID that changes
+ * every request.
+ */
+function oneSlotJson(): (value: string) => string {
+  let key: string | undefined;
+  let json = '';
+  return (value) => {
+    if (value !== key) {
+      json = JSON.stringify(value);
+      key = value;
+    }
+    return json;
+  };
+}
+
+const correlationJson = oneSlotJson();
+const subsystemJson = oneSlotJson();
 
 /**
  * One JSON object per line, matching SwiftLogger's `JSONLogFormatter`.
@@ -149,14 +279,14 @@ export class JsonLinesFormatter implements LogFormatter {
   ): string {
     let json = '{"timestamp":';
     json += this.renderTimestamp(entry.timestamp);
-    json += ',"level":' + JSON.stringify(LEVEL_NAME[entry.level]);
+    json += ',"level":' + LEVEL_JSON[entry.level];
     json += ',"message":' + JSON.stringify(message);
 
     if (entry.correlation !== undefined) {
-      json += ',"correlation":' + JSON.stringify(entry.correlation);
+      json += ',"correlation":' + correlationJson(entry.correlation);
     }
     if (entry.subsystem !== undefined) {
-      json += ',"subsystem":' + JSON.stringify(entry.subsystem);
+      json += ',"subsystem":' + subsystemJson(entry.subsystem);
     }
 
     if (metadata) {
@@ -185,7 +315,7 @@ export class JsonLinesFormatter implements LogFormatter {
     if (!Number.isFinite(epochMs) || Math.abs(epochMs) > MAX_ISO_MS) {
       return '"1970-01-01T00:00:00.000Z"';
     }
-    return JSON.stringify(new Date(epochMs).toISOString());
+    return isoTimestampJson(epochMs);
   }
 }
 

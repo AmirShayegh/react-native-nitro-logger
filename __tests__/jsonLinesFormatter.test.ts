@@ -236,6 +236,150 @@ describe('JsonLinesFormatter — timestamps', () => {
   });
 });
 
+/**
+ * The timestamp is rendered from a memo of the current whole second, so these
+ * exist because **the goldens cannot see this at all**: all 21 are pinned to
+ * the same instant `T`, so a formatter that computed the second once and then
+ * ignored every later entry's would pass every one of them. Only
+ * `epoch-before-1970` even involves a second field, and only once.
+ *
+ * Each case below is a way the memo can be wrong that its own key hides:
+ * the second not being reconsidered, the milliseconds being taken from the
+ * wrong subtraction, or the head being cut at the wrong offset.
+ */
+describe('JsonLinesFormatter — the whole-second timestamp memo', () => {
+  /** The `timestamp` value as written, quotes included. */
+  const stamp = (timestamp: number) => {
+    const rendered = fmt.format(entry({ timestamp }));
+    return rendered.slice(
+      '{"timestamp":'.length,
+      rendered.indexOf(',"level":')
+    );
+  };
+
+  test('every millisecond of one second renders its own three digits', () => {
+    // The padding lives in the memo now: 7 must render `.007`, not `.7`, and
+    // 70 must render `.070`. Sweeping the whole second covers both widths and
+    // the unpadded majority in one pass.
+    const second = 1785154530000;
+    for (let ms = 0; ms < 1000; ms += 1) {
+      const expected = String(ms).padStart(3, '0');
+      expect(stamp(second + ms)).toBe(`"2026-07-27T12:15:30.${expected}Z"`);
+    }
+  });
+
+  test('the second rolls over when the entry does', () => {
+    expect(stamp(1785154530999)).toBe('"2026-07-27T12:15:30.999Z"');
+    expect(stamp(1785154531000)).toBe('"2026-07-27T12:15:31.000Z"');
+  });
+
+  test("interleaved seconds never hand one entry another entry's head", () => {
+    // The realistic failure: a batch of entries spanning a second boundary,
+    // or two destinations formatting entries from different moments. Repeated
+    // so a memo that updates on the wrong side of its check cannot alternate
+    // its way to a pass.
+    for (let i = 0; i < 3; i += 1) {
+      expect(stamp(1785154530842)).toBe('"2026-07-27T12:15:30.842Z"');
+      expect(stamp(-1500)).toBe('"1969-12-31T23:59:58.500Z"');
+      expect(stamp(1785154531842)).toBe('"2026-07-27T12:15:31.842Z"');
+      expect(stamp(0)).toBe('"1970-01-01T00:00:00.000Z"');
+    }
+  });
+
+  test('a pre-1970 instant floors to its second instead of truncating', () => {
+    // Dividing toward zero puts a NEGATIVE remainder in the millisecond
+    // field: -1500 would render as second 59 with `.-500`. The golden covers
+    // only -1500; these cover the rest of the second either side of it.
+    expect(stamp(-1)).toBe('"1969-12-31T23:59:59.999Z"');
+    expect(stamp(-999)).toBe('"1969-12-31T23:59:59.001Z"');
+    expect(stamp(-1000)).toBe('"1969-12-31T23:59:59.000Z"');
+    expect(stamp(-1500)).toBe('"1969-12-31T23:59:58.500Z"');
+  });
+
+  test('a fractional timestamp is the instant Date would have made of it', () => {
+    // `new Date(1.7)` is 1ms past the epoch — the constructor truncates
+    // toward zero — so the memo has to as well, or a fraction reaches the
+    // millisecond field where Date would have dropped it. Nothing in this
+    // package produces a fractional timestamp; `LogEntry.timestamp` is a
+    // plain number and a hand-built entry can.
+    expect(stamp(1.7)).toBe('"1970-01-01T00:00:00.001Z"');
+    expect(stamp(-1.7)).toBe('"1969-12-31T23:59:59.999Z"');
+    expect(stamp(999.999)).toBe('"1970-01-01T00:00:00.999Z"');
+  });
+
+  test('an expanded-year instant keeps its own width', () => {
+    // At the edges of the representable range the year grows a sign and two
+    // digits. The head is cut from the END of the quoted string for exactly
+    // this reason, so the extra width moves the cut rather than breaking it.
+    expect(stamp(8.64e15)).toBe('"+275760-09-13T00:00:00.000Z"');
+    expect(stamp(-8.64e15)).toBe('"-271821-04-20T00:00:00.000Z"');
+  });
+});
+
+/**
+ * `correlation` and `subsystem` are each rendered through their own one-slot
+ * memo. The goldens pin one value of each and never change it, so nothing
+ * there would notice a slot that is never invalidated: every golden would be
+ * served the value it wanted anyway.
+ *
+ * What is NOT pinned here, because no test can pin it: that the two fields
+ * use *separate* slots. Pointing both at one slot was mutation-tested and
+ * renders byte-identical output — each miss recomputes, so a shared slot only
+ * thrashes. That separation is a performance property, and the comment on
+ * `oneSlotJson` is where it is recorded.
+ */
+describe('JsonLinesFormatter — the correlation and subsystem memos', () => {
+  test("a changed value is re-rendered, not served from the last entry's slot", () => {
+    // The defect a one-slot memo actually has: returning the previous
+    // entry's text when this entry's differs. Both fields are alternated
+    // between two values so a slot that stops invalidating is wrong on the
+    // second render rather than the tenth, and the values are swapped
+    // between the fields so a wrong slot cannot accidentally hold the right
+    // string.
+    for (let i = 0; i < 3; i += 1) {
+      expect(fmt.format(entry({ correlation: 'C1', subsystem: 'S1' }))).toBe(
+        '{"timestamp":"2026-07-27T12:15:30.842Z","level":"INFO"' +
+          ',"message":"m","correlation":"C1","subsystem":"S1"}'
+      );
+      expect(fmt.format(entry({ correlation: 'S1', subsystem: 'C1' }))).toBe(
+        '{"timestamp":"2026-07-27T12:15:30.842Z","level":"INFO"' +
+          ',"message":"m","correlation":"S1","subsystem":"C1"}'
+      );
+    }
+  });
+
+  test('a value needing escapes is memoised escaped, not raw', () => {
+    // A cached slot is spliced in without re-quoting, so the thing cached has
+    // to be the escaped form. Repeated to render once from the miss and once
+    // from the hit.
+    for (let i = 0; i < 2; i += 1) {
+      const rendered = fmt.format(
+        entry({ correlation: 'a"b', subsystem: 'c\nd' })
+      );
+      expect(rendered).toContain(',"correlation":"a\\"b"');
+      expect(rendered).toContain(',"subsystem":"c\\nd"');
+      expect(JSON.parse(rendered).correlation).toBe('a"b');
+      expect(JSON.parse(rendered).subsystem).toBe('c\nd');
+    }
+  });
+
+  test('two formatters share the slots and still render their own entries', () => {
+    // The memos are module-level on purpose — one process commonly holds a
+    // file formatter and a console one seeing the same entry — so a second
+    // instance must not be able to serve the first one stale text.
+    const other = new JsonLinesFormatter();
+    expect(fmt.format(entry({ subsystem: 'network' }))).toContain(
+      '"subsystem":"network"'
+    );
+    expect(other.format(entry({ subsystem: 'auth' }))).toContain(
+      '"subsystem":"auth"'
+    );
+    expect(fmt.format(entry({ subsystem: 'network' }))).toContain(
+      '"subsystem":"network"'
+    );
+  });
+});
+
 describe('JsonLinesFormatter — formatWithin', () => {
   const big = (n: number): RedactedMetadata => {
     const out: Record<string, string> = {};
