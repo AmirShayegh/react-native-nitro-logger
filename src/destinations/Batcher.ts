@@ -5,6 +5,7 @@ import type {
   SinkStatus,
 } from '../specs/FileSink.nitro';
 import { utf8Length } from '../utf8';
+import { clampDeadline, startDeadline } from '../deadline';
 
 /**
  * The part of a `FileSink` the batcher drives. Narrow on purpose: it is what
@@ -109,9 +110,6 @@ const DEFAULTS = {
   watermarkBytes: 256 * 1024,
   maxBatchBytes: 256 * 1024,
 };
-
-/** Upper bound on any deadline handed to the sink, in milliseconds. */
-const MAX_DEADLINE_MS = 30_000;
 
 /** Consecutive no-progress rounds before a bounded drain gives up. */
 const MAX_STALLS = 8;
@@ -301,7 +299,11 @@ export class Batcher {
   // ── Draining ────────────────────────────────────────────────────────────
 
   /**
-   * Drain to the sink and fsync, bounded by a wall-clock deadline.
+   * Drain to the sink and fsync, bounded by an elapsed-time deadline.
+   *
+   * Elapsed, not wall-clock: the budget is read from a monotonic clock where
+   * the host has one, so a device clock correction landing mid-drain cannot
+   * stretch or end it. See `startDeadline`.
    *
    * Backpressure is overridden for the duration: the whole point of a flush
    * is to push through a full queue rather than wait for it to clear, so a
@@ -316,7 +318,7 @@ export class Batcher {
     this.cancelTimer();
     if (this.disposed || this.fenced) return this.outcome(false, false, 0);
 
-    const deadlineAt = Date.now() + clampDeadline(deadlineMs);
+    const remaining = startDeadline(deadlineMs);
     this.paused = false;
     // An explicit flush is the retry: a notice the sink refused on its own
     // gets one more chance here before being set aside again.
@@ -328,7 +330,7 @@ export class Batcher {
     const maxAttempts = this.maxPendingEntries + MAX_STALLS * 2 + 16;
 
     while (this.pending.length > 0 || this.owesNotice()) {
-      if (attempts >= maxAttempts || Date.now() >= deadlineAt) {
+      if (attempts >= maxAttempts || remaining() <= 0) {
         timedOut = true;
         break;
       }
@@ -340,12 +342,12 @@ export class Batcher {
 
       if (result === 'full') {
         // Ask the sink to write what it has, then retry.
-        const remaining = deadlineAt - Date.now();
-        if (remaining <= 0) {
+        const left = remaining();
+        if (left <= 0) {
           timedOut = true;
           break;
         }
-        const mid = this.targetFlush(remaining);
+        const mid = this.targetFlush(left);
         if (mid.timedOut) timedOut = true;
       }
 
@@ -362,7 +364,7 @@ export class Batcher {
       }
     }
 
-    const final = this.targetFlush(Math.max(0, deadlineAt - Date.now()));
+    const final = this.targetFlush(remaining());
     if (final.timedOut) timedOut = true;
 
     const settled =
@@ -809,11 +811,4 @@ function positive(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : fallback;
-}
-
-function clampDeadline(value: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    return 0;
-  }
-  return Math.min(Math.floor(value), MAX_DEADLINE_MS);
 }

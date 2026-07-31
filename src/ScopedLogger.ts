@@ -71,12 +71,24 @@ export class ScopedLogger {
     this.log(message, 'todo', metadata);
   }
 
-  /** Child scope: inherits this scope's subsystem unless overridden, merges
-   * metadata (child keys win). The merge happens at construction, like any
-   * scope snapshot — both sides are materialized here so later mutation of
-   * the caller's object cannot change what the child reports. */
+  /**
+   * Child scope: inherits this scope's correlation and subsystem unless
+   * overridden, merges metadata (child keys win).
+   *
+   * `correlation` is optional and defaults to **this scope's**, which is the
+   * opposite of `Logger.scoped()` generating a fresh one — and both are right
+   * for the same reason. A correlation ID names a unit of work. `Logger.scoped()`
+   * starts one; a scope nested inside it is still the same unit of work seen
+   * closer up, and giving it a new ID severs the trail at exactly the point
+   * someone reading the logs is trying to follow it. Pass one explicitly to
+   * start a genuinely separate unit from inside an existing scope.
+   *
+   * The merge happens at construction, like any scope snapshot — both sides are
+   * materialized here so later mutation of the caller's object cannot change
+   * what the child reports.
+   */
   scoped(
-    correlation: string,
+    correlation?: string,
     subsystem?: string,
     metadata?: LogMetadata
   ): ScopedLogger {
@@ -86,7 +98,7 @@ export class ScopedLogger {
       : child;
     return new ScopedLogger(
       this.logger,
-      correlation,
+      correlation ?? this.correlation,
       subsystem ?? this.subsystem,
       merged
     );

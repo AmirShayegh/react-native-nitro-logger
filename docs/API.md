@@ -44,13 +44,24 @@ down to be useful ends up not being used at the layers that need it most.
 | `consoleLogging(enabled)` | `this` | Toggle the built-in console destination. |
 | `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. |
 | `removeDestination(label)` | `this` | Unregister and dispose. |
-| `flush(deadlineMs?)` | `void` | Ask every destination to flush. Returns nothing — see the note below. |
+| `flush(deadlineMs?)` | `void` | Ask every destination to flush, inside one total budget. Returns nothing — see the note below. |
 | `newCorrelationId()` | `string` | A fresh ID, generated rather than derived. |
 | `scoped(correlation?, subsystem?, metadata?)` | `ScopedLogger` | Omit `correlation` and one is generated. |
 
 `flush()` deliberately returns `void`. Whether bytes reached disk is a question
 only the file sink can answer, so ask it: `FileDestination.flush(deadlineMs)`
 returns a `BatchFlushOutcome` with `durable` on it.
+
+`deadlineMs` (default 2000) is the **total** for the whole call, not an
+allowance each destination gets. Destinations are flushed in registration order
+and each is handed what the ones before it left, so register the destination
+whose durability matters most — normally the file sink — first. A destination
+reached with the budget already spent is still asked, with `0`: that drains
+whatever needs no waiting, and skipping it would be a new way to lose records on
+the crash path. The bound is cooperative — a destination that ignores its
+deadline still blocks — and `Infinity` means the 30-second ceiling rather than
+forever. Time is measured against a monotonic clock, so a device clock
+correction between two destinations cannot stretch or end the budget.
 
 `metadataKeyCatalog` is tighten-only and implements that by **intersecting**:
 the second call keeps only the keys the first one also approved and can never
@@ -70,7 +81,14 @@ approves none — counts only, never the key names themselves.
 Carries a correlation ID, an optional subsystem, and optional default metadata
 into every call. Same six level methods as `Logger`, minus the `subsystem`
 argument, since a scope already has one. `scoped()` nests, and a nested scope
-inherits what it does not override.
+inherits what it does not override — **including the correlation ID**.
+
+That is the opposite of `Logger.scoped()`, which generates a fresh one when you
+omit it, and both are right for the same reason: a correlation ID names a unit
+of work. `Logger.scoped()` starts one. A scope nested inside it is that same
+unit of work seen closer up, so a new ID there would sever the trail at exactly
+the point someone reading the logs is trying to follow it. Pass one explicitly
+to start a genuinely separate unit from inside an existing scope.
 
 Its default metadata goes through the same redaction path as call-site
 metadata, and the ESLint rules read both.
@@ -190,6 +208,15 @@ const logFile = new FileDestination(createFileSink(), {
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
 | `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip, protection and exclusivity each have a bit. |
 | `dispose()` | `void` | Releases the native handle. |
+
+Every `deadlineMs` here bounds a wait on the JavaScript thread, and every one of
+them is capped at **30 seconds** — `Infinity` means that cap, not forever, on
+both sides of the bridge. `flush` applies the cap in JavaScript before it starts
+draining; `maintain`, `purge` and `collectForSupport` hand the number to the
+native writer, which applies the same one. The waits are measured against a
+monotonic clock, so a device clock correction landing mid-call cannot stretch
+them. What none of them bound is a filesystem that never answers: the deadline
+governs how long this code waits, not how long a single blocking syscall takes.
 
 `PurgeOutcome` reports `durable` (every pre-purge artifact is gone) separately
 from `rebound` (the destination is writable again), because a complete deletion

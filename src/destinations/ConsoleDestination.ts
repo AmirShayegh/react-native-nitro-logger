@@ -50,7 +50,17 @@ export class ConsoleDestination implements LogDestination {
     }
   }
 
-  flush(): void {
+  /**
+   * Nothing to drain — console writes already happened.
+   *
+   * The parameter exists so the signature matches `LogDestination`, which every
+   * caller already satisfies: `Logger.flush` passes a deadline to everything it
+   * holds, and a zero-argument `flush` accepting it only by TypeScript's
+   * arity-compatibility rule reads like an oversight rather than a decision.
+   * Naming it says the deadline was considered and there is nothing to spend
+   * it on.
+   */
+  flush(_deadlineMs?: number): void {
     // console writes are synchronous; nothing buffers here
   }
 

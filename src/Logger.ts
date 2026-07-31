@@ -4,6 +4,7 @@ import type { PrivacyDefault, PrivacySettings } from './privacy';
 import { ConsoleDestination } from './destinations/ConsoleDestination';
 import { resolveSubsystemLevel } from './config';
 import { levelAtLeast } from './levels';
+import { startDeadline } from './deadline';
 import {
   buildCatalog,
   normalizePrivacyDefault,
@@ -246,11 +247,38 @@ export class Logger {
     return this;
   }
 
-  /** Drain every destination synchronously (bounded per destination). */
+  /**
+   * Drain every destination synchronously, inside **one** budget.
+   *
+   * `deadlineMs` is the total, not an allowance per destination. It used to be
+   * the latter, which meant a caller asking for 2000 with three destinations
+   * registered could block the JavaScript thread for six seconds — the number
+   * they passed multiplied by a count they may not control, since adding a
+   * destination lengthened every flush in the app.
+   *
+   * The budget is spent in **registration order**, which is therefore now
+   * load-bearing: the first destination registered gets first call on the time,
+   * and a destination added later can find none left. Register the one whose
+   * durability matters most — normally the file sink — first.
+   *
+   * An exhausted budget keeps iterating with `0` rather than skipping the rest.
+   * `flush(0)` is not a no-op: it drains everything that needs no waiting, and
+   * every destination still gets asked. Skipping would introduce a new way to
+   * lose records on the crash path, which is the path this method exists for.
+   *
+   * What this does NOT bound: a destination that ignores its deadline. The
+   * budget is cooperative, and a third-party `flush` that blocks for a minute
+   * blocks for a minute. The two destinations in this package honour it.
+   *
+   * The time is read from a monotonic clock where the host has one, so a device
+   * clock correction landing between two destinations cannot lengthen or end
+   * the budget — see `startDeadline`.
+   */
   flush(deadlineMs = 2000): void {
+    const remaining = startDeadline(deadlineMs);
     for (const { destination } of this.registrations) {
       try {
-        destination.flush(deadlineMs);
+        destination.flush(remaining());
       } catch {
         // isolation: one failing flush must not stop the others
       }

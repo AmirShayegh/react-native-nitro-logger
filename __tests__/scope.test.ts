@@ -120,3 +120,48 @@ describe('ScopedLogger', () => {
     expect(dest.entries[0]!.metadata).toEqual({ user: 'u1' });
   });
 });
+
+/**
+ * A nested scope is the same unit of work, seen closer up.
+ *
+ * `Logger.scoped()` starts a unit of work and generates a correlation ID for
+ * it. `ScopedLogger.scoped()` does the opposite by default and inherits one,
+ * because giving a child a fresh ID severs the trail at exactly the point
+ * somebody reading the logs is trying to follow it through.
+ */
+describe('ScopedLogger.scoped — correlation inheritance', () => {
+  test('a child inherits its parent correlation by default', () => {
+    const { logger, dest } = makeLogger();
+    const parent = logger.scoped('unit-1', 'sync');
+
+    parent.scoped().info('deep');
+
+    expect(dest.entries[0]!.correlation).toBe('unit-1');
+    expect(dest.entries[0]!.subsystem).toBe('sync');
+  });
+
+  test('and an explicit one still starts a separate unit', () => {
+    const { logger, dest } = makeLogger();
+    logger.scoped('unit-1').scoped('unit-2').info('deep');
+
+    expect(dest.entries[0]!.correlation).toBe('unit-2');
+  });
+
+  test('inheritance survives more than one level', () => {
+    const { logger, dest } = makeLogger();
+    logger.scoped('unit-1').scoped().scoped().info('deep');
+
+    expect(dest.entries[0]!.correlation).toBe('unit-1');
+  });
+
+  test('metadata still merges when correlation is omitted', () => {
+    const { logger, dest } = makeLogger();
+    logger
+      .scoped('unit-1', undefined, { a: '1' })
+      .scoped(undefined, undefined, { b: '2' })
+      .info('deep');
+
+    expect(dest.entries[0]!.metadata).toEqual({ a: '1', b: '2' });
+    expect(dest.entries[0]!.correlation).toBe('unit-1');
+  });
+});

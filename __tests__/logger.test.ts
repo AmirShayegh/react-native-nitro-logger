@@ -394,3 +394,153 @@ describe('Logger pipeline', () => {
     expect(Object.isFrozen(good.entries[0]!.metadata)).toBe(true);
   });
 });
+
+/**
+ * `flush(deadlineMs)` is a total, not an allowance each destination gets.
+ *
+ * It used to be the latter: a caller asking for 2000 with three destinations
+ * blocked the JavaScript thread for up to six seconds, and adding a fourth
+ * destination anywhere in the app silently lengthened every flush in it. The
+ * number a caller passes has to mean what it says, because the call it means it
+ * for is the one on the crash path.
+ *
+ * ## What these do NOT prove
+ *
+ * That the bound holds against a destination that ignores it. The budget is
+ * cooperative — nothing here can interrupt a third-party `flush` that blocks —
+ * and these assert what each destination is *told*, which is the only part this
+ * library controls.
+ */
+describe('Logger.flush — one budget across every destination', () => {
+  /** Records the deadline it was handed, and burns the time it was given. */
+  function greedy(label: string, burnMs: number, seen: number[]) {
+    return {
+      label,
+      isEnabled: true,
+      write() {},
+      flush(deadlineMs?: number) {
+        seen.push(deadlineMs ?? -1);
+        const until = Date.now() + burnMs;
+        while (Date.now() < until) {
+          /* spend it, the way a destination that waits would */
+        }
+      },
+      dispose() {},
+    } satisfies LogDestination;
+  }
+
+  test('the second destination gets what the first left', () => {
+    const seen: number[] = [];
+    const logger = makeLogger();
+    logger.addDestination(greedy('slow', 60, seen));
+    logger.addDestination(greedy('after', 0, seen));
+
+    logger.flush(300);
+
+    expect(seen).toHaveLength(2);
+    // Bands, not values, on both: this measures real elapsed time, and even the
+    // first destination can be handed 299 if the clock ticks between the
+    // deadline being started and the first reading of what is left of it.
+    expect(seen[0]!).toBeGreaterThan(0);
+    expect(seen[0]!).toBeLessThanOrEqual(300);
+    // Whatever the first spent is gone from the second's share.
+    expect(seen[1]!).toBeLessThan(seen[0]!);
+    expect(seen[1]!).toBeGreaterThan(0);
+  });
+
+  /**
+   * A device clock correction must not lengthen the budget.
+   *
+   * `Date.now()` is not a stopwatch. NTP, a manual change, a leap smear — any
+   * of them moves it, and a budget computed as the difference between two
+   * readings of it can be handed backwards time. This drives `Date.now`
+   * backwards between the two destinations and asserts the second is still
+   * bounded by what the caller asked for.
+   *
+   * Presumes a host that provides `performance.now` — Node here, Hermes and JSC
+   * in the app. On a host without one the library falls back to `Date.now` and
+   * documents that this property is not delivered there; see `startDeadline`.
+   */
+  test('a backwards clock correction does not extend the budget', () => {
+    const seen: number[] = [];
+    const record = (label: string): LogDestination => ({
+      label,
+      isEnabled: true,
+      write() {},
+      flush(deadlineMs?: number) {
+        seen.push(deadlineMs ?? -1);
+      },
+      dispose() {},
+    });
+    const logger = makeLogger();
+    logger.addDestination(record('one'));
+    logger.addDestination(record('two'));
+
+    const realNow = Date.now;
+    let drift = 0;
+    Date.now = () => {
+      drift += 3_600_000;
+      return realNow() - drift;
+    };
+    try {
+      logger.flush(300);
+    } finally {
+      Date.now = realNow;
+    }
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]!).toBeLessThanOrEqual(300);
+  });
+
+  test('an exhausted budget still asks every destination, with zero', () => {
+    const seen: number[] = [];
+    const logger = makeLogger();
+    logger.addDestination(greedy('hog', 120, seen));
+    logger.addDestination(greedy('starved', 0, seen));
+    logger.addDestination(greedy('also-starved', 0, seen));
+
+    logger.flush(100);
+
+    // Three calls, not one. `flush(0)` still drains whatever needs no waiting,
+    // and skipping the rest would be a new way to lose records on the crash
+    // path — which is the path this method exists for.
+    expect(seen).toHaveLength(3);
+    expect(seen[1]).toBe(0);
+    expect(seen[2]).toBe(0);
+  });
+
+  test('a nonsense deadline becomes zero rather than a wait', () => {
+    const seen: number[] = [];
+    const logger = makeLogger();
+    logger.addDestination(greedy('one', 0, seen));
+
+    logger.flush(Number.NaN);
+    logger.flush(-5);
+    logger.flush(Number.POSITIVE_INFINITY);
+
+    // NaN and a negative are zero; infinity is the 30s ceiling, not forever.
+    expect(seen[0]).toBe(0);
+    expect(seen[1]).toBe(0);
+    expect(seen[2]).toBeGreaterThan(0);
+    expect(seen[2]).toBeLessThanOrEqual(30_000);
+  });
+
+  test('a destination that throws does not consume what the rest get', () => {
+    const seen: number[] = [];
+    const logger = makeLogger();
+    logger.addDestination({
+      label: 'thrower',
+      isEnabled: true,
+      write() {},
+      flush() {
+        throw new Error('nope');
+      },
+      dispose() {},
+    });
+    logger.addDestination(greedy('after', 0, seen));
+
+    expect(() => logger.flush(500)).not.toThrow();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!).toBeGreaterThan(0);
+  });
+});
