@@ -75,7 +75,7 @@ export default function BenchHarness(props: BenchHarnessProps) {
         setTimeout(() => resolve(), 50);
       });
 
-    (async () => {
+    const run = async () => {
       // Let the first frame land so startup work is not billed to case one.
       await yieldToHost();
 
@@ -109,7 +109,18 @@ export default function BenchHarness(props: BenchHarnessProps) {
 
       console.log(`${MARKER} ${runId} DONE ${ALL_CASES.length}`);
       setLines((previous) => [...previous, `done: ${ALL_CASES.length} cases`]);
-    })();
+    };
+
+    // A case's `teardown` throws when what it measured was not what it
+    // claims (a filtered case that delivered, a delivered case that wrote
+    // nothing). Surface that as a marked line and stop: no DONE marker
+    // means the harvest script fails the run, which is the right outcome —
+    // but a silent rejection would make it look like a hung device.
+    run().catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.log(`${MARKER} ${runId} FAILED ${detail}`);
+      setLines((previous) => [...previous, `FAILED: ${detail}`]);
+    });
 
     return () => {
       cancelled = true;

@@ -17,6 +17,12 @@
  * margin is a multiple rather than an absolute, because the floor differs
  * by engine and machine, which is exactly why it is re-measured per run.
  *
+ * This only works because of a rule the case files keep: whatever an op
+ * returns must be what would REMAIN if its work were deleted. A void
+ * API's case returns a literal, so the residual is the control exactly; a
+ * case that returned, say, a counter read would leave a residual costing
+ * more than the control and could clear this bar with its work gone.
+ *
  * WHAT IT DOES NOT PROVE: that a case measures the RIGHT work — only that
  * it measures some. A case configured wrongly (the empty-Map short-circuit
  * that once made the deep-subsystem walk read 7.6 ns) clears this bar

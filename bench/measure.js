@@ -41,10 +41,11 @@ function runCase(op, options) {
   // published on `runCase.blackhole` after the loops — folded, not stored,
   // because an overwritten slot keeps only the LAST iteration's result live
   // and leaves the other N−1 calls of a pure op dead. The fold gives each
-  // iteration's value a consumer: cases return numbers where a result
-  // exists (a byte count, a rendered length, a write counter), which join
-  // the sum directly; any other return contributes a constant through the
-  // same data dependency. A pure helper — `utf8Length`, a formatter — is
+  // iteration's value a consumer: cases return numbers where the work has
+  // a result (a byte count, a rendered length), which join the sum
+  // directly; a void API's case returns a literal instead — see
+  // `cases/hotpath.js` for why that is the honest shape, and
+  // `floor.js` for what catches it. A pure helper — `utf8Length` — is
   // exactly the call an inliner would otherwise be entitled to eliminate,
   // and a bench that measures an eliminated call reports the cost of an
   // empty loop. The `| 0` keeps the accumulator a small integer on both

@@ -118,7 +118,10 @@ function main() {
       { cwd: ROOT, encoding: 'utf8' }
     );
     if (child.status !== 0) {
-      process.stderr.write(`FAIL: case ${name} did not execute\n`);
+      // Either the case did not construct, or its teardown rejected what it
+      // measured — `cases/hotpath.js` throws there when a filtered case
+      // delivered, or a delivered case wrote nothing.
+      process.stderr.write(`FAIL: case ${name} did not complete\n`);
       process.stderr.write(child.stderr || '');
       process.exit(1);
     }

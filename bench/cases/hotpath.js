@@ -7,27 +7,40 @@
  * name: the options object, the redaction walk, the marker probe, the
  * per-entry eligible array.
  *
- * Every case runs against a near-no-op destination. The point is the
- * logger's own bookkeeping; a real destination would drown it in I/O — but
- * `write` must still OBSERVE each entry (two stores into an exported slot),
- * because a destination that ignores its argument invites the inliner to
- * delete the delivery it exists to price. Each destination gets its own
- * slot, so the two-destination case demonstrably performs both writes.
+ * ## Why every op here returns a literal zero
+ *
+ * `logger.info` is a void API: on the filtered path it returns nothing and
+ * touches nothing, which is precisely the path being priced. So no return
+ * value can prove the call ran, and the harness must not pretend otherwise.
+ * The arrangement instead is:
+ *
+ *   * `op` runs the call and returns the literal `0` — byte for byte the
+ *     control case's body. If an engine ever eliminated the call, what
+ *     remained would BE `control.empty-loop`, and `bench/floor.js` catches
+ *     it. Returning anything else (a counter read, say) would leave a
+ *     residual the floor could mistake for real work.
+ *   * `teardown` asserts what the case claims about delivery — filtered
+ *     cases wrote nothing, delivered cases wrote something — which fails
+ *     the run outright if the shape was never what the name says.
+ *
+ * The destinations still consume each entry rather than ignoring it, so a
+ * delivered case's write is a heap effect and not a no-op.
  */
 const { Logger, pub, priv } = require('../api');
 
-/** Written by every destination and exported: the escape hatch DCE cannot
- * see through. Keyed by destination label. */
+/** Written by every destination and exported, keyed by label. Read only by
+ * `teardown` — never inside a measured op, see the note above. */
 const observed = {};
 module.exports.observed = observed;
 
 /** A destination that costs as close to nothing as a call can while still
  * consuming what it is handed. */
 function noopDestination(label) {
-  const slot = { entry: undefined, writes: 0 };
-  observed[label || 'noop'] = slot;
+  const key = label || 'noop';
+  observed[key] = { entry: undefined, writes: 0 };
+  const slot = observed[key];
   return {
-    label: label || 'noop',
+    label: key,
     isEnabled: true,
     write(entry) {
       slot.entry = entry;
@@ -42,6 +55,35 @@ function quietLogger() {
   return new Logger().removeDestination('console');
 }
 
+/** The filtered path's claim: the burst reached no destination at all. */
+function expectNoWrites(slot) {
+  return function teardown() {
+    if (slot.writes !== 0) {
+      throw new Error(
+        'filtered case delivered ' +
+          slot.writes +
+          ' entries; it was measuring the delivered path'
+      );
+    }
+  };
+}
+
+/** The delivered path's claim, and the stronger one: the calls really ran.
+ * An engine that eliminated them would leave this at zero. */
+function expectWrites(slots) {
+  return function teardown() {
+    for (let i = 0; i < slots.length; i += 1) {
+      if (slots[i].writes === 0) {
+        throw new Error(
+          'delivered case wrote nothing to destination ' +
+            i +
+            '; the calls did not run'
+        );
+      }
+    }
+  };
+}
+
 const CATALOG = ['requestId', 'route', 'status', 'elapsedMs', 'retries'];
 
 module.exports.cases = [
@@ -53,31 +95,33 @@ module.exports.cases = [
     // price the walk, not the short-circuit.
     name: 'hotpath.filtered.deep-subsystem',
     setup() {
+      const destination = noopDestination();
       const logger = quietLogger()
-        .addDestination(noopDestination())
+        .addDestination(destination)
         .minimumLevel('warn')
         .subsystem('media', 'error');
       return {
         op() {
           logger.info('cache warm', undefined, 'ui.checkout.payment.card');
-          // Zero, every iteration: the count that proves nothing was
-          // delivered is itself the loop-carried value.
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectNoWrites(observed.noop),
       };
     },
   },
   {
     name: 'hotpath.filtered.no-subsystem',
     setup() {
+      const destination = noopDestination();
       const logger = quietLogger()
-        .addDestination(noopDestination())
+        .addDestination(destination)
         .minimumLevel('warn');
       return {
         op() {
           logger.info('cache warm');
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectNoWrites(observed.noop),
       };
     },
   },
@@ -86,27 +130,31 @@ module.exports.cases = [
     // is what must not regress this).
     name: 'hotpath.delivered.subsystem-override',
     setup() {
+      const destination = noopDestination();
       const logger = quietLogger()
-        .addDestination(noopDestination())
+        .addDestination(destination)
         .minimumLevel('warn')
         .subsystem('net', 'verbose');
       return {
         op() {
           logger.info('response', undefined, 'net.http.client');
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
   {
     name: 'hotpath.delivered.bare',
     setup() {
-      const logger = quietLogger().addDestination(noopDestination());
+      const destination = noopDestination();
+      const logger = quietLogger().addDestination(destination);
       return {
         op() {
           logger.info('ready');
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
@@ -115,8 +163,9 @@ module.exports.cases = [
     // delivered-with-metadata shape.
     name: 'hotpath.delivered.metadata-5-catalog',
     setup() {
+      const destination = noopDestination();
       const logger = quietLogger()
-        .addDestination(noopDestination())
+        .addDestination(destination)
         .metadataKeyCatalog(CATALOG);
       return {
         op() {
@@ -127,8 +176,9 @@ module.exports.cases = [
             elapsedMs: pub(41),
             retries: pub(0),
           });
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
@@ -136,12 +186,14 @@ module.exports.cases = [
     // T8: both marker kinds through inspectMarker.
     name: 'hotpath.delivered.markers-mixed',
     setup() {
-      const logger = quietLogger().addDestination(noopDestination());
+      const destination = noopDestination();
+      const logger = quietLogger().addDestination(destination);
       return {
         op() {
           logger.info('session', { device: pub('ios'), owner: priv('carol') });
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
@@ -149,12 +201,14 @@ module.exports.cases = [
     // T5's trap values: falsy survivors must cost the same as any other.
     name: 'hotpath.delivered.metadata-all-falsy',
     setup() {
-      const logger = quietLogger().addDestination(noopDestination());
+      const destination = noopDestination();
+      const logger = quietLogger().addDestination(destination);
       return {
         op() {
           logger.info('flags', { a: pub(0), b: pub(false), c: pub('') });
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
@@ -162,30 +216,34 @@ module.exports.cases = [
     // T2's scoped shape: two threaded objects per call today.
     name: 'hotpath.delivered.scoped-default-metadata',
     setup() {
-      const logger = quietLogger().addDestination(noopDestination());
+      const destination = noopDestination();
+      const logger = quietLogger().addDestination(destination);
       const scoped = logger.scoped('corr-bench', 'net.http', {
         app: pub('bench'),
       });
       return {
         op() {
           scoped.info('tick', { seq: pub(7) });
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectWrites([observed.noop]),
       };
     },
   },
   {
     name: 'hotpath.filtered.scoped',
     setup() {
+      const destination = noopDestination();
       const logger = quietLogger()
-        .addDestination(noopDestination())
+        .addDestination(destination)
         .minimumLevel('warn');
       const scoped = logger.scoped('corr-bench', 'net.http');
       return {
         op() {
           scoped.info('tick');
-          return observed.noop.writes;
+          return 0;
         },
+        teardown: expectNoWrites(observed.noop),
       };
     },
   },
@@ -199,9 +257,11 @@ module.exports.cases = [
       return {
         op() {
           logger.info('ready');
-          // Both slots read: neither write can be proven dead independently.
-          return observed.first.writes + observed.second.writes;
+          return 0;
         },
+        // Both slots checked: a fan-out that quietly stopped reaching the
+        // second destination would otherwise still look delivered.
+        teardown: expectWrites([observed.first, observed.second]),
       };
     },
   },
