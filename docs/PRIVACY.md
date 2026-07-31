@@ -344,7 +344,14 @@ What differs between builds is only *what the entry contains*. In a release
 build a private value has already been reduced to `<private>` before any
 destination sees it, so what reaches the system store is redacted — which is a
 much smaller problem, not the absence of one: public metadata is still public,
-and it is still permanent.
+and it is still outside this library's reach.
+
+"Outside its reach" rather than "permanent", because the accurate claim is about
+control, not lifetime. Both stores are retention-bounded and rotate — logcat is
+a ring buffer, and the unified log ages out on its own schedule — but neither
+schedule is one this package sets, observes, or can shorten. The entry is gone
+when the operating system decides it is, which is not something an app can offer
+a user as a deletion.
 
 So the control that actually works is choosing not to produce the copy. If an
 app handles regulated data, the question to answer at startup is whether
@@ -595,14 +602,19 @@ answer is not to configure `ConsoleDestination` in the builds that ship, which
 is also the ordinary configuration.
 
 **iOS file protection is `CompleteUntilFirstUserAuthentication`, deliberately.**
-Every artifact gets that class rather than the stricter `Complete`. The
-difference is real: after the user unlocks the device once following a boot, the
-files stay readable even while the device is subsequently locked. `Complete`
-would make them unreadable whenever the screen locks — and would also make the
-logger unable to write during backgrounded work, on device boot before first
-unlock, and in exactly the crash-and-restart windows the crash-tail recovery
-exists for. A logger that cannot log when the screen is off is not a logger.
-This is the standard trade for background-capable storage, and it is written
-down here so it is a decision the reader can disagree with rather than an
-assumption. Android has no per-file equivalent; see
-[Logs on disk](#logs-on-disk).
+Every artifact gets that class rather than the stricter `Complete`, and the
+difference is narrower than the names suggest.
+
+Both classes keep the files unreadable between boot and the **first** unlock, so
+neither lets this library log in that window — a boot-time crash before anyone
+touches the device leaves no file entry, and that is true either way. What
+`CompleteUntilFirstUserAuthentication` adds is everything *after* that first
+unlock: the files stay accessible while the device is subsequently locked, which
+is when backgrounded work runs and when most crash-and-restart cycles happen.
+`Complete` would make them unreadable every time the screen locks, so the logger
+would go silent for the majority of a device's day and the crash-tail recovery
+would have nothing to recover.
+
+That is the standard trade for background-capable storage. It is written down
+here so it is a decision the reader can disagree with rather than an assumption.
+Android has no per-file equivalent; see [Logs on disk](#logs-on-disk).

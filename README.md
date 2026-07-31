@@ -32,7 +32,6 @@ and each of them fails in a way that looks like something else.
 
 - **`react-native-nitro-modules` is a peer, not a dependency.** It is not
   installed for you, and it is where the `createHybridObject` runtime lives.
-  Without it the JavaScript resolves and the first file destination throws.
 - **New Architecture only.** There is no bridge fallback: on an app with the
   old architecture the Hybrid Object is never registered, so the failure is at
   the first sink construction rather than at build time. React Native 0.76 and
@@ -44,9 +43,18 @@ and each of them fails in a way that looks like something else.
   the Kotlin compile with a class-version error that names a file in this
   library rather than the JDK.
 
-A linking failure reads like this. The JavaScript resolved, so it is a runtime
-error at the first call that asks for the native object — `createFileDestination()`
-— and not a red screen at startup:
+They fail at different times, which is the fastest way to tell them apart.
+
+**At build time.** A JDK older than 17 never produces an app: the Kotlin compile
+fails with a class-file version error naming a file in this library. Nothing
+below applies — there is nothing to run.
+
+**At module resolution.** A missing `react-native-nitro-modules` fails when the
+import is resolved, so it reads as a bundler error about a package that is not
+installed rather than as anything to do with logging.
+
+**At the first call that asks for the native object** — `createFileDestination()`
+— once the JavaScript has resolved and the app is running:
 
 ```
 Cannot create an instance of HybridObject "FileSink" - It has not yet been
@@ -55,11 +63,12 @@ registered in the Nitro Modules HybridObjectRegistry! Suggestions:
 - All registered HybridObjects: [...]
 ```
 
-All four causes above produce that one message, which is why they are worth
-working through in order rather than guessing. The bracketed list at the end is
-the useful part: if it is empty, Nitro itself never initialised — the peer
-dependency or the New Architecture. If it has entries but not `FileSink`, this
-library's native side did not build in, which is the pods or the JDK.
+That message means the native side is not registered, which narrows it to the
+New Architecture or the pods. The bracketed list at the end is what separates
+those two: empty means Nitro itself never initialised, so the app is on the old
+architecture; entries but no `FileSink` means Nitro is fine and *this* library's
+native code did not build in, which on iOS is a `pod install` that has not been
+run since it was added.
 
 ## Quick start
 

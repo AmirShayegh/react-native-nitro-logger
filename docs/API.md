@@ -426,25 +426,43 @@ records why both are the app's call.
 import { createFileDestination } from 'react-native-nitro-logger';
 
 declare function uploadToSupport(path: string): Promise<void>;
+declare function scheduleSupportBundleRetry(): void;
 
 async function sendDiagnostics(file: ReturnType<typeof createFileDestination>) {
   // 1. collect — a gzipped copy of the log, beside the log files.
   const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
-  if (!bundle.complete || bundle.path === '') return; // nothing to send
 
-  // 2. upload — yours. Nothing here transmits or encrypts.
-  await uploadToSupport(bundle.path);
-
-  // 3. delete — also yours, and the step that is easy to forget.
-  file.deleteSupportBundle();
+  try {
+    // 2. upload — yours. Nothing here transmits or encrypts. Only a complete
+    //    bundle is worth sending; an incomplete collect still has step 3.
+    if (bundle.complete && bundle.path !== '') {
+      await uploadToSupport(bundle.path);
+    }
+  } finally {
+    // 3. delete — in `finally`, because the failure paths are exactly the ones
+    //    that leave bytes behind. An incomplete collect can leave staging
+    //    artifacts, and a throwing upload skips everything after it.
+    if (!file.deleteSupportBundle()) {
+      // Assume a copy may still be there. Retrying is the response; ignoring
+      // it silently is how a gzipped log outlives the flow that made it.
+      scheduleSupportBundleRetry();
+    }
+  }
 }
 ```
 
-Step 3 is not tidiness. Retention deliberately keeps a *finished* bundle,
-because the sweep cannot know whether an upload is still reading it — so a
-bundle nobody deletes sits outside the rotation budget the app configured,
-indefinitely, as a gzipped copy of the whole log. On a device holding regulated
-data that is the one artifact retention never comes back for.
+Step 3 is not tidiness, and the `finally` is the part worth copying. Retention
+deliberately keeps a *finished* bundle, because the sweep cannot know whether an
+upload is still reading it — so a bundle nobody deletes sits outside the rotation
+budget the app configured, indefinitely, as a gzipped copy of the whole log. On a
+device holding regulated data that is the one artifact retention never comes back
+for.
+
+Which is why the paths that skip step 3 matter more than the happy one. A
+throwing upload and an early return on an incomplete collect are exactly the
+cases that leave bytes on disk: a collect that did not finish can still have
+written the `.part` and `.member` staging files, which hold log content, and
+`deleteSupportBundle` is what removes those too.
 
 Two ordering rules, both of which return `false` rather than guessing:
 
