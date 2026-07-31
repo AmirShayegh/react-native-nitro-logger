@@ -382,6 +382,37 @@ describe('Batcher — backpressure', () => {
     expect(writer.lines()).toContain('held');
   });
 
+  test('a batch that leaves records behind leaves exactly those behind', () => {
+    // A PARTIAL drain: `maxBatchBytes` binds before the buffer is empty, so
+    // the batch takes a prefix and the rest must still be there afterwards.
+    //
+    // This is the case the whole-buffer fast path in `loseHead` must not
+    // claim. It is cheap to widen that condition by one character while
+    // refactoring, and the result would be a batch of two records removing
+    // three — the third never written, never counted as lost, and absent from
+    // the file with nothing anywhere saying so. Before this test exactly one
+    // case noticed, and only incidentally.
+    const { batcher, sink, writer } = build({
+      batchBytes: 1_000_000, // nothing is pushed until the explicit flush
+      maxBatchBytes: 50, // two 21-byte records fit; three do not
+    });
+
+    batcher.add(record(20, 'a'));
+    batcher.add(record(20, 'b'));
+    batcher.add(record(20, 'c'));
+    expect(batcher.bufferedBytes()).toBe(63);
+
+    batcher.flush(1000);
+
+    expect(sink.appendCalls.map((call) => call.entryCount)).toEqual([2, 1]);
+    expect(writer.lines()).toEqual([
+      record(20, 'a'),
+      record(20, 'b'),
+      record(20, 'c'),
+    ]);
+    expect(batcher.bufferedBytes()).toBe(0);
+  });
+
   test('a batch larger than the sink can ever hold is given up, not held forever', () => {
     const { batcher, writer } = build({ batchBytes: 8 });
     writer.capacityBytes = 4; // nothing this batcher builds will ever fit

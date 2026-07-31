@@ -543,14 +543,23 @@ export class Batcher {
       entryCount += 1;
     }
 
-    const snapshot: Cursor = { ...this.observed };
-    const owed = this.delta();
-    let carriesNotice = false;
-    if (!this.noticeBlocked && (owed.entries > 0 || owed.bytes > 0)) {
-      const notice = this.noticeText(owed);
+    // The snapshot and the loss totals are built only when there is loss to
+    // describe, which in a healthy process is never: two objects per push
+    // existed to be read by a branch that did not run. `owesNotice` answers
+    // the same question from scalars.
+    //
+    // Both are still built BEFORE `appendBatch`, and that is the part with a
+    // test on it — 'a loss discovered during the very append is not
+    // acknowledged by it' stages a drop from inside the sink's own
+    // `appendBatch`, so a snapshot taken any later would acknowledge a loss
+    // the notice does not describe and bury it permanently.
+    let noticeSnapshot: Cursor | undefined;
+    if (!this.noticeBlocked && this.owesNotice()) {
+      const snapshot: Cursor = { ...this.observed };
+      const notice = this.noticeText(this.delta());
       if (notice !== undefined) {
         lines.push(notice);
-        carriesNotice = true;
+        noticeSnapshot = snapshot;
       } else if (entryCount === 0) {
         // A notice that will not render, and nothing else to send. Trying
         // again in a hundred milliseconds will produce the same nothing, so
@@ -560,6 +569,11 @@ export class Batcher {
       }
     }
     if (lines.length === 0) return 'empty';
+
+    // Derived from the snapshot rather than tracked beside it: the snapshot
+    // exists exactly when a notice was attached, so one of them cannot go
+    // stale while the other is right.
+    const carriesNotice = noticeSnapshot !== undefined;
 
     // Whether this batch is carrying the notice and nothing else, which is
     // what makes a rejection unrecoverable by retrying: there is no record to
@@ -584,7 +598,7 @@ export class Batcher {
 
     if (result.accepted) {
       this.loseHead(entryCount, 0, false);
-      if (carriesNotice) this.acked = snapshot;
+      if (noticeSnapshot !== undefined) this.acked = noticeSnapshot;
       if (toCount(result.queuedBytes) >= this.watermarkBytes)
         this.paused = true;
       return 'sent';
@@ -634,9 +648,25 @@ export class Batcher {
    */
   private loseHead(count: number, bytes: number, lost = true): void {
     if (count === 0) return;
-    const removed = this.pending.splice(0, count);
-    for (const item of removed) this.pendingBytes -= item.bytes;
-    if (this.pendingBytes < 0) this.pendingBytes = 0;
+    if (count === this.pending.length) {
+      // The whole buffer, which is what a batch normally takes: `batchBytes`
+      // is 4 KB and `maxBatchBytes` 256 KB, so a push has to be starved of
+      // room before it leaves anything behind. `splice` would allocate an
+      // N-element array of records nobody reads, purely to subtract byte
+      // counts that must sum to `pendingBytes` — an empty buffer holds zero
+      // bytes, and it can be said rather than computed.
+      //
+      // Assigning 0 also settles the drift the clamp below exists for,
+      // instead of leaving a residue on an empty buffer. The 5-seed
+      // conservation fuzz asserts `bufferedBytes() === 0` exactly, which is
+      // what stops that from being a claim.
+      this.pending.length = 0;
+      this.pendingBytes = 0;
+    } else {
+      const removed = this.pending.splice(0, count);
+      for (const item of removed) this.pendingBytes -= item.bytes;
+      if (this.pendingBytes < 0) this.pendingBytes = 0;
+    }
     if (lost) {
       this.observed.localEntries += count;
       this.observed.localBytes += bytes;
@@ -700,36 +730,48 @@ export class Batcher {
     return typeof text === 'string' && text.length > 0 ? text : undefined;
   }
 
+  /**
+   * Loss seen but not yet acknowledged, as two numbers.
+   *
+   * Split out of `delta` because every caller but one only wants to compare
+   * them against zero, and building a `LossCounts` to do that allocated an
+   * object per push in the steady state where the answer is "nothing owed".
+   * `delta` remains the single expression of the arithmetic; these are its
+   * two halves under their own names.
+   */
+  private owedEntries(): number {
+    return Math.max(
+      0,
+      this.observed.sinkEntries -
+        this.acked.sinkEntries +
+        (this.observed.localEntries - this.acked.localEntries)
+    );
+  }
+
+  private owedBytes(): number {
+    return Math.max(
+      0,
+      this.observed.sinkBytes -
+        this.acked.sinkBytes +
+        (this.observed.localBytes - this.acked.localBytes)
+    );
+  }
+
   private delta(): LossCounts {
-    return {
-      entries: Math.max(
-        0,
-        this.observed.sinkEntries -
-          this.acked.sinkEntries +
-          (this.observed.localEntries - this.acked.localEntries)
-      ),
-      bytes: Math.max(
-        0,
-        this.observed.sinkBytes -
-          this.acked.sinkBytes +
-          (this.observed.localBytes - this.acked.localBytes)
-      ),
-    };
+    return { entries: this.owedEntries(), bytes: this.owedBytes() };
   }
 
   private owesNotice(): boolean {
-    const owed = this.delta();
-    return owed.entries > 0 || owed.bytes > 0;
+    return this.owedEntries() > 0 || this.owedBytes() > 0;
   }
 
   /** Where the drain has got to: records still buffered, loss still owed. */
   private position(): Position {
-    const owed = this.delta();
     return {
       entries: this.pending.length,
       bytes: this.pendingBytes,
-      owedEntries: owed.entries,
-      owedBytes: owed.bytes,
+      owedEntries: this.owedEntries(),
+      owedBytes: this.owedBytes(),
     };
   }
 
