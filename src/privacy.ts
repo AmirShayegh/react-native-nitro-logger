@@ -325,6 +325,44 @@ function claimKeys(
   }
 }
 
+/**
+ * Check one key, and if it earns it, read and resolve its value into
+ * `result`. Returns false when the entry was dropped.
+ *
+ * A module-level function taking every input explicitly, rather than a
+ * closure defined inside {@link redactMetadata}: a closure would allocate
+ * once per call on the delivered path, which is the allocation this unit is
+ * removing elsewhere. It exists at all so the two iteration shapes below —
+ * one source, or two with precedence — share ONE copy of the key rules.
+ * Two copies of a privacy check is how the copies come to disagree.
+ */
+function admitKey(
+  result: Record<string, LogPrimitive>,
+  key: string,
+  source: Record<string, unknown>,
+  catalog: ReadonlySet<string> | undefined,
+  requireCatalog: boolean,
+  settings: PrivacySettings
+): boolean {
+  if (key === DROPPED_COUNT_KEY || !isValidMetadataKey(key)) return false;
+  if (catalog !== undefined ? !catalog.has(key) : requireCatalog) return false;
+
+  // Only now — after the key has earned it — is the value touched.
+  let raw: unknown;
+  try {
+    raw = source[key];
+  } catch {
+    return false;
+  }
+
+  // Identity against the sentinel, never truthiness: `0`, `false` and `''`
+  // are values this logger is asked to record, not absences.
+  const resolution = resolveValue(raw, settings);
+  if (resolution === DROP) return false;
+  result[key] = resolution;
+  return true;
+}
+
 function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
   let visibility: PrivacyDefault;
   let payload: LogPrimitive;
@@ -385,11 +423,14 @@ export function redactMetadata(
   // in the signature would itself be caller-controlled — a hostile array
   // could throw from Symbol.iterator, iterate forever, or be a revoked
   // Proxy — and guarding it is strictly more work than not having one.
-  const owner = new Map<string, Record<string, unknown>>();
-  claimKeys(owner, scopeMetadata);
-  // Second wins on collision: the call site overrides the scope's default.
-  claimKeys(owner, callSiteMetadata);
-  if (owner.size === 0) return undefined;
+  //
+  // The falsy tests match `claimKeys`, which skips a falsy source, so
+  // "absent" here means exactly what it has always meant.
+  const hasScope = !!scopeMetadata;
+  const hasCallSite = !!callSiteMetadata;
+  // Nothing to settle and nothing to read: every call that passes no
+  // metadata at all, which is most of them.
+  if (!hasScope && !hasCallSite) return undefined;
 
   const catalog = settings.keyCatalog;
   const requireCatalog = catalogRequired(settings);
@@ -397,33 +438,40 @@ export function redactMetadata(
   const result: Record<string, LogPrimitive> = Object.create(null);
   let dropped = 0;
 
-  for (const [key, source] of owner) {
-    if (key === DROPPED_COUNT_KEY || !isValidMetadataKey(key)) {
-      dropped += 1;
-      continue;
-    }
-    if (catalog !== undefined ? !catalog.has(key) : requireCatalog) {
-      dropped += 1;
-      continue;
-    }
-
-    // Only now — after the key has earned it — is the value touched.
-    let raw: unknown;
+  if (!hasScope || !hasCallSite) {
+    // One source, so there is no precedence to settle and no ownership map
+    // to build — every key belongs to the only source there is. Key order
+    // is `Object.keys` order, which is the same order the map would have
+    // been iterated in, and third-party formatters may depend on it even
+    // though both shipped ones sort.
+    const source = (hasScope ? scopeMetadata : callSiteMetadata) as LogMetadata;
+    let keys: string[];
     try {
-      raw = source[key];
+      keys = Object.keys(source);
     } catch {
-      dropped += 1;
-      continue;
+      // A source whose keys cannot be enumerated contributes nothing —
+      // there is no key that could be safely counted or described.
+      return undefined;
     }
+    if (keys.length === 0) return undefined;
+    for (const key of keys) {
+      const record = source as Record<string, unknown>;
+      if (!admitKey(result, key, record, catalog, requireCatalog, settings)) {
+        dropped += 1;
+      }
+    }
+  } else {
+    const owner = new Map<string, Record<string, unknown>>();
+    claimKeys(owner, scopeMetadata);
+    // Second wins on collision: the call site overrides the scope's default.
+    claimKeys(owner, callSiteMetadata);
+    if (owner.size === 0) return undefined;
 
-    // Identity against the sentinel, never truthiness: `0`, `false` and `''`
-    // are values this logger is asked to record, not absences.
-    const resolution = resolveValue(raw, settings);
-    if (resolution === DROP) {
-      dropped += 1;
-      continue;
+    for (const [key, source] of owner) {
+      if (!admitKey(result, key, source, catalog, requireCatalog, settings)) {
+        dropped += 1;
+      }
     }
-    result[key] = resolution;
   }
 
   if (dropped > 0) result[DROPPED_COUNT_KEY] = dropped;

@@ -79,6 +79,22 @@ adopted or declined on a Hermes measurement, never a V8 one.
   same relative signal per-commit on the machine where the work happens, and
   the trade is recorded in the test file).
 
+## Measuring on a busy machine
+
+The runner prints the one-minute load average when it exceeds one job per
+core, and records it in `--json` output either way. Heed it: during 0.4.0 a
+stuck jest worker from an earlier session held a core for a day, and the
+same case read 122, 130 and 164 ns on three consecutive runs — a 34% spread
+around effects worth single digits. A before/after pair taken across that
+window said a change with no plausible connection to the case had tripled
+its cost.
+
+When the machine cannot be quietened, **alternate the two builds** rather
+than running all of one side then all of the other, and keep the minimum
+per side. Drift then has to be present for every repetition of one side and
+absent from every repetition of the other to survive, instead of merely
+happening to fall between the two halves of a single pair.
+
 ## What this proves, and does not
 
 It proves a change moved a number on the engine it ran on, and that every

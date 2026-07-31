@@ -22,8 +22,25 @@
  */
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { CONTROL, checkControlFloor } = require('./floor');
+
+/**
+ * Above this one-minute load average, the run says so.
+ *
+ * Not a refusal — the machine belongs to whoever is using it, and a rough
+ * number under load still beats no number. But a contaminated run looks
+ * exactly like a clean one in the output, and that is how a stray process
+ * gets written into a commit message as a regression. This session lost a
+ * measurement to a stuck jest worker: the same case read 122, 130 and
+ * 164 ns on three consecutive runs at load 24, which is a 34% spread around
+ * an effect worth a few percent.
+ *
+ * One core busy per core present is the line: at that point the scheduler
+ * is handing out whole cores, and below it the noise is what any laptop has.
+ */
+const LOAD_PER_CORE_WARN = 1;
 
 const ROOT = path.resolve(__dirname, '..');
 // `control.js` first: its empty-loop floor validates every later number.
@@ -91,6 +108,16 @@ function main() {
   const mode = quick ? 'quick' : 'full';
 
   assertLibFresh();
+
+  const cores = os.cpus().length;
+  const loadBefore = os.loadavg()[0];
+  if (loadBefore > cores * LOAD_PER_CORE_WARN) {
+    process.stdout.write(
+      `NOTE: load average ${loadBefore.toFixed(1)} across ${cores} cores — ` +
+        'something else is using this machine, and these numbers will be ' +
+        'noisy enough to invent a regression. Compare with care.\n\n'
+    );
+  }
 
   const selected = [];
   let matched = 0;
@@ -163,7 +190,18 @@ function main() {
     fs.writeFileSync(
       jsonPath,
       JSON.stringify(
-        { engine: 'node-v8', node: process.version, commit, mode, results },
+        {
+          engine: 'node-v8',
+          node: process.version,
+          commit,
+          mode,
+          // Recorded, not judged: a file of numbers outlives the session
+          // that produced it, and "what else was running" is the first
+          // question to ask of a surprising one.
+          cores,
+          loadAverage: { before: loadBefore, after: os.loadavg()[0] },
+          results,
+        },
         null,
         2
       ) + '\n'
