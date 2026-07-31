@@ -771,6 +771,13 @@ the append rejected as a stale generation, fences itself and loses that record;
 from then on it reports `isEnabled: false` until something calls `reopen()`.
 Purge through the destination when you have one.
 
+On **React Native 0.78 only**, importing from `/unstable` also needs
+`resolver.unstable_enablePackageExports: true` in `metro.config.js`: Metro 0.81
+ships with subpath exports off, and 0.82 — React Native 0.79 and up — turns
+them on. The root entry point is unaffected at every version. The
+[README](../README.md#unstable-needs-one-line-of-metro-config-on-react-native-078)
+has the measurements.
+
 `FileSink` and `NativeConsoleSink` are the Nitro interfaces, and moved to
 `/unstable` with the two factories. `FileSinkLike` and `NativeConsoleSinkLike`
 are structural equivalents that stay at the root — they are what lets tests drive a

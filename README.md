@@ -216,6 +216,63 @@ The scope's six level methods (`scope.info(msg, meta)` and siblings) did not
 change. Most callers of `createFileSink` want `createFileDestination()`
 instead, which is a root export and does both steps.
 
+### `/unstable` needs one line of Metro config on React Native 0.78
+
+That third row is the only change that is not purely an import edit, and only
+at the bottom of the supported range. `react-native-nitro-logger/unstable` is a
+**subpath export**, and Metro resolves subpath exports only when
+`unstable_enablePackageExports` is on:
+
+| Metro | Ships with | Default | `…/unstable` resolves |
+| --- | --- | --- | --- |
+| 0.81 | React Native 0.78 | `false` | no — `Unable to resolve module` |
+| 0.82+ | React Native ≥ 0.79 | `true` | yes |
+
+So on **React Native 0.78 only**, a project that imports `/unstable` sets the
+flag in its existing `metro.config.js`. Merged into the stock 0.78 template,
+which is what `npx @react-native-community/cli init` writes:
+
+```js
+// metro.config.js
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+const config = {
+  resolver: { unstable_enablePackageExports: true },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+Add the property to whatever `resolver` object your config already has — do not
+replace the file. `getDefaultConfig` is what supplies React Native's own
+transformer, asset and resolver settings, and a `metro.config.js` that exports
+a bare object without it will bundle something subtly wrong rather than fail
+loudly.
+
+Measured rather than inferred, and the two rows are not backed by the same
+thing.
+
+**The 0.81 row is a CI gate.** `scripts/check-metro-resolution.sh` installs
+React Native 0.78.0, React 19.0.0, Metro 0.81 and the packed tarball, then
+bundles each entry point twice — once under the stock template
+`metro.config.js` and once under the config above. It requires the root to
+bundle both times, requires `/unstable` to fail under the stock config *naming
+that specifier*, and requires the snippet above to fix it. So both the problem
+and the workaround are executed on every run. `min-rn-ios` and `min-rn-android`
+stay stock and import only the root entry point, because their value is in
+standing for an unmodified consumer app.
+
+**The 0.82+ row is not.** Its default is read out of
+`metro-config/src/defaults/index.js` at 0.82 and 0.83, plus the fact that
+neither `@react-native/metro-config@0.78.0` nor `@0.79.0` mentions the option,
+so a stock app gets Metro's own default either way; the resolution behaviour
+was bundled once locally on Metro 0.82, not in CI. Nothing re-checks it, so
+read it as accurate when written rather than as enforced.
+
+The **root** entry point resolved under every combination tried — this affects
+`/unstable` and nothing else, so a project that only ever imports from
+`react-native-nitro-logger` never meets any of it.
+
 ## Writing to a file
 
 ```ts

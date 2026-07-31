@@ -44,6 +44,12 @@ metadata?)`. Three positionals in an order nobody could recall, and different
   below a destination changes one import line and gets, at that line, the
   documentation for what that layer does not do.
 
+  On React Native 0.78 that import also needs
+  `resolver.unstable_enablePackageExports: true` in `metro.config.js` — Metro
+  0.81 ships with subpath exports off, and Metro 0.82 (React Native 0.79 and
+  up) turns them on. The root entry point is unaffected at every supported
+  version. The README's "Upgrading to 0.3.0" section has the measurements.
+
   **The six spec result interfaces are `readonly`.** `RotationConfig`,
   `SinkStatus`, `AppendResult`, `FlushOutcome`, `ClearOutcome` and
   `CollectOutcome` — what the native calls hand back. Nitrogen's generated tree

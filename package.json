@@ -85,6 +85,7 @@
     "check-test-reports": "./scripts/check-test-reports.sh",
     "check-mutants": "./scripts/check-mutants.sh",
     "check-package-exports": "./scripts/check-package-exports.sh",
+    "check-metro-resolution": "./scripts/check-metro-resolution.sh",
     "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",
     "check-doc-links": "./scripts/check-doc-links.sh",
     "check-parity-counts": "./scripts/check-parity-counts.sh",

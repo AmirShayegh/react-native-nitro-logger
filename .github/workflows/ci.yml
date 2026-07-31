@@ -329,6 +329,16 @@ jobs:
       - name: Typecheck the min-rn harness apps against the published surface
         run: yarn check-harness-lib
 
+      # Which entry points a stock app at the MINIMUM React Native can bundle.
+      # `check-package-exports` above runs Node's resolver and tsc, both of
+      # which honour `exports` unconditionally, so every entry point passes
+      # there — while Metro 0.81, which react-native 0.78 pins, ships with
+      # subpath exports off and cannot resolve `/unstable` at all. This builds
+      # real bundles against the stock template config to pin that, and to pin
+      # that the documented one-line workaround still works.
+      - name: Check the export map resolves at the minimum React Native
+        run: yarn check-metro-resolution
+
       # Every `__DEV__` in the built library is a place redaction can be turned
       # off. The set is meant to be small and unchanging; this fails if it grows
       # without anyone deciding it should, and — just as importantly — if an
