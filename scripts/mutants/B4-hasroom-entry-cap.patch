@@ -1,0 +1,13 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..3a22cb6 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -319,7 +319,7 @@ export class Batcher {
+    */
+   hasRoom(): boolean {
+     if (this.disposed || this.fenced) return false;
+-    if (this.pending.length >= this.maxPendingEntries) return false;
++    if (this.pending.length > this.maxPendingEntries) return false;
+     // `>=`, not `>`: a record costs at least its newline, so a buffer already
+     // at the cap has room for nothing.
+     return this.pendingBytes < this.maxPendingBytes;

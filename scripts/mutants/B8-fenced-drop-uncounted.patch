@@ -1,0 +1,12 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..e8adec4 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -261,7 +261,6 @@ export class Batcher {
+     const bytes = measured + 1; // the record's own newline
+ 
+     if (this.disposed || this.fenced) {
+-      this.dropped(record, bytes);
+       return;
+     }
+     if (

@@ -1,0 +1,13 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..c9a77fa 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -322,7 +322,7 @@ export class Batcher {
+     if (this.pending.length >= this.maxPendingEntries) return false;
+     // `>=`, not `>`: a record costs at least its newline, so a buffer already
+     // at the cap has room for nothing.
+-    return this.pendingBytes < this.maxPendingBytes;
++    return this.pendingBytes <= this.maxPendingBytes;
+   }
+ 
+   /** Losses with no notice in the file yet. */

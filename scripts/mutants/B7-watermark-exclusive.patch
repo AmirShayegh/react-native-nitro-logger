@@ -1,0 +1,13 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..388b398 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -585,7 +585,7 @@ export class Batcher {
+     if (result.accepted) {
+       this.loseHead(entryCount, 0, false);
+       if (carriesNotice) this.acked = snapshot;
+-      if (toCount(result.queuedBytes) >= this.watermarkBytes)
++      if (toCount(result.queuedBytes) > this.watermarkBytes)
+         this.paused = true;
+       return 'sent';
+     }

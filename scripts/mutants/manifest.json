@@ -1,0 +1,171 @@
+{
+  "mutants": [
+    {
+      "id": "F1-entry-limit-exclusive",
+      "patch": "F1-entry-limit-exclusive.patch",
+      "target": "src/destinations/FileDestination.ts",
+      "claim": "maxEntryBytes is inclusive: a record of exactly the limit is written, not replaced by a notice.",
+      "expect_red": {
+        "suite": "__tests__/fileDestination.test.ts",
+        "test": "a record of exactly maxEntryBytes is written unchanged"
+      }
+    },
+    {
+      "id": "F2-notice-limit-exclusive",
+      "patch": "F2-notice-limit-exclusive.patch",
+      "target": "src/destinations/FileDestination.ts",
+      "claim": "The same inclusive limit applies to the pipeline's own notices.",
+      "expect_red": {
+        "suite": "__tests__/fileDestination.test.ts",
+        "test": "a notice of exactly maxEntryBytes still fits"
+      }
+    },
+    {
+      "id": "F3-deleted-count-unclamped",
+      "patch": "F3-deleted-count-unclamped.patch",
+      "target": "src/destinations/FileDestination.ts",
+      "claim": "A deletedCount arriving negative, NaN or Infinity from native is clamped to 0.",
+      "expect_red": {
+        "suite": "__tests__/fileDestination.test.ts",
+        "test": "a negative count is floored at zero, not passed on"
+      }
+    },
+    {
+      "id": "F4-deleted-count-unfloored",
+      "patch": "F4-deleted-count-unfloored.patch",
+      "target": "src/destinations/FileDestination.ts",
+      "claim": "A fractional deletedCount is floored; rounding up invents a deleted file.",
+      "expect_red": {
+        "suite": "__tests__/fileDestination.test.ts",
+        "test": "a fractional count is floored, never rounded up"
+      }
+    },
+    {
+      "id": "B1-entry-cap-exclusive",
+      "patch": "B1-entry-cap-exclusive.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "The pending entry cap is inclusive: a buffer at the cap refuses the next record.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "the buffer fills to its entry cap and refuses the next record"
+      }
+    },
+    {
+      "id": "B2-byte-cap-inclusive",
+      "patch": "B2-byte-cap-inclusive.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "The pending byte cap is exclusive: a record filling the buffer exactly is accepted.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "the byte cap is exclusive, so a record filling it exactly is kept"
+      }
+    },
+    {
+      "id": "B3-batch-threshold-exclusive",
+      "patch": "B3-batch-threshold-exclusive.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "A buffer landing exactly on batchBytes pushes rather than waiting for the timer.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "a buffer landing exactly on batchBytes pushes without waiting"
+      }
+    },
+    {
+      "id": "B4-hasroom-entry-cap",
+      "patch": "B4-hasroom-entry-cap.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "hasRoom reports false at the entry cap, matching what add would do.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "hasRoom turns false at the entry cap, not one past it"
+      }
+    },
+    {
+      "id": "B5-hasroom-byte-cap",
+      "patch": "B5-hasroom-byte-cap.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "A buffer sitting on its byte cap has room for nothing: a record costs its newline.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "hasRoom turns false once the buffer is at the byte cap"
+      }
+    },
+    {
+      "id": "B7-watermark-exclusive",
+      "patch": "B7-watermark-exclusive.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "Backpressure engages when the sink queue reaches the watermark, not one byte past.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "the queue pauses at the watermark rather than one byte past it"
+      }
+    },
+    {
+      "id": "B8-fenced-drop-uncounted",
+      "patch": "B8-fenced-drop-uncounted.patch",
+      "target": "src/destinations/Batcher.ts",
+      "claim": "A record dropped by a fenced batcher is still counted, so the loss is reported.",
+      "expect_red": {
+        "suite": "__tests__/batcher.test.ts",
+        "test": "a fenced batcher counts further records as lost, never buffers them"
+      }
+    },
+    {
+      "id": "P1-redact-renders-payload",
+      "patch": "P1-redact-renders-payload.patch",
+      "target": "src/privacy.ts",
+      "claim": "redactMetadata renders the placeholder, never the private payload, outside a dev build.",
+      "expect_red": {
+        "suite": "__tests__/privacy.test.ts",
+        "test": "the module exposes no payload-recovery export, in any position"
+      }
+    },
+    {
+      "id": "P2-sentinel-renamed",
+      "patch": "P2-sentinel-renamed.patch",
+      "target": "src/privacy.ts",
+      "claim": "The reveal sentinel in src/ is the literal check-release-bundle.sh greps a release bundle for.",
+      "expect_red": {
+        "suite": "__tests__/revealSentinels.test.js",
+        "test": "the privacy reveal branch assigns the sentinel the gate greps for"
+      }
+    },
+    {
+      "id": "P3-sentinel-unconditional",
+      "patch": "P3-sentinel-unconditional.patch",
+      "target": "src/privacy.ts",
+      "claim": "The sentinel is assigned only inside the __DEV__ branch, so a release bundle strips it.",
+      "expect_red": {
+        "suite": "__tests__/revealSentinels.test.js",
+        "test": "a release build leaves both sentinels unassigned"
+      }
+    },
+    {
+      "id": "E1-factory-binding-silenced",
+      "patch": "E1-factory-binding-silenced.patch",
+      "target": "eslint-plugin/shared.js",
+      "claim": "An unresolvable initializer falls through to the name heuristic instead of silencing every rule.",
+      "expect_red": {
+        "suite": "__tests__/eslintPlugin.test.js",
+        "test": "the canonical name rebound through a hook no longer silences the rules"
+      }
+    },
+    {
+      "id": "E2-construction-falls-through",
+      "patch": "E2-construction-falls-through.patch",
+      "target": "eslint-plugin/shared.js",
+      "claim": "A null from classifyConstruction is a decision and still ends classification, keeping loggerClassNames meaningful.",
+      "expect_red": {
+        "suite": "__tests__/eslintPlugin.test.js",
+        "test": "narrowing loggerClassNames still silences a construction"
+      }
+    }
+  ],
+  "accepted_survivors": [
+    {
+      "id": "B6",
+      "target": "src/destinations/Batcher.ts",
+      "why": "The Date.now() boundary tick. Pinning it needs a clock injected into Batcher \u2014 a production change for a one-tick difference. Knowingly accepted."
+    }
+  ]
+}

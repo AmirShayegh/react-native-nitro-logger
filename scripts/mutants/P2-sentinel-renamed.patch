@@ -1,0 +1,13 @@
+diff --git a/src/privacy.ts b/src/privacy.ts
+index ba8db55..85738db 100644
+--- a/src/privacy.ts
++++ b/src/privacy.ts
+@@ -199,7 +199,7 @@ let revealBranchSentinel = '';
+  * There is deliberately no runtime switch to turn this on in production. */
+ function privateRevealAllowed(): boolean {
+   if (typeof __DEV__ !== 'undefined' && __DEV__) {
+-    revealBranchSentinel = '__NITRO_LOGGER_PRIVATE_REVEAL__';
++    revealBranchSentinel = '__NITRO_LOGGER_PRIV_REVEAL__';
+     return true;
+   }
+   return false;
