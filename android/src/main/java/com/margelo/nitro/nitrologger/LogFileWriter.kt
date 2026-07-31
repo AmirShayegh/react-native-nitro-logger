@@ -374,7 +374,16 @@ class LogFileWriter internal constructor(
   private var writerThread: Thread? = null
 
   private val executor = Executors.newSingleThreadExecutor(ThreadFactory { runnable ->
-    Thread(runnable, "com.nitrologger.filewriter").apply {
+    Thread({
+      // On the writer thread, not the one that built it. `setThreadPriority`
+      // acts on the caller, so doing this in the factory body — which runs on
+      // whichever thread submitted the first task, usually the JavaScript
+      // thread — would deprioritize the app instead of the log writer.
+      //
+      // Before the runnable, so every task including the first is covered.
+      platform.deprioritizeCurrentThread()
+      runnable.run()
+    }, "com.nitrologger.filewriter").apply {
       isDaemon = true
       writerThread = this
     }

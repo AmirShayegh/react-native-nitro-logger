@@ -459,7 +459,11 @@ public final class LogWriter {
     // The trim above stays synchronous. It must finish before any byte is
     // appended, it is what the exclusive lock is taken to protect, and it is
     // bounded by the file's size rather than by the directory's history.
-    queue.async { [self] in
+    // `.utility` for the same reason the append path is: nobody is waiting for
+    // this. It is the other half of the change that moved it off the acquiring
+    // thread — having decided the caller does not wait for the sweep, letting
+    // it compete with the UI at the caller's priority would be odd.
+    queue.async(qos: .utility) { [self] in
       openSweepGate?()
       sweepRetention()
     }
@@ -707,7 +711,33 @@ public final class LogWriter {
     let status = statusLocked(handleID)
     stateLock.unlock()
 
-    queue.async { [self] in
+    // `.utility`, and the *submission* carries it rather than the queue.
+    //
+    // This is the one place the priority is lowered, because this is the work
+    // nobody is waiting for: `appendBatch` has already returned by the time the
+    // block runs, and rotation and compression happen inside it. Dropping it
+    // below the UI is the whole point — a log write must never be why a frame
+    // is late.
+    //
+    // The queue itself deliberately has NO assigned QoS, and that is not an
+    // oversight. A `DispatchQueue` created with a QoS treats it as a ceiling
+    // and silently discards the QoS of anything submitted with `async(qos:)`;
+    // only a `DispatchWorkItem` carrying `.enforceQoS` gets past it. So giving
+    // the queue `.utility` would have quietly demoted the six deadline-bound
+    // barriers — `flush`, `close`, `maintain`, `collectLogs`, `clearLogs`,
+    // `logFilePaths` — to utility as well, which is the exact opposite of what
+    // is wanted for calls the JavaScript thread is blocked on. Leaving the
+    // queue unassigned lets those barriers keep inheriting their caller's QoS,
+    // which is a better answer than any constant picked here.
+    //
+    // What this does NOT buy: a barrier still queues behind whatever appends
+    // are already in front of it, and those now run at utility. Dispatch is
+    // documented to raise queued work when something higher-priority arrives
+    // behind it, but that override is not observable through
+    // `qos_class_self()`, so it is not something this comment will claim.
+    // Utility rather than background is partly why: the gap is a scheduling
+    // preference, not a starvation cliff.
+    queue.async(qos: .utility) { [self] in
       performWrite(data, handleID: handleID, entryCount: entryCount, generation: handleGeneration)
     }
     return LogAppendResult(accepted: true, rejectReason: nil, status: status)
@@ -2179,6 +2209,15 @@ public final class LogWriter {
   var rotationAttemptsForTesting: Int {
     queue.sync { rotationAttempts }
   }
+
+  /// The queue's own QoS, which must stay `.unspecified`.
+  ///
+  /// Not a curiosity: a `DispatchQueue` created with a QoS treats it as a
+  /// ceiling and discards the QoS of work submitted with `async(qos:)`, so an
+  /// assigned QoS here would silently demote every deadline-bound barrier to
+  /// it. The appends carry `.utility` on the submission instead, which leaves
+  /// the barriers inheriting their caller.
+  var queueQoSForTesting: DispatchQoS { queue.qos }
 
   /// Blocks until everything already enqueued has run, so a test can assert on
   /// the file without racing the writer.

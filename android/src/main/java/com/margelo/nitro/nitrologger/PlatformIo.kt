@@ -113,6 +113,26 @@ interface PlatformIo {
   fun renameReplacing(from: File, to: File): Boolean
 
   /**
+   * Drops the **calling** thread a notch below default scheduling priority.
+   *
+   * Called from inside the writer thread's own runnable, not from whoever
+   * created it: `Process.setThreadPriority(int)` acts on the current thread, so
+   * calling it at construction would deprioritize the JavaScript thread that
+   * happened to open the sink. That is the mistake this signature is shaped to
+   * make hard — there is no thread parameter to get wrong.
+   *
+   * Deliberately **not** `THREAD_PRIORITY_BACKGROUND`. Android puts any thread
+   * at priority 10 or above into a throttled background cgroup that gets
+   * single-digit CPU percentages while anything foreground is running, and the
+   * thread this is applied to is the one a crash-path `flush` blocks on with a
+   * deadline it promised to keep. One notch below default keeps the thread in
+   * the foreground cgroup: log writes yield to the UI, and never to nothing.
+   *
+   * A no-op off-device, so unit-test timing is exactly what it was.
+   */
+  fun deprioritizeCurrentThread()
+
+  /**
    * The unit-test implementation. **Not for Android**: it is the only place in
    * this package that touches `java.nio.file`, which does not exist below API
    * 26.
@@ -143,6 +163,14 @@ interface PlatformIo {
     override fun creationTimeMillis(file: File): Long? = Nio.creationTimeMillis(file)
 
     override fun renameReplacing(from: File, to: File): Boolean = Nio.renameReplacing(from, to)
+
+    /**
+     * Nothing. A JVM has no equivalent that is worth reaching for —
+     * `Thread.setPriority` is advisory to the point of being ignored on the
+     * platforms these tests run on — and a real change here would perturb the
+     * timing that several tests in this suite measure.
+     */
+    override fun deprioritizeCurrentThread() = Unit
 
     /**
      * Every `java.nio.file` reference in the package, in one object that

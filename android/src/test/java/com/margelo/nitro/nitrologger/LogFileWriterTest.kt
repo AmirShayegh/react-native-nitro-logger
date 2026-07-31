@@ -568,6 +568,68 @@ class LogFileWriterTest {
     }
   }
 
+  /**
+   * The writer thread lowers *its own* priority, and does it on itself.
+   *
+   * The signature has no thread parameter precisely because the mistake worth
+   * preventing is calling it from the wrong one: `Process.setThreadPriority`
+   * acts on the caller, so making the request while constructing the executor
+   * — which happens on whichever thread opened the sink, in production the
+   * JavaScript thread — would deprioritize the app and leave the log writer
+   * exactly where it was. Asserting the *name* of the thread it ran on is what
+   * catches that; asserting only that it was called does not.
+   *
+   * ## What this does not prove
+   *
+   * That anything happened. `PlatformIo.Jvm` is a no-op and this double only
+   * records, so what is pinned is that the request is made, from the right
+   * thread, exactly once. Whether the OS honours it is not observable from a
+   * JVM and is not observable on a device either — `getThreadPriority` reports
+   * what was set, not what the scheduler did with it.
+   */
+  @Test
+  fun `the writer thread lowers its own priority`() {
+    val recorder = RecordingPriority()
+    val w = LogFileWriter.open(
+      file = File(directory, "app.log"),
+      canonicalPath = File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(),
+      lineFramed = true,
+      platform = recorder,
+      clock = { now },
+      monotonic = { steady }
+    ).also { opened.add(it) }
+
+    assertTrue(w.append(1, w.currentGeneration, "x\n", 1).accepted)
+    w.settleForTesting()
+
+    assertEquals(
+      "the priority request was made on the wrong thread",
+      listOf("com.nitrologger.filewriter"),
+      recorder.threads()
+    )
+  }
+
+  /**
+   * Records where [deprioritizeCurrentThread] was called from, and does the
+   * rest of the work the tests already rely on.
+   *
+   * Delegation rather than a hand-written stub: a stub would have to
+   * reimplement every method, and the one it got subtly wrong would be a test
+   * failure that says nothing about priority.
+   */
+  private class RecordingPriority(
+    private val inner: PlatformIo = PlatformIo.Jvm
+  ) : PlatformIo by inner {
+    private val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    override fun deprioritizeCurrentThread() {
+      seen.add(Thread.currentThread().name)
+    }
+
+    fun threads(): List<String> = synchronized(seen) { seen.toList() }
+  }
+
   /** Opens [latch] from a daemon thread after [millis]. */
   private fun releaseAfter(latch: CountDownLatch, millis: Long) {
     Thread {
