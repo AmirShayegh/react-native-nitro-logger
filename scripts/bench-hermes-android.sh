@@ -73,6 +73,23 @@ fi
 ABI="$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
 echo "device ABI: $ABI; run: $RUN_ID; expecting $CASE_COUNT cases"
 
+# The bundle outputs are DELETED rather than trusted, and this is the Hermes
+# half of `assertLibFresh` in `bench/run.js`.
+#
+# Gradle's up-to-date check for the React bundle task does not watch `bench/`
+# or `src/`, so editing a case body or the library and re-running produced
+# "BUILD SUCCESSFUL, 146 up-to-date" and an APK carrying the PREVIOUS bundle —
+# a before/after where both sides measure the same code and agree beautifully.
+#
+# This was found the only way it can be found by accident: a run whose case
+# NAMES had also changed, which the harvest's identity check rejected. Names
+# change almost never; case bodies and library code change on every
+# measurement, and for those the identity check passes and the numbers are
+# simply wrong. A few seconds of re-bundling per run is the price of the
+# numbers meaning anything.
+rm -rf example/android/app/build/generated/assets/react \
+       example/android/app/build/intermediates/assets
+
 (cd example/android && ./gradlew :app:assembleRelease \
   "-PreactNativeArchitectures=$ABI" --console=plain)
 

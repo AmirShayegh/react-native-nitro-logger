@@ -79,6 +79,53 @@ describe('utf8Length agrees with the platform encoder', () => {
     }
   });
 
+  /**
+   * The same walk, but long enough to take the OTHER fast path.
+   *
+   * Since 0.4.0 a string of at least `SEARCH_MIN_UNITS` units that begins in
+   * ASCII finds its handover index with `String.prototype.search` instead of
+   * a per-unit loop. That is a second implementation of "where does ASCII
+   * stop", and the gate means the walk above — which tops out at 25 units —
+   * never reaches it. So it is walked again on both sides of the threshold.
+   *
+   * The positions are deliberately spread across it: below the gate, exactly
+   * on it, and well past, so an off-by-one in the gate itself shows up as a
+   * wrong byte count rather than as an untaken branch.
+   */
+  test('the handover is exact on the long path too, across the gate', () => {
+    for (let position = 0; position < 80; position += 1) {
+      const text = `${'a'.repeat(position)}🙂${'b'.repeat(80 - position)}`;
+      expect(utf8Length(text)).toBe(reference(text));
+    }
+  });
+
+  test('a long string that turns non-ASCII at its very first unit', () => {
+    // Long enough for the gate, but the prefix walk stops at index 0, so the
+    // `search` is never reached — there is no ASCII run to hand over. It must
+    // still count correctly, and it must not pay for a scan that finds
+    // nothing.
+    const text = `🙂${'a'.repeat(200)}`;
+    expect(utf8Length(text)).toBe(reference(text));
+  });
+
+  test('a long all-ASCII string still short-circuits to its own length', () => {
+    for (const size of [31, 32, 33, 4096]) {
+      const text = 'x'.repeat(size);
+      expect(utf8Length(text)).toBe(size);
+      expect(utf8Length(text)).toBe(reference(text));
+    }
+  });
+
+  test('a lone surrogate past the gate is found by the same rule', () => {
+    // The `u`-less regex matches code UNITS, so an unpaired surrogate is
+    // where ASCII stops — the same answer the charCodeAt loop gives. A `u`
+    // flag here would make the two paths disagree on exactly this input.
+    for (const lone of ['\ud83d', '\ude42']) {
+      const text = `${'a'.repeat(50)}${lone}${'b'.repeat(10)}`;
+      expect(utf8Length(text)).toBe(reference(text));
+    }
+  });
+
   test('a string of only ASCII counts as its own length', () => {
     const text = 'x'.repeat(1000);
     expect(utf8Length(text)).toBe(1000);
