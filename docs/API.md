@@ -617,6 +617,68 @@ four bytes they encode to, not as the two code units JavaScript stores.
 
 <!-- api: utf8Length -->
 
+### `describeDegradation(mask)` and the `DEGRADED_*` bits
+
+`FileDestination.degradation()` returns a bitmask, which is the right thing to
+send across a bridge and an awkward thing to hold: `if (mask & 4)` is
+unreadable at the call site and unverifiable in review. `DEGRADED_ROTATION`,
+`DEGRADED_GZIP`, `DEGRADED_PRUNE`, `DEGRADED_SIDECAR`, `DEGRADED_PROTECTION`
+and `DEGRADED_EXCLUSIVITY` are those bits by name, matching the table above.
+
+`describeDegradation(mask)` turns one into a frozen array of the names set —
+`[]` for a healthy `0`, `['prune', 'exclusivity']` for `0x24`. Bits this build
+has no name for are ignored rather than reported: a newer native paired with an
+older JavaScript bundle can set one, and inventing `'bit6'` would put a string
+in a log line that means nothing to whoever reads it. Compare against the raw
+mask if you need to know that something unnamed is set.
+
+The output is payload-free by construction — six fixed literals, and no path,
+`errno` or filename can reach it — which is the same reason the natives report
+a mask instead of a message.
+
+```ts
+import {
+  Log as Logger6,
+  FileDestination as FileDestination6,
+  createFileSink as createFileSink6,
+  describeDegradation,
+} from 'react-native-nitro-logger';
+
+const watched = new FileDestination6(createFileSink6());
+const problems = describeDegradation(watched.degradation());
+if (problems.length > 0) {
+  Logger6.warning('logging degraded', { degraded: problems.join(',') }, 'diagnostics');
+}
+```
+
+<!-- api: describeDegradation, DEGRADED_ROTATION, DEGRADED_GZIP, DEGRADED_PRUNE, DEGRADED_SIDECAR, DEGRADED_PROTECTION, DEGRADED_EXCLUSIVITY -->
+
+### `levelAtLeast(level, minimum)`, `LEVEL_ORDER` and `PRIVATE_PLACEHOLDER`
+
+The three things a custom `LogDestination` cannot implement without. A
+destination that filters by severity has to compare two `LogLevel`s, which are
+strings — `'warning' >= 'error'` is a lexicographic answer to a question nobody
+asked. `LEVEL_ORDER` maps each level to the numeric severity that also crosses
+the bridge, and `levelAtLeast(level, minimum)` is the comparison itself.
+`PRIVATE_PLACEHOLDER` is the exact string (`<private>`) that redaction
+substitutes for a value, exported so a destination can recognise it — to count
+redactions, or render them differently — without transcribing the literal and
+drifting from it.
+
+It does **not** tell you a field was redacted. By the time an entry reaches a
+destination the placeholder is an ordinary string, indistinguishable from one a
+caller set to that same text on purpose, and nothing in `LogEntry` records which
+it was. That is a property of the design rather than an oversight: the payload
+is gone, not hidden, so there is nothing left to carry the provenance.
+
+Deliberately **not** exported: `LEVEL_TAG` and `LEVEL_NAME`. Those are the
+fixed-width tags and uppercase names the formatters emit for byte-parity with
+SwiftLogger. They are a wire format that happens to live in the same file, not
+API, and exporting them would invite a consumer to depend on bytes this package
+has promised to a different project.
+
+<!-- api: levelAtLeast, LEVEL_ORDER, PRIVATE_PLACEHOLDER -->
+
 ---
 
 ## Index
@@ -640,6 +702,13 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `DEFAULT_BUNDLE_NAMES`
 - `DEFAULT_MAX_FRAMES`
 - `DefaultFormatter`
+- `DEGRADED_EXCLUSIVITY`
+- `DEGRADED_GZIP`
+- `DEGRADED_PROTECTION`
+- `DEGRADED_PRUNE`
+- `DEGRADED_ROTATION`
+- `DEGRADED_SIDECAR`
+- `describeDegradation`
 - `DROPPED_COUNT_KEY`
 - `ERROR_METADATA_KEYS`
 - `ErrorHandlerOptions`
@@ -658,6 +727,8 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `JsonLinesFormatterOptions`
 - `JsonTimestampStyle`
 - `LazyMessage`
+- `LEVEL_ORDER`
+- `levelAtLeast`
 - `Log`
 - `LogDestination`
 - `LogEntry`
@@ -680,6 +751,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NON_ERROR_THROWN`
 - `priv`
 - `PrivacyDefault`
+- `PRIVATE_PLACEHOLDER`
 - `PrivateValue`
 - `pub`
 - `PublicValue`

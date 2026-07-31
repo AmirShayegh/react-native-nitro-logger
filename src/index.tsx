@@ -91,6 +91,17 @@ export type {
   LossCounts,
 } from './destinations/Batcher';
 export { utf8Length } from './utf8';
+export {
+  DEGRADED_ROTATION,
+  DEGRADED_GZIP,
+  DEGRADED_PRUNE,
+  DEGRADED_SIDECAR,
+  DEGRADED_PROTECTION,
+  DEGRADED_EXCLUSIVITY,
+  describeDegradation,
+} from './degradation';
+export { levelAtLeast, LEVEL_ORDER } from './levels';
+export { PRIVATE_PLACEHOLDER } from './privacy';
 export type { LogFormatter } from './formatters/types';
 export { DefaultFormatter } from './formatters/DefaultFormatter';
 export { JsonLinesFormatter } from './formatters/JsonLinesFormatter';
