@@ -287,6 +287,8 @@ public final class LogWriter {
   private let compressor: Compressor
   private let steady: Steady
   private let clock: Clock
+  /// See the parameter of the same name on `init`. Nil in production.
+  private let openSweepGate: (() -> Void)?
 
   // MARK: State behind `stateLock` — cheap, never held across I/O
 
@@ -376,6 +378,14 @@ public final class LogWriter {
     compressor: Compressor? = nil,
     steady: Steady? = nil,
     clock: Clock? = nil,
+    /// Runs on the queue immediately before the open sweep, so a test can hold
+    /// the sweep there and observe the writer as it is *before* retention has
+    /// run.
+    ///
+    /// Injected rather than assigned afterwards because the sweep is submitted
+    /// during `init` — by the time a caller has a writer to set a property on,
+    /// the sweep may already have run.
+    openSweepGate: (() -> Void)? = nil,
     directoryShortfall: LogSecureFile.Shortfall = []
   ) throws {
     self.fileURL = fileURL
@@ -392,6 +402,7 @@ public final class LogWriter {
     }
     self.steady = steady ?? Self.steadyMillis
     self.clock = clock ?? { Date() }
+    self.openSweepGate = openSweepGate
     self.queue = DispatchQueue(label: "com.nitrologger.filewriter")
     queue.setSpecific(key: queueKey, value: true)
 
@@ -432,7 +443,26 @@ public final class LogWriter {
     currentFileStart = fileStart(created: opened.created)
 
     trimTornTailIfFramed()
-    sweepRetention()
+    // Submitted, not run here — the twin of Android's change, and made
+    // identically so the next person editing one finds the other.
+    //
+    // The queue is serial, so the sweep still runs before the first append's
+    // write. That is the only ordering it needs: it moves archives, and nothing
+    // can append to an archive it has not finished moving if the append is
+    // behind it in the same queue.
+    //
+    // It was never a deadlock risk here the way it was on Android — same
+    // thread, no cross-thread wait — but it is the same unbounded directory I/O
+    // performed **while the registry lock is held**, so opening one file with a
+    // large backlog to prune stalled every other file's acquire and release.
+    //
+    // The trim above stays synchronous. It must finish before any byte is
+    // appended, it is what the exclusive lock is taken to protect, and it is
+    // bounded by the file's size rather than by the directory's history.
+    queue.async { [self] in
+      openSweepGate?()
+      sweepRetention()
+    }
     opening = false
   }
 

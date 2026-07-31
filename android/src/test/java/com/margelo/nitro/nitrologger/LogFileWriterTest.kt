@@ -11,6 +11,9 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.file.Files
@@ -392,6 +395,185 @@ class LogFileWriterTest {
     val names = directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
     assertTrue("expected a surviving plaintext archive", names.any { !it.endsWith(".gz") })
     assertTrue(w.status(1).degraded and LogDegradation.GZIP != 0)
+  }
+
+  @Test
+  fun `open returns without waiting for the retention sweep`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    try {
+      releaseAfter(held, 3_000)
+      val began = System.nanoTime()
+      val w = LogFileWriter.open(
+        file = File(directory, "app.log"),
+        canonicalPath = File(directory, "app.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now },
+        monotonic = { steady },
+        openSweepGate = {
+          inSweep.countDown()
+          held.await()
+        }
+      ).also { opened.add(it) }
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      // The sweep is provably still running — it is sitting in the gate — and
+      // `open` has already returned. Before this change it waited.
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      assertTrue("open waited for the retention sweep", elapsedMs < 2_000)
+
+      // And the writer is usable while the sweep is still gated, which is the
+      // point of moving it: the trim that had to finish already has.
+      assertTrue(w.append(1, w.currentGeneration, "usable\n", 1).accepted)
+    } finally {
+      held.countDown()
+    }
+  }
+
+  /**
+   * What the async sweep is actually worth: the registry lock is free while it
+   * runs.
+   *
+   * Waiting for the sweep meant an unbounded, cross-thread wait on directory
+   * I/O taken **inside** the registry lock — so opening one file with a large
+   * backlog of archives to prune stalled every other file's acquire and
+   * release, including a close with a deadline it had promised to keep.
+   *
+   * The gated acquire runs on its **own thread**, and that is load-bearing
+   * rather than tidy. Measuring a second acquire after the first has returned
+   * proves nothing about the lock: a first acquire that waited would simply
+   * have finished waiting by then. The second acquire has to be attempted while
+   * the first is still inside `registry.acquire`, which needs two threads.
+   *
+   * What this does not prove: that the sweep *completes* before the first
+   * append lands. That follows from the executor being single-threaded, which
+   * is a construction argument rather than a tested one.
+   */
+  @Test
+  fun `a gated open sweep on one path does not block another path`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    val registry = LogWriterRegistry.isolated()
+    val slow = AtomicReference<LogFileHandle>()
+    val slowThread = Thread {
+      slow.set(
+        registry.acquire(
+          path = File(directory, "slow.log").absolutePath,
+          policy = LogRotationPolicy.of(),
+          lineFramed = true,
+          platform = PlatformIo.Jvm,
+          clock = { now },
+          openSweepGate = {
+            inSweep.countDown()
+            held.await()
+          }
+        )
+      )
+    }
+    try {
+      slowThread.start()
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      // Insurance against the mutation: with the sweep awaited again, the
+      // thread above is stuck inside `acquire` holding the lock and would never
+      // reach the release below — the suite would hang instead of failing.
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      val other = registry.acquire(
+        path = File(directory, "other.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now }
+      )
+      other.close(1000.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertTrue(
+        "a gated sweep on one file held the registry lock against another",
+        elapsedMs < 2_000
+      )
+    } finally {
+      held.countDown()
+      slowThread.join(10_000)
+      slow.get()?.let { runCatching { it.close(1000.0) } }
+    }
+  }
+
+  /**
+   * Moving the sweep off the acquiring thread changed an externally visible
+   * contract, so the new contract gets pinned rather than left implied.
+   *
+   * Open used to guarantee the sweep had *finished*. It now guarantees only
+   * that it is queued, which means a `getStatus()` taken right after opening
+   * can legitimately report the state from before the sweep ran — a caller
+   * that opens and immediately checks `degraded` may see a clean status and a
+   * degraded one a moment later, with nothing having gone wrong in between.
+   * That is worth a test because it is the kind of difference that otherwise
+   * gets discovered as a flake in somebody else's suite.
+   *
+   * The sweep is made to *fail* here, because a sweep that succeeds leaves no
+   * mark on the status and the two moments would be indistinguishable.
+   *
+   * What this does not prove: that the window is short. There is no bound on
+   * how long the queued sweep takes to reach the front — that is the cost the
+   * change deliberately accepts in exchange for not paying it on the caller's
+   * thread.
+   */
+  @Test
+  fun `status right after open can predate the sweep`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    try {
+      // Insurance against a revert to the inline sweep: that would block the
+      // open below on this test's own thread, and the gate would never open.
+      releaseAfter(held, 3_000)
+      val w = LogFileWriter.open(
+        file = File(directory, "app.log"),
+        canonicalPath = File(directory, "app.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now },
+        monotonic = { steady },
+        openSweepGate = {
+          inSweep.countDown()
+          held.await()
+        }
+      ).also { opened.add(it) }
+
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      assertEquals(
+        "the sweep is still sitting in its gate — it cannot have reported a failure yet",
+        0,
+        w.status(1).degraded and LogDegradation.PRUNE
+      )
+
+      // Break the sweep from outside the gate it is parked in, so the failure
+      // is provably one the sweep hit rather than anything the open did.
+      directory.setReadable(false, false)
+      assumeDirectoryRefusesListing()
+      held.countDown()
+      w.settleForTesting()
+
+      assertTrue(
+        "once the sweep runs, the listing it could not do is on the status",
+        w.status(1).degraded and LogDegradation.PRUNE != 0
+      )
+    } finally {
+      held.countDown()
+      directory.setReadable(true, false)
+    }
+  }
+
+  /** Opens [latch] from a daemon thread after [millis]. */
+  private fun releaseAfter(latch: CountDownLatch, millis: Long) {
+    Thread {
+      Thread.sleep(millis)
+      latch.countDown()
+    }.apply { isDaemon = true }.start()
   }
 
   // An interrupted compression must not leave something that looks like a

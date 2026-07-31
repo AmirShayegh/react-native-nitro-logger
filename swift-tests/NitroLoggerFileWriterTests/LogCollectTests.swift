@@ -355,8 +355,11 @@ final class LogCollectTests: LogWriterTestCase {
         "\(orphan.lastPathComponent) is not an artifact")
     }
 
-    // The sweep runs at open.
+    // Open *queues* the sweep — it no longer waits for it, so asserting on the
+    // directory needs a barrier. `settleForTesting` is that barrier and nothing
+    // more: it is the queue draining, not a second chance for the sweep.
     let handle = try makeHandle(policy: policy())
+    handle.writerForTesting.settleForTesting()
 
     for orphan in orphans {
       XCTAssertFalse(

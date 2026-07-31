@@ -949,6 +949,188 @@ final class LogRegistryTests: LogWriterTestCase {
                   "and the caller has to be able to find out")
   }
 
+  /// Acquiring returns without waiting for the retention sweep, and the
+  /// registry lock is free while that sweep runs.
+  ///
+  /// The sweep is unbounded directory I/O — it lists, prunes by age, by count
+  /// and by total size — and it used to run inline inside `init`, which the
+  /// registry calls **with its lock held**. So opening one file with a large
+  /// backlog to prune stalled every other file's acquire and release, including
+  /// a close with a deadline it had promised to keep.
+  ///
+  /// Both halves are asserted here rather than in two tests, because on iOS
+  /// they were always the same fact: the sweep ran on the acquiring thread, so
+  /// "the open waited" and "the lock was held" were one event.
+  ///
+  /// The gated acquire runs on its **own thread**, and that is load-bearing
+  /// rather than tidy. Measuring a second acquire after the first has returned
+  /// proves nothing about the lock: a first acquire that waited would simply
+  /// have finished waiting by then. The second acquire has to be attempted
+  /// while the first is still inside `registry.acquire`, which needs two
+  /// threads. It is also what keeps the inline-sweep mutation from deadlocking
+  /// the suite — with the sweep back on the acquiring thread, that thread is
+  /// this test's own, and it could never reach the release below.
+  ///
+  /// What this does not prove: that the sweep *completes* before the first
+  /// append lands. That follows from the queue being serial, which is a
+  /// construction argument rather than a tested one.
+  func testAcquireDoesNotWaitForTheOpenSweep() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inSweep = DispatchSemaphore(value: 0)
+    let acquired = AcquireOutcome()
+    let registry: LogWriterRegistry = self.registry
+    let slowPath = logsDirectory.appendingPathComponent("slow.log").path
+
+    DispatchQueue.global().async {
+      let began = Date()
+      let handle = try? registry.acquire(
+        path: slowPath,
+        policy: LogRotationPolicy(),
+        lineFramed: true,
+        openSweepGate: {
+          inSweep.signal()
+          held.wait()
+        }
+      )
+      acquired.finish(handle: handle, elapsed: Date().timeIntervalSince(began))
+    }
+
+    XCTAssertEqual(inSweep.wait(timeout: .now() + 10), .success, "the sweep never reached its gate")
+    // Insurance against the mutation: with the sweep awaited inline again, the
+    // thread above is stuck inside `acquire` holding the lock, and the acquire
+    // below never returns — this turns that hang into a red run.
+    held.releaseAfter(3)
+
+    // The sweep is provably still running — it is sitting in the gate — and the
+    // lock it would have held is free: a different path opens and closes.
+    let otherBegan = Date()
+    let other = try registry.acquire(
+      path: logsDirectory.appendingPathComponent("other.log").path,
+      policy: LogRotationPolicy(),
+      lineFramed: true
+    )
+    _ = other.close(deadlineMs: 1000)
+    XCTAssertLessThan(
+      Date().timeIntervalSince(otherBegan), 2.0,
+      "a gated sweep on one file held the registry lock against another")
+
+    held.release()
+    XCTAssertEqual(acquired.done.wait(timeout: .now() + 10), .success,
+                   "the gated acquire never returned")
+    let outcome = acquired.read()
+    XCTAssertLessThan(outcome.elapsed, 2.0, "acquire waited for the retention sweep")
+    // Not `makeHandle`, because this needed the gate — so the close here is
+    // what `makeHandle`'s teardown would have done.
+    if let slow = outcome.handle { _ = slow.close(deadlineMs: 1000) }
+  }
+
+  /// Moving the sweep off the acquiring thread changed an externally visible
+  /// contract, so the new contract gets pinned rather than left implied.
+  ///
+  /// Open used to guarantee the sweep had *finished*. It now guarantees only
+  /// that it is queued, which means a `getStatus()` taken right after opening
+  /// can legitimately report the state from before the sweep ran — a caller
+  /// that opens and immediately checks `degraded` may see a clean status and a
+  /// degraded one a moment later, with nothing having gone wrong in between.
+  /// That is worth a test because it is the kind of difference that otherwise
+  /// gets discovered as a flake in somebody else's suite.
+  ///
+  /// The sweep is made to *fail* here, because a sweep that succeeds leaves no
+  /// mark on the status and the two moments would be indistinguishable.
+  ///
+  /// What this does not prove: that the window is short. There is no bound on
+  /// how long the queued sweep takes to reach the front — that is the cost the
+  /// change deliberately accepts in exchange for not paying it inside the
+  /// registry lock.
+  func testStatusRightAfterOpenCanPredateTheSweep() throws {
+    try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+    // An orphaned compression that cannot be deleted. The sweep will try, fail,
+    // and record `.prune` — which is the observable the two moments differ on.
+    let orphan = logsDirectory.appendingPathComponent(
+      LogWriter.supportStagingName("app.log"))
+    try Data("truncated".utf8).write(to: orphan)
+    TestFlags.makeImmutable(orphan)
+
+    let held = Latch()
+    defer { held.release() }
+    let inSweep = DispatchSemaphore(value: 0)
+    // Insurance against a revert to the inline sweep: that would block the
+    // acquire below on this test's own thread, and the gate would never open.
+    // Opening it on a timer makes that a failed assertion instead of a hang.
+    held.releaseAfter(3)
+
+    let handle = try registry.acquire(
+      path: logURL.path,
+      policy: LogRotationPolicy(),
+      lineFramed: true,
+      openSweepGate: {
+        inSweep.signal()
+        held.wait()
+      }
+    )
+    addTeardownBlock { _ = handle.close(deadlineMs: 1000) }
+
+    XCTAssertEqual(inSweep.wait(timeout: .now() + 10), .success, "the sweep never reached its gate")
+    XCTAssertFalse(
+      LogDegradation(rawValue: handle.status().degraded).contains(.prune),
+      "the sweep is still sitting in its gate — it cannot have reported a failure yet")
+
+    held.release()
+    handle.writerForTesting.settleForTesting()
+    XCTAssertTrue(
+      LogDegradation(rawValue: handle.status().degraded).contains(.prune),
+      "once the sweep runs, the deletion it could not do is on the status")
+  }
+
+  /// Carries a gated acquire's result back from the thread that ran it.
+  private final class AcquireOutcome: @unchecked Sendable {
+    let done = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var handle: LogFileHandle?
+    private var elapsed: TimeInterval = 0
+
+    func finish(handle: LogFileHandle?, elapsed: TimeInterval) {
+      lock.lock()
+      self.handle = handle
+      self.elapsed = elapsed
+      lock.unlock()
+      done.signal()
+    }
+
+    func read() -> (handle: LogFileHandle?, elapsed: TimeInterval) {
+      lock.lock()
+      defer { lock.unlock() }
+      return (handle, elapsed)
+    }
+  }
+
+  /// A gate that latches open, so a second `release()` is harmless and the
+  /// number of waiters need not be known in advance.
+  private final class Latch: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var open = false
+
+    func wait() {
+      condition.lock()
+      while !open { condition.wait() }
+      condition.unlock()
+    }
+
+    func release() {
+      condition.lock()
+      open = true
+      condition.broadcast()
+      condition.unlock()
+    }
+
+    /// Opens the gate after `seconds`, so a test that would otherwise hang on a
+    /// regression fails instead.
+    func releaseAfter(_ seconds: TimeInterval) {
+      DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [self] in release() }
+    }
+  }
+
   /// A purge that arrives after the close barrier still deletes, and does not
   /// reopen.
   ///

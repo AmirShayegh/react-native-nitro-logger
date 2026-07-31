@@ -373,8 +373,12 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertFalse(LogWriter.isArchiveName(orphan.lastPathComponent, baseName: "app.log"))
     XCTAssertTrue(LogWriter.isArtifactName(orphan.lastPathComponent, baseName: "app.log"))
 
-    // The sweep runs at open.
+    // The sweep is submitted at open and runs on the writer's queue, so the
+    // assertions below have to cross a settle barrier rather than assuming it
+    // finished before `acquire` returned. It deliberately does not — see
+    // `LogWriter.init`.
     let handle = try makeHandle(policy: sizePolicy())
+    handle.writerForTesting.settleForTesting()
     XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
     XCTAssertFalse(handle.logFilePaths().contains(orphan.path))
   }

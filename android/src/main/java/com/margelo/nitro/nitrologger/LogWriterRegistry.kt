@@ -187,6 +187,13 @@ class LogWriterRegistry {
     clock: (() -> Long)? = null,
     monotonic: (() -> Long)? = null,
     /**
+     * Holds the open sweep on the executor — see [LogFileWriter.open].
+     * Forwarded here for the same reason [clock] and [monotonic] are: writers
+     * are only ever built through this call, so this is the only place a test
+     * can reach it.
+     */
+    openSweepGate: (() -> Unit)? = null,
+    /**
      * Reports the canonical path, once, the instant resolution produces it.
      *
      * For the caller that has to answer "where are the artifacts" after this
@@ -290,7 +297,8 @@ class LogWriterRegistry {
           rawWrite = rawWrite,
           compressor = compressor,
           clock = clock,
-          monotonic = monotonic
+          monotonic = monotonic,
+          openSweepGate = openSweepGate
         )
         writers[resolved.canonicalPath] = writer
       }

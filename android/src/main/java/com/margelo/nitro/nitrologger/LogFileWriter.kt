@@ -64,7 +64,9 @@ class LogFileWriter internal constructor(
    * and a close that was promised 200 ms and takes an hour is an ANR. iOS keeps
    * the same split, using `DispatchTime` for deadlines and `Date` for ages.
    */
-  private val monotonic: () -> Long
+  private val monotonic: () -> Long,
+  /** See the parameter of the same name on [open]. Null in production. */
+  private val openSweepGate: (() -> Unit)? = null
 ) {
   /**
    * The raw write, injectable so short writes and hard failures can be tested
@@ -339,7 +341,20 @@ class LogFileWriter internal constructor(
       rawWrite: RawWrite? = null,
       compressor: Compressor? = null,
       clock: (() -> Long)? = null,
-      monotonic: (() -> Long)? = null
+      monotonic: (() -> Long)? = null,
+      /**
+       * Runs on the executor immediately before the open sweep, so a test can
+       * hold the sweep there and observe the writer as it is *before* retention
+       * has run.
+       *
+       * Injected here rather than set on the instance afterwards because the
+       * sweep is submitted during construction — by the time a caller has a
+       * writer to assign a property on, the sweep may already have run. A
+       * process-wide static would reach it in time and is what this replaces:
+       * these suites share a JVM, and one test's gate left standing is another
+       * test's writer wedged at open.
+       */
+      openSweepGate: (() -> Unit)? = null
     ): LogFileWriter = LogFileWriter(
       file = file,
       canonicalPath = canonicalPath,
@@ -349,7 +364,8 @@ class LogFileWriter internal constructor(
       rawWrite = rawWrite ?: defaultRawWrite,
       compressor = compressor ?: defaultCompressor,
       clock = clock ?: System::currentTimeMillis,
-      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L }
+      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L },
+      openSweepGate = openSweepGate
     ).also { it.start() }
   }
 
@@ -476,7 +492,25 @@ class LogFileWriter internal constructor(
         "could not open the log file"
       )
     }
-    onExecutor { sweepRetention() }
+    // Submitted, not awaited — and that is the change worth understanding.
+    //
+    // The executor is single-threaded, so the sweep still runs before the first
+    // append's write reaches the disk. That is the only ordering the sweep
+    // needs: it moves archives, and nothing can append to an archive it has not
+    // finished moving if the append is behind it in the same queue.
+    //
+    // What waiting cost was an unbounded cross-thread wait taken **while the
+    // registry lock is held**. Opening one file with a large backlog of
+    // archives to prune therefore stalled every other file's acquire and
+    // release, including a close with a deadline it had promised to keep.
+    //
+    // The trim above stays synchronous. It must finish before any byte is
+    // appended, it is what the exclusive lock is taken to protect, and it is
+    // bounded by the file's size rather than by the directory's history.
+    executor.execute {
+      openSweepGate?.invoke()
+      sweepRetention()
+    }
   }
 
   /**
@@ -2041,25 +2075,28 @@ class LogFileWriter internal constructor(
 
   // MARK: - Test support
 
-  private fun onExecutor(block: () -> Unit) {
-    if (Thread.currentThread() === writerThread) {
-      block()
-      return
-    }
-    val done = CountDownLatch(1)
-    executor.execute {
-      try {
-        block()
-      } finally {
-        done.countDown()
-      }
-    }
-    try {
-      done.await()
-    } catch (_: InterruptedException) {
-      Thread.currentThread().interrupt()
-    }
-  }
+  /**
+   * Runs [block] on the executor and waits for it, bounded.
+   *
+   * **Test support only** since the open sweep stopped waiting — its callers
+   * are `settleForTesting`, `closeStreamForTesting` and the three `*ForTesting`
+   * getters, and no production path waits on the executor through here any
+   * more.
+   *
+   * The bound is the whole reason this is not just `onExecutorBounded`'s job
+   * spelled out again: an unbounded wait in a test helper is a CI run that
+   * hangs rather than fails, and a hung run says less and says it far later.
+   * `MAX_DEADLINE_MS` rather than a fresh number, so there is nothing here that
+   * can drift away from the clamp everything else is measured against. Nothing
+   * asserts the value: it is a hang-guard, not a contract.
+   *
+   * Returns false if the executor never got there — including
+   * `RejectedExecutionException`, so a helper called on an already-closed
+   * writer is inert rather than explosive. Callers ignore it, because a false
+   * means the test is already failing for some other reason.
+   */
+  private fun onExecutor(block: () -> Unit): Boolean =
+    onExecutorBounded(MAX_DEADLINE_MS, block)
 
   /**
    * Runs [block] on the executor and waits at most [budgetMs] for it.

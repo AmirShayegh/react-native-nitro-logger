@@ -70,6 +70,10 @@ public final class LogWriterRegistry {
     /// Forwarded here for the same reason `steady` is: writers are only ever
     /// built through this call, so this is the only place a test can reach it.
     clock: LogWriter.Clock? = nil,
+    /// Holds the open sweep on the queue — see `LogWriter.init`. Forwarded here
+    /// for the same reason `steady` and `clock` are: writers are only ever built
+    /// through this call.
+    openSweepGate: (() -> Void)? = nil,
     /// Reports the canonical path, once, the instant resolution produces it.
     ///
     /// For the caller that has to answer "where are the artifacts" after this
@@ -144,6 +148,7 @@ public final class LogWriterRegistry {
         compressor: compressor,
         steady: steady,
         clock: clock,
+        openSweepGate: openSweepGate,
         directoryShortfall: resolved.shortfall
       )
       writers[resolved.canonicalPath] = writer

@@ -154,6 +154,14 @@ export interface FileSink extends HybridObject<{
    * intentional one, and trimming would destroy good data. Absent — the
    * default for a custom formatter that does not declare `framing: 'line'` —
    * the file is left exactly as the crash left it and recovery is reduced.
+   *
+   * Returns once the file is open and any torn trailing record has been
+   * trimmed. The retention sweep is *queued*, not awaited: a `getStatus()`
+   * taken immediately afterwards can still report the state from before the
+   * sweep ran, so a clean `degraded` here does not mean retention succeeded.
+   * The sweep runs unbounded directory I/O — listing, pruning by age, by count
+   * and by total size — and waiting for it would make every open block on a
+   * backlog the caller has no way to bound.
    */
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
 
