@@ -1998,10 +1998,12 @@ function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
  *     getLogger(); const holder = { logger: value }` is the factory case with
  *     one alias in front of it, and reading that `null` as evidence puts it
  *     straight back. So the binding decides: an initializer that is understood
- *     and is not a logger is evidence, an opaque one is not, and an identifier
- *     with nothing behind it — a parameter, an unresolved global, an import
- *     from elsewhere — is a bare name, which is what the name heuristic is
- *     for and has always answered.
+ *     and is not a logger is evidence, an opaque one is not, and a binding
+ *     with nothing behind it at all — a parameter, a `let` assigned
+ *     elsewhere — is a value from outside this scope, which is a shrug. An
+ *     unresolved global is the one identifier whose `null` still stands: it is
+ *     the value's own name at module scope, and classifying bare names is what
+ *     the heuristic is for.
  *   - a **construction** was examined by `classifyConstruction` and found not
  *     to be a logger. `classifyReceiver` calls that evidence in as many words,
  *     and `loggerClassNames` depends on it continuing to mean something.
@@ -2049,9 +2051,19 @@ function classifyCandidate(context, value, callNode, seen) {
   const def = singleDef(variable);
   if (def && def.type === 'ImportBinding') return null;
 
-  // A parameter, or a binding with no initializer to read: a bare name again.
+  // A parameter, a `let` assigned elsewhere, a catch binding: the variable
+  // exists and there is nothing behind it to read. That is a shrug, not a
+  // denial. The value arrives from outside this scope exactly as `deps.audit`
+  // does, and the name it arrives under was chosen by whoever wrote the
+  // signature — `f(value)` says nothing about what `f(Log)` passes.
+  //
+  // Which is the line between this and the unresolved global above. That one
+  // IS the value's own name, at module scope, and classifying bare names is
+  // what the heuristic is for; this one is a local label. And silencing a
+  // call the name already caught is the regression this whole walk is under
+  // instruction not to cause.
   const init = bindingInit(variable);
-  if (!init) return null;
+  if (!init) return undefined;
 
   // Otherwise the question is exactly this question, one alias in.
   return classifyCandidate(context, init, callNode, seen);

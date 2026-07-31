@@ -168,13 +168,11 @@ describe('no-dynamic-message', () => {
       'const value = analytics; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
       'const value = new Widget(); const holder = { logger: value }; holder.logger.info(`user ${id}`);',
       `import { audit } from './x'; const holder = { logger: audit }; holder.logger.info(\`user \${id}\`);`,
-      // A parameter has no initializer to see through, so it is a bare name
-      // like any other, and a bare name is what the heuristic answers. Making
-      // it opaque instead would mean doing the same for the unresolved global
-      // in `{ logger: analytics }` above, which is the fixture that fixed the
-      // ORDER of the two analyses in the first place. Where a value crosses a
-      // function boundary is where this plugin stops, deliberately.
-      'function f(value) { const holder = { logger: value }; holder.logger.info(`user ${id}`); }',
+      // A parameter is unreadable, so it hands the question back to the name —
+      // and here neither name says logger, so nothing is reported. This is the
+      // companion to the invalid `{ logger: value }` case below: what changes
+      // the answer is the field's spelling, not the parameter's.
+      'function f(value) { const holder = { audit: value }; holder.audit.info(`user ${id}`); }',
       // The same value reachable twice is still that value. `seen` is a
       // recursion stack, so the second candidate gets its own copy and its own
       // real classification — shared, the first would mark the variable and
@@ -714,6 +712,20 @@ describe('no-dynamic-message', () => {
       },
       {
         code: 'const value = deps.audit; const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A parameter is the function boundary this plugin stops at, which makes
+      // it a value from outside this scope — `deps.audit` with a different
+      // spelling, and answered the same way. `f(Log)` is the case: real, in
+      // the privacy path, and CHECKED before the container walk existed. The
+      // walk is allowed to be more precise than the name; it is not allowed to
+      // silence what the name caught.
+      {
+        code: 'function f(value) { const holder = { logger: value }; holder.logger.info(`patient ${id}`); }',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'function f(value) { const alias = value; const holder = { logger: alias }; holder.logger.info(`patient ${id}`); }',
         errors: [{ messageId: 'dynamic' }],
       },
       // Aliases that name each other are dead code, but "cannot see through
