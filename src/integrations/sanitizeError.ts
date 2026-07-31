@@ -78,14 +78,14 @@ export const MAX_STACK_CHARS = 64 * 1024;
 export const MAX_STACK_LINES = 256;
 
 /**
- * How much of a single line the frame pattern is run against.
+ * How much of a single line the frame parser is run against.
  *
- * Capping the whole stack is not enough on its own. {@link FRAME_TAIL} ends in
- * `$`, and its leading `[^\s()]+` backtracks: given one very long line with no
- * separator in it, the engine retries from every offset and the match becomes
- * quadratic. A 64 KB line took four seconds to reject — inside the crash
- * handler. The pattern is anchored at the end, so the last kilobyte decides it
- * for any line that could really be a frame.
+ * This bound predates {@link frameTail} and used to be what kept a
+ * backtracking regex from going quadratic on one long line. The parser is
+ * linear now, so the constant's remaining job is smaller but still real: the
+ * per-line `slice` below allocates whatever it is given, and the location run
+ * of a degenerate line can be arbitrarily long. The tail decides it for any
+ * line that could really be a frame, so nothing parseable is lost.
  */
 export const MAX_FRAME_LINE_CHARS = 1024;
 
@@ -221,8 +221,91 @@ function boundedFrames(value: number | undefined): number {
  * Only the position is taken. The function name is discarded with everything
  * else: it adds nothing a file and line does not already give, and it is one
  * more string from application code that nobody has vetted.
+ *
+ * This grammar used to be the regex `/([^\s()]+):(\d+):(\d+)\)?$/`, and the
+ * reason it no longer is is the rejection path. `[^\s()]` overlaps `\d` and
+ * the pattern is anchored at the end but not the start, so on a line that
+ * does NOT match, the engine retries from every offset and each retry
+ * backtracks the run it consumed. {@link MAX_FRAME_LINE_CHARS} bounded that
+ * without closing it: 256 colon-dense 1024-char lines measured 225 ms of
+ * pure rejection on a desktop — several times that on a phone — inside the
+ * fatal-error handler, ahead of the flush that handler exists to reach. And
+ * `stack` is a property of an object someone threw, so the shape is chosen
+ * by the thrower.
+ *
+ * So: the same grammar, parsed backward from the end in one pass. The
+ * equivalence is exact, because the regex's match was already uniquely
+ * determined from its `$` anchor — an optional `)`; then the maximal
+ * trailing digit run as the column (greedy `[^\s()]+` concedes the minimum,
+ * making the `:digits:digits` split the rightmost one); a `:`; the maximal
+ * digit run before it as the line; a `:`; then the location, which extends
+ * left over `[^\s()]` maximally because the leftmost match start is exactly
+ * the start of that run. The differential fuzz test in sanitizeError.test.ts
+ * holds this parser equal to the regex over random and adversarial inputs —
+ * the regex lives on there as the executable specification.
  */
-const FRAME_TAIL = /([^\s()]+):(\d+):(\d+)\)?$/;
+function frameTail(
+  line: string
+): { location: string; lineNumber: string; column: string } | null {
+  let i = line.length - 1;
+
+  // `\)?` — at most one closing paren at the very end. Unconditional when
+  // present: the regex could never match with the `)` unconsumed, because a
+  // digit would then have to sit where the `)` is.
+  if (i >= 0 && line.charCodeAt(i) === 0x29) i -= 1;
+
+  const columnEnd = i;
+  while (i >= 0 && isAsciiDigit(line.charCodeAt(i))) i -= 1;
+  if (i === columnEnd) return null;
+  const column = line.slice(i + 1, columnEnd + 1);
+
+  if (i < 0 || line.charCodeAt(i) !== 0x3a /* ':' */) return null;
+  i -= 1;
+
+  const lineEnd = i;
+  while (i >= 0 && isAsciiDigit(line.charCodeAt(i))) i -= 1;
+  if (i === lineEnd) return null;
+  const lineNumber = line.slice(i + 1, lineEnd + 1);
+
+  if (i < 0 || line.charCodeAt(i) !== 0x3a /* ':' */) return null;
+  i -= 1;
+
+  const locationEnd = i;
+  while (i >= 0 && !isFrameBoundary(line.charCodeAt(i))) i -= 1;
+  if (i === locationEnd) return null;
+  const location = line.slice(i + 1, locationEnd + 1);
+
+  return { location, lineNumber, column };
+}
+
+function isAsciiDigit(code: number): boolean {
+  return code >= 0x30 && code <= 0x39;
+}
+
+/**
+ * Exactly the characters the regex's `[^\s()]` excluded: `(`, `)`, and
+ * ECMAScript's `\s` — the WhiteSpace and LineTerminator productions. The
+ * list is what `\s` matches per ES2023 §22.2.2.9, written out because the
+ * whole point of this parser is to run no regex; the differential fuzz test
+ * generates from an alphabet that includes every one of these, so a missed
+ * or extra member fails there rather than lurking.
+ */
+function isFrameBoundary(code: number): boolean {
+  if (code === 0x28 || code === 0x29) return true; // ( )
+  if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) return true; // space, TAB LF VT FF CR
+  if (code < 0xa0) return false; // the rest of ASCII: never whitespace
+  return (
+    code === 0xa0 || // NBSP
+    code === 0x1680 || // OGHAM SPACE MARK
+    (code >= 0x2000 && code <= 0x200a) || // EN QUAD .. HAIR SPACE
+    code === 0x2028 || // LINE SEPARATOR
+    code === 0x2029 || // PARAGRAPH SEPARATOR
+    code === 0x202f || // NARROW NO-BREAK SPACE
+    code === 0x205f || // MEDIUM MATHEMATICAL SPACE
+    code === 0x3000 || // IDEOGRAPHIC SPACE
+    code === 0xfeff // ZERO WIDTH NO-BREAK SPACE
+  );
+}
 
 /**
  * Walks the stack a line at a time within a fixed budget.
@@ -261,16 +344,17 @@ function parseFrames(
     start = end + 1;
     lines += 1;
 
-    const match = FRAME_TAIL.exec(line);
+    const tail = frameTail(line);
     // A line that does not parse is discarded rather than guessed at. The
     // first line of a V8 stack is `Name: message`, which is exactly the string
     // this module exists to keep out.
-    if (!match) continue;
+    if (!tail) continue;
 
-    const [, location, lineNumber, column] = match;
-    const file = basename(location!);
+    const file = basename(tail.location);
     frames.push(
-      bundleNames.has(file) ? `${file}:${lineNumber}:${column}` : REDACTED_FRAME
+      bundleNames.has(file)
+        ? `${file}:${tail.lineNumber}:${tail.column}`
+        : REDACTED_FRAME
     );
   }
 

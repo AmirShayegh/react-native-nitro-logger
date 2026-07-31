@@ -357,3 +357,158 @@ describe('sanitizeError — the dev reveal and its limits', () => {
     expect(JSON.stringify(result.frames)).not.toContain(SENTINEL);
   });
 });
+
+describe('sanitizeError — the frame-tail parser vs its regex specification', () => {
+  /**
+   * The regex the parser replaced, kept here as the executable specification.
+   * The production code must never run it again — its rejection path is
+   * quadratic, which is the whole reason it was replaced — but as an oracle
+   * over bounded inputs it is exactly the semantics the parser must preserve.
+   */
+  const SPECIFICATION = /([^\s()]+):(\d+):(\d+)\)?$/;
+
+  /** The same basename contract sanitizeError applies, restated for the oracle. */
+  function specBasename(location: string): string {
+    const cut = Math.max(location.lastIndexOf('/'), location.lastIndexOf('\\'));
+    let name = cut >= 0 ? location.slice(cut + 1) : location;
+    const query = name.search(/[?#]/);
+    if (query >= 0) name = name.slice(0, query);
+    return name;
+  }
+
+  /** What the specification says a one-line stack must produce. */
+  function specFrame(
+    rawLine: string
+  ): { file: string; lineNumber: string; column: string } | null {
+    const match = SPECIFICATION.exec(rawLine.trim());
+    if (!match) return null;
+    const [, location, lineNumber, column] = match;
+    return {
+      file: specBasename(location!),
+      lineNumber: lineNumber!,
+      column: column!,
+    };
+  }
+
+  /** Deterministic PRNG (mulberry32) so a failure names a reproducible seed. */
+  /* eslint-disable no-bitwise -- mulberry32 is defined by its bit mixing */
+  function prng(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  /* eslint-enable no-bitwise */
+
+  // Deliberately adversarial: digits and colons (the overlap that made the
+  // regex quadratic), both parens, every ECMAScript whitespace the class
+  // excludes, path/URL punctuation the basename step cares about, and a
+  // surrogate pair to pin code-unit semantics.
+  const ALPHABET = [
+    ...'0123456789::::()ab/\\.?#@-_',
+    ' ',
+    '\t',
+    ' ',
+    ' ',
+    ' ',
+    ' ',
+    ' ',
+    ' ',
+    ' ',
+    ' ',
+    '　',
+    '﻿',
+    '😀',
+  ];
+
+  const FIXED_CASES = [
+    'at fn (/path/index.bundle:1:2)',
+    'at /path/index.bundle:1:2',
+    'fn@http://localhost:8081/index.bundle?platform=ios:1:2',
+    'at fn (address at /path/index.android.bundle:1:2)',
+    'a:1:2:3:4', // multi-colon: location a:1:2, line 3, column 4
+    'a:12:34',
+    'a::1:2', // location may end in a colon
+    ':1:2', // empty location: no frame
+    '12:34', // one colon-group: no frame
+    'foo:1:2))', // only one trailing paren is grammar
+    'foo:1:2)',
+    'a:12b:34', // non-digit in the line-number position: no frame
+    '(:1:2', // paren just before an empty location
+    'b(foo:3:4', // location stops at the paren
+    'Error: no chart for MRN-4417293', // the V8 first line this module drops
+    '',
+    ')',
+    ':::',
+    '1:1:1:', // trailing colon: no frame
+  ];
+
+  test('agrees with the specification on fixed and fuzzed lines (seed 0x5eed)', () => {
+    const random = prng(0x5eed);
+    const lines = [...FIXED_CASES];
+    for (let i = 0; i < 1500; i += 1) {
+      const length = 1 + Math.floor(random() * 40);
+      let line = '';
+      for (let j = 0; j < length; j += 1) {
+        line += ALPHABET[Math.floor(random() * ALPHABET.length)];
+      }
+      lines.push(line);
+    }
+
+    for (const line of lines) {
+      const expected = specFrame(line);
+      const error = new Error('x');
+      // A single-line stack routes the line through the real parser.
+      Object.defineProperty(error, 'stack', { value: line });
+
+      if (expected === null) {
+        const result = sanitizeError(error);
+        expect({ line, frames: result.frames }).toEqual({ line, frames: [] });
+      } else {
+        // Naming the expected file as a bundle lets the parsed captures reach
+        // the output verbatim, so all three groups are compared — through the
+        // public surface, not a test-only export.
+        const result = sanitizeError(error, { bundleNames: [expected.file] });
+        expect({ line, frames: result.frames }).toEqual({
+          line,
+          frames: [
+            `${expected.file}:${expected.lineNumber}:${expected.column}`,
+          ],
+        });
+      }
+    }
+  });
+
+  // The shape the regex was slow on: many colon-dense lines, each of which
+  // fails to parse only at its very last character. 256 lines × 1024 chars of
+  // rejection measured 225 ms under the regex on a desktop — several times
+  // that on a phone, inside the fatal-error handler. The parser does the same
+  // rejection in one backward step per line. The 100 ms budget is ~50× the
+  // parser's cost and half the regex's measured floor, so a reintroduced
+  // backtracking implementation fails here on any hardware.
+  test('a colon-dense stack is rejected in linear time', () => {
+    const error = new Error('x');
+    Object.defineProperty(error, 'stack', {
+      // Each full line ends in ':', so no full line parses. One line does
+      // parse anyway: the 64 KiB MAX_STACK_CHARS slice cuts the 64th line
+      // mid-"1:" run, and the sliced tail ends in a digit — `...1:1:1` is a
+      // well-formed location:line:column under the specification regex and
+      // the parser alike (column 1, line 1, the rest a location that is not
+      // a bundle name, hence redacted). That frame is asserted, not worked
+      // around: it is the equivalence holding on a truncation artifact.
+      value: ('1:'.repeat(512) + '\n').repeat(300),
+    });
+
+    const started = Date.now();
+    const result = sanitizeError(error);
+
+    expect(result.frames).toEqual([REDACTED_FRAME]);
+    expect(result.frameCount).toBe(1);
+    expect(result.framesTruncated).toBe(true);
+    expect(Date.now() - started).toBeLessThan(100);
+  });
+});
