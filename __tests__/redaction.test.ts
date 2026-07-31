@@ -67,6 +67,23 @@ describe('privacy default', () => {
     expect(md(dest)).toEqual({ state: 'running', patientRef: '<private>' });
   });
 
+  /**
+   * The twin of the test above, and the reason it is worth having.
+   *
+   * On its own, "redacts in production" is satisfied by a `priv()` that
+   * redacts always — including on the developer's machine, where seeing the
+   * value is the entire point of marking it rather than omitting it. A
+   * library that quietly did that would push developers back to logging the
+   * bare value, which is the failure the marker exists to prevent. Both
+   * halves, or the pair proves only that nothing leaks.
+   */
+  test('and reveals under that same default in a dev build', () => {
+    setDev(true);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { state: 'running', patientRef: priv('abc') });
+    expect(md(dest)).toEqual({ state: 'running', patientRef: 'abc' });
+  });
+
   test('a forgotten wrapper hides data rather than leaking it', () => {
     setDev(false);
     const { logger, dest } = makeLogger();

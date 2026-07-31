@@ -8,6 +8,8 @@ import {
   MAX_STACK_LINES,
 } from '../src/integrations/sanitizeError';
 
+declare const globalThis: { __DEV__?: boolean };
+
 /**
  * The sentinel these tests hunt for. If it ever appears in a sanitised result,
  * something in the error survived that should not have.
@@ -303,5 +305,55 @@ describe('sanitizeError — hostile input', () => {
       1
     );
     expect(sanitizeError(error, { maxFrames: -1 }).frames).toHaveLength(1);
+  });
+});
+
+/**
+ * The dev reveal, and what it deliberately does not extend to.
+ *
+ * `never renders the real message outside a dev build` is one half of a pair
+ * and is satisfied on its own by a sanitiser that redacts unconditionally.
+ * That sanitiser would be safe and useless: the reason a real message is
+ * shown on a developer's machine is that an error report reading
+ * `<redacted>` with no way to get at the original sends people back to
+ * `console.log(error.message)` — the exact habit this module exists to make
+ * unnecessary.
+ *
+ * The third case is the bound on the reveal. `__DEV__` unlocks the *message*
+ * and nothing else, so a frame from an unrecognised bundle stays a token even
+ * in dev — a stack path can carry a username, a device name, or a directory
+ * tree that says who somebody is.
+ */
+describe('sanitizeError — the dev reveal and its limits', () => {
+  const originalDev = globalThis.__DEV__;
+
+  afterEach(() => {
+    if (originalDev === undefined) delete globalThis.__DEV__;
+    else globalThis.__DEV__ = originalDev;
+  });
+
+  test('a dev build renders the real message', () => {
+    globalThis.__DEV__ = true;
+    const result = sanitizeError(new Error(`no chart for ${SENTINEL}`));
+    expect(result.message).toBe(`no chart for ${SENTINEL}`);
+  });
+
+  test('and a release build redacts the very same error', () => {
+    globalThis.__DEV__ = false;
+    const result = sanitizeError(new Error(`no chart for ${SENTINEL}`));
+    expect(result.message).toBe(REDACTED_MESSAGE);
+  });
+
+  test('the reveal reaches the message and stops there', () => {
+    globalThis.__DEV__ = true;
+    const error = new Error('boom');
+    error.stack = `Error: boom\n    at f (/Users/${SENTINEL}/app/secret.js:1:1)`;
+
+    const result = sanitizeError(error);
+
+    expect(result.message).toBe('boom');
+    // The path is not part of the reveal, in dev or anywhere else.
+    expect(result.frames).toEqual([REDACTED_FRAME]);
+    expect(JSON.stringify(result.frames)).not.toContain(SENTINEL);
   });
 });
