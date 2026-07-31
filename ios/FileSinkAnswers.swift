@@ -130,7 +130,7 @@ final class FileSinkAnswers {
   /// An abrupt runtime teardown never runs JavaScript, so a JS `dispose()` is
   /// not a guarantee — but that deinit is. Releasing here hands the descriptor
   /// and the registry slot back even when nothing on the JS side got to run.
-  func dispose() {
+  func releaseHandle() {
     // Zero deadline: a teardown deinit must not wait on a wedged disk.
     _ = lifecycle.beginDispose().handle?.close(deadlineMs: 0)
   }

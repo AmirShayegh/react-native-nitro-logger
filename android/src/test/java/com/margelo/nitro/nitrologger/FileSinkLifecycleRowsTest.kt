@@ -27,7 +27,7 @@ import java.io.File
  * That the `Wire*`-to-nitrogen copy in `HybridFileSink` is faithful. That class
  * extends a nitrogen-generated base and still cannot be constructed off a
  * device. What it now contains is a field-for-field copy and nothing else —
- * `PackageManifestTests` pins that with a line ceiling and a ban on
+ * `adapterThinness.test.js` pins that with a line ceiling and a ban on
  * `lifecycle.` calls — and the copy itself is covered end to end only by the
  * min-rn smoke jobs. A real reduction of the gap, not its elimination.
  */

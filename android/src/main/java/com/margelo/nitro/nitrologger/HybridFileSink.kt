@@ -20,8 +20,8 @@ import com.margelo.nitro.NitroModules
  * release was caught by review rather than by a test for exactly that reason.
  *
  * Anything that grows logic in this file has been put in the wrong place.
- * `PackageManifestTests` enforces that with a line ceiling and a ban on
- * `lifecycle.` calls here.
+ * `__tests__/adapterThinness.test.js` enforces that with a line ceiling and
+ * a ban on `lifecycle.` calls here.
  */
 @DoNotStrip
 class HybridFileSink : HybridFileSinkSpec() {

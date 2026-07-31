@@ -21,8 +21,8 @@ import NitroModules
 /// test for exactly that reason.
 ///
 /// Anything that grows logic in this file has been put in the wrong place.
-/// `PackageManifestTests` enforces that with a line ceiling and a ban on
-/// `lifecycle.` calls here.
+/// `__tests__/adapterThinness.test.js` enforces that with a line ceiling and
+/// a ban on `lifecycle.` calls here.
 final class HybridFileSink: HybridFileSinkSpec {
   private let answers = FileSinkAnswers()
 
@@ -31,7 +31,7 @@ final class HybridFileSink: HybridFileSinkSpec {
   /// An abrupt runtime teardown never runs JavaScript, so a JS `dispose()` is
   /// not a guarantee — but this deinit is.
   deinit {
-    answers.dispose()
+    answers.releaseHandle()
   }
 
   var defaultLogDirectory: String {

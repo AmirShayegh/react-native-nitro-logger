@@ -19,7 +19,7 @@ import XCTest
 /// That the `Wire*`-to-nitrogen copy in `HybridFileSink` is faithful. Every
 /// nitrogen value type is a C++-backed typealias behind `import NitroModules`,
 /// so that file still cannot join this target. What it now contains is a
-/// field-for-field copy and nothing else — `PackageManifestTests` pins that
+/// field-for-field copy and nothing else — `adapterThinness.test.js` pins that
 /// with a line ceiling and a ban on `lifecycle.` calls — and the copy itself is
 /// covered end to end only by the min-rn smoke jobs. A real reduction of the
 /// gap, not its elimination.

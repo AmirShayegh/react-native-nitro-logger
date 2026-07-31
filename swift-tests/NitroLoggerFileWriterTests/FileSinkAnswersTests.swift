@@ -62,7 +62,7 @@ final class FileSinkAnswersTests: LogWriterTestCase {
 
   func testADisposedSinkRefusesToOpen() throws {
     let sink = answers()
-    sink.dispose()
+    sink.releaseHandle()
 
     XCTAssertThrowsError(
       try sink.open(path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
@@ -251,10 +251,10 @@ final class FileSinkAnswersTests: LogWriterTestCase {
       WireSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0))
   }
 
-  func testDisposeReleasesTheHandleAndTheRegistrySlot() throws {
+  func testReleaseHandleFreesTheRegistrySlotAndIsTerminal() throws {
     let sink = answers()
     try sink.open(path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
-    sink.dispose()
+    sink.releaseHandle()
 
     // The slot is free: another sink can take the same path, which it could not
     // do while the first still held it with a different configuration.
