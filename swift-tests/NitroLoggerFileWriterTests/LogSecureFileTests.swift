@@ -66,7 +66,20 @@ final class LogSecureFileTests: LogWriterTestCase {
 
   /// The same directory, reached through the writer: the loose mode surfaces
   /// as a `protection` degradation rather than being silently corrected.
+  ///
+  /// With a control, because `.protection` is a folded bit with twelve
+  /// contributors — the directory, the log file, the sidecar, every archive
+  /// and every staging file. "Some route set it" is not the claim; "this
+  /// directory set it" is, and only a writer over a directory this test did
+  /// not loosen can tell those apart.
   func testALooseHostDirectoryDegradesTheWriter() throws {
+    let control = try makeHandle(at: root.appendingPathComponent("control/app.log"))
+    XCTAssertEqual(
+      control.status().degraded & LogDegradation.protection.rawValue, 0,
+      "a directory the writer made itself is not a protection shortfall, "
+        + "so the assertion below would be satisfied by something else")
+    _ = control.close(deadlineMs: 1000)
+
     try FileManager.default.createDirectory(
       at: logsDirectory, withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o777])

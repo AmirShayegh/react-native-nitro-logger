@@ -419,6 +419,27 @@ class LogFileWriterTest {
   // A bigger archive beats a lost one.
   @Test
   fun `a failed compression keeps the plaintext archive and records it`() {
+    // The control first, and it is what makes the last line mean anything:
+    // `GZIP` is set from eight places in the compression path, so "the bit is
+    // up" is a claim about the whole path. The same policy with the real
+    // compressor has to leave it down, or the injected failure is not what
+    // this test is observing.
+    val control = writer(
+      name = "control.log",
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, compressArchives = true)
+    )
+    repeat(2) {
+      control.write("0123456789012345\n")
+      now.addAndGet(1_000)
+    }
+    control.flush(1, 1000.0)
+    control.settleForTesting()
+    assertEquals(
+      "compression succeeds here, so the assertion below distinguishes something",
+      0,
+      control.status(1).degraded and LogDegradation.GZIP
+    )
+
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, compressArchives = true),
       compressor = { _, _ -> false }
@@ -1511,6 +1532,20 @@ class LogFileWriterTest {
    */
   @Test
   fun `the writer reports rather than repairs a directory it cannot secure`() {
+    // With a control, because `PROTECTION` is a folded bit with eleven
+    // contributors — the directory, the log file, the sidecar, every archive
+    // and every staging file. "Some route set it" is not the claim; "the
+    // refused `restrictToOwner` set it" is, and only a writer on the
+    // unmodified platform can tell those apart.
+    val control = writer(name = "control.log")
+    control.write("x\n")
+    control.flush(1, 500.0)
+    assertEquals(
+      "nothing is wrong here, so the assertion below distinguishes something",
+      0,
+      control.status(1).degraded and LogDegradation.PROTECTION
+    )
+
     val w = writer(platform = object : PlatformIo by PlatformIo.Jvm {
       override fun restrictToOwner(file: File, isDirectory: Boolean) = false
     })

@@ -336,7 +336,24 @@ final class LogRotationTests: LogWriterTestCase {
   }
 
   /// A bigger archive beats a lost one.
+  ///
+  /// The control comes first, and it is what makes the last line mean
+  /// anything: `.gzip` is set from eleven places in the compression path, so
+  /// "the bit is up" is a claim about the whole path. The same policy with the
+  /// real compressor has to leave it down, or the injected failure is not what
+  /// this test is observing.
   func testGzipFailureKeepsThePlaintextArchiveAndReportsDegradation() throws {
+    let control = try makeHandle(
+      at: root.appendingPathComponent("control/app.log"),
+      policy: sizePolicy(bytes: 64, compress: true)
+    )
+    write(control, record)
+    write(control, record)
+    XCTAssertEqual(
+      control.status().degraded & LogDegradation.gzip.rawValue, 0,
+      "compression succeeds here, so the assertion below distinguishes something")
+    _ = control.close(deadlineMs: 1000)
+
     let handle = try makeHandle(
       policy: sizePolicy(bytes: 64, compress: true),
       compressor: { _, _ in false }
