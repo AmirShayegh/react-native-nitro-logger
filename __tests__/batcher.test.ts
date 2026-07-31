@@ -469,8 +469,17 @@ describe('Batcher — fencing', () => {
     batcher.add('a');
     batcher.flush(1000);
 
+    const before = batcher.unreported();
     batcher.add('b');
     expect(batcher.bufferedBytes()).toBe(0);
+
+    // Both halves of the title, and the second is the one an empty buffer
+    // cannot show: a record thrown away without being counted leaves
+    // `bufferedBytes` at zero exactly as a counted one does. What separates
+    // silent loss from reported loss is this delta, so it is what to assert.
+    const after = batcher.unreported();
+    expect(after.entries - before.entries).toBe(1);
+    expect(after.bytes - before.bytes).toBe(2); // 'b' and its newline
   });
 });
 
@@ -1086,5 +1095,122 @@ describe('Batcher — hostile sink counters', () => {
     // and every reported number NaN — including the one an app alerts on.
     expect(batcher.unreported()).toEqual({ entries: 0, bytes: 0 });
     expect(batcher.degradation()).toBe(0);
+  });
+});
+
+/**
+ * Every threshold in this class, met exactly.
+ *
+ * The tests above approach each cap from a comfortable distance — 84 against
+ * 64, 300 against 256 — which proves the comparison exists and says nothing
+ * about which side of it the boundary value falls on. `>=` and `>` differ on
+ * one input each, and that input is not exotic: a caller sizing records to a
+ * documented limit, or a sink whose queue lands precisely on the watermark,
+ * produces it on an ordinary day. Each case below is paired with its
+ * neighbour so the assertion pins a boundary rather than a direction.
+ */
+describe('Batcher — thresholds met exactly', () => {
+  test('the buffer fills to its entry cap and refuses the next record', () => {
+    const { batcher } = build({ maxPendingEntries: 3, batchBytes: 1_000_000 });
+
+    batcher.add('a');
+    batcher.add('b');
+    batcher.add('c');
+    expect(batcher.bufferedBytes()).toBe(6); // 3 × (1 + newline)
+    expect(batcher.unreported().entries).toBe(0);
+
+    batcher.add('d');
+    expect(batcher.bufferedBytes()).toBe(6);
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 2 });
+  });
+
+  test('the byte cap is exclusive, so a record filling it exactly is kept', () => {
+    // The twin of the entry cap and deliberately the other comparison: an
+    // entry cap counts what is already there, a byte cap counts what would be
+    // there afterwards. Filling a buffer to its stated size is not overflowing
+    // it, and dropping that record would make the documented capacity a lie.
+    const { batcher } = build({ maxPendingBytes: 21, batchBytes: 1_000_000 });
+
+    batcher.add(record(20)); // exactly 21 bytes with its newline
+    expect(batcher.bufferedBytes()).toBe(21);
+    expect(batcher.unreported().entries).toBe(0);
+
+    batcher.add('x'); // 2 more would be 23
+    expect(batcher.bufferedBytes()).toBe(21);
+    expect(batcher.unreported().entries).toBe(1);
+  });
+
+  test('a buffer landing exactly on batchBytes pushes without waiting', () => {
+    const { batcher, sink } = build({ batchBytes: 21 });
+
+    batcher.add(record(20)); // 21 bytes: the threshold, met not passed
+    expect(sink.appendCalls).toHaveLength(1);
+  });
+
+  test('and one byte short of it waits for the timer', () => {
+    const { batcher, sink } = build({ batchBytes: 22 });
+
+    batcher.add(record(20)); // 21 bytes
+    expect(sink.appendCalls).toHaveLength(0);
+    expect(batcher.bufferedBytes()).toBe(21);
+  });
+
+  test('hasRoom turns false at the entry cap, not one past it', () => {
+    const { batcher } = build({ maxPendingEntries: 2, batchBytes: 1_000_000 });
+
+    batcher.add('a');
+    expect(batcher.hasRoom()).toBe(true);
+
+    batcher.add('b'); // now at the cap
+    expect(batcher.hasRoom()).toBe(false);
+  });
+
+  test('hasRoom turns false once the buffer is at the byte cap', () => {
+    // The buffer has to actually reach the cap for this to say anything: a
+    // record refused by `add` leaves the buffer *below* the cap, where `<`
+    // and `<=` agree and the assertion is worth nothing. So the last record
+    // here is one `add` accepts, sized to land on the cap exactly.
+    const { batcher } = build({ maxPendingBytes: 21, batchBytes: 1_000_000 });
+
+    batcher.add(record(18)); // 19 of 21
+    expect(batcher.hasRoom()).toBe(true);
+
+    batcher.add('x'); // 2 more: exactly 21, accepted
+    expect(batcher.bufferedBytes()).toBe(21);
+    // A record costs at least its newline, so a buffer sitting on its byte cap
+    // has room for nothing — the one input where this differs from `<=`.
+    expect(batcher.hasRoom()).toBe(false);
+  });
+
+  test('the queue pauses at the watermark rather than one byte past it', () => {
+    const { batcher, sink, writer } = build({
+      batchBytes: 8,
+      watermarkBytes: 21,
+    });
+    writer.capacityBytes = 1000;
+
+    batcher.add(record(20)); // one 21-byte batch: the queue lands on 21
+    expect(writer.queuedBytes).toBe(21);
+    expect(sink.appendCalls).toHaveLength(1);
+
+    // Paused at exactly the watermark: the next record buffers instead of
+    // pushing, though it is well over `batchBytes` on its own.
+    batcher.add(record(20));
+    expect(sink.appendCalls).toHaveLength(1);
+    expect(batcher.bufferedBytes()).toBe(21);
+  });
+
+  test('and one byte above the queue it keeps pushing', () => {
+    const { batcher, sink, writer } = build({
+      batchBytes: 8,
+      watermarkBytes: 22,
+    });
+    writer.capacityBytes = 1000;
+
+    batcher.add(record(20));
+    expect(writer.queuedBytes).toBe(21); // one short of the watermark
+
+    batcher.add(record(20));
+    expect(sink.appendCalls).toHaveLength(2);
   });
 });

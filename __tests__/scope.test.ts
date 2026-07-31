@@ -28,6 +28,45 @@ describe('ScopedLogger', () => {
     expect(dest.entries[0]!.correlation).toMatch(/^[a-z0-9]{4,}$/);
   });
 
+  /**
+   * A generated correlation belongs to one unit of work, not to the logger.
+   *
+   * The shape assertion above holds just as well for a logger that generated
+   * one ID and handed the same one to every scope for the rest of the
+   * process — and that logger is useless in the exact situation correlation
+   * exists for, which is telling two concurrent units of work apart in a file
+   * where their lines are interleaved. `newCorrelationId`'s own suite proves
+   * successive *draws* differ; what is unpinned until here is that
+   * `Logger.scoped` takes a fresh draw per scope rather than reusing one.
+   *
+   * This is deliberately the opposite of what a *child* scope does — a child
+   * inherits, because it is the same unit of work seen closer up. Both rules
+   * are pinned; they are not in tension.
+   *
+   * Driven by a counter rather than the real generator, for the reason
+   * `correlation.test.ts` gives at length: twenty real IDs are *probably*
+   * distinct, and a test asserting "probably" is one that fails in CI one
+   * morning for no reason. What is worth pinning is the policy — one draw per
+   * scope — which a deterministic source pins exactly.
+   */
+  test('each generated correlation is its own, never the logger reusing one', () => {
+    const { logger, dest } = makeLogger();
+    let drawn = 0;
+    const draw = jest
+      .spyOn(logger, 'newCorrelationId')
+      .mockImplementation(() => `id-${drawn++}`);
+
+    for (let i = 0; i < 20; i += 1) logger.scoped().info(`unit ${i}`);
+
+    // Both halves: a logger that drew once and reused it fails the count, and
+    // one that drew twenty times but tagged every message with the last fails
+    // the sequence.
+    expect(draw).toHaveBeenCalledTimes(20);
+    expect(dest.entries.map((e) => e.correlation)).toEqual(
+      Array.from({ length: 20 }, (_, i) => `id-${i}`)
+    );
+  });
+
   test('scope metadata rides every message; call-site wins on collision', () => {
     const { logger, dest } = makeLogger();
     const session = logger.scoped('s-1', undefined, {

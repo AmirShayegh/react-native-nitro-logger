@@ -1909,3 +1909,117 @@ describe('FileDestination — what the formatter is asked to render', () => {
     expect(destination.unreportedLoss().entries).toBe(2);
   });
 });
+
+/**
+ * The per-entry limit, approached from both sides of the exact value.
+ *
+ * Every other test in this file clears or overruns `maxEntryBytes` by a wide
+ * margin, which is enough to prove the two branches exist and nothing about
+ * where the line between them falls. `<=` and `<` differ on exactly one
+ * input, and it is the input a caller sizing records to a documented cap
+ * produces deliberately — so an off-by-one here replaces the record a caller
+ * built to fit with a notice saying it did not.
+ */
+describe('FileDestination — the exact per-entry limit', () => {
+  /** A formatter whose output size is the message size, so the cap is exact. */
+  const identity: LogFormatter = {
+    framing: 'line',
+    format: (e) => e.message,
+  };
+
+  // Wide enough that the 35-byte oversize notice fits under it too, so the
+  // two cases below differ in the record's size and in nothing else.
+  const budget = 40;
+
+  test('a record of exactly maxEntryBytes is written unchanged', () => {
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: budget,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(budget) }));
+    destination.flush(1000);
+
+    expect(writer.lines()).toEqual(['x'.repeat(budget)]);
+    expect(destination.unreportedLoss().entries).toBe(0);
+  });
+
+  test('and one byte more is replaced by the notice', () => {
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: budget,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(budget + 1) }));
+    destination.flush(1000);
+
+    expect(writer.lines()[0]).toBe('a log entry was too large to record');
+  });
+
+  /**
+   * The notice is held to the same limit, and that limit is inclusive too.
+   *
+   * `boundedNotice` has its own `<=` against the same field, and the one
+   * input that separates it from `<` is a notice that is exactly the size of
+   * the budget. Tightening it there is worse than tightening the record path:
+   * the entry is already gone, and the line that would have said so does not
+   * get written either.
+   */
+  test('a notice of exactly maxEntryBytes still fits', () => {
+    // 35 is the length of the oversize notice under this formatter — the
+    // budget is set to exactly what the notice costs and nothing more.
+    const notice = 'a log entry was too large to record';
+    expect(utf8Length(notice)).toBe(35);
+
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: 35,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(36) }));
+    destination.flush(1000);
+
+    expect(writer.lines()[0]).toBe(notice);
+  });
+});
+
+/**
+ * A count that comes back across the bridge is a number in name only.
+ *
+ * `deletedCount` is reported by native code and can arrive negative,
+ * fractional or not a number at all — from an old binary, a partial failure
+ * counted the wrong way, or a marshalling bug. It is handed to a caller who
+ * is usually purging for compliance and usually writing the number down, so
+ * "−1 files deleted" is worse than useless. The positive pass-through is
+ * pinned above; these are the clauses that have to reject.
+ */
+describe('FileDestination — a hostile deletedCount', () => {
+  test('a negative count is floored at zero, not passed on', () => {
+    const { destination, sink } = build();
+    sink.hostileClear = { durable: true, rebound: true, deletedCount: -5 };
+
+    expect(destination.purge(1000).deletedCount).toBe(0);
+  });
+
+  test('a fractional count is floored, never rounded up', () => {
+    const { destination, sink } = build();
+    sink.hostileClear = { durable: true, rebound: true, deletedCount: 3.9 };
+
+    // Three files were deleted and a fourth was not. Rounding invents it.
+    expect(destination.purge(1000).deletedCount).toBe(3);
+  });
+
+  test.each([
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+  ])('a %s count reports zero rather than propagating', (_label, value) => {
+    const { destination, sink } = build();
+    sink.hostileClear = {
+      durable: true,
+      rebound: true,
+      deletedCount: value,
+    };
+
+    expect(destination.purge(1000).deletedCount).toBe(0);
+  });
+});
