@@ -13,6 +13,7 @@ import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -67,13 +68,15 @@ class LogWriterRegistryTest {
     policy: LogRotationPolicy = LogRotationPolicy.of(),
     lineFramed: Boolean = true,
     owner: Long? = null,
-    rawWrite: LogFileWriter.RawWrite? = null
+    rawWrite: LogFileWriter.RawWrite? = null,
+    compressor: LogFileWriter.Compressor? = null
   ): LogFileHandle = registry.acquire(
     path = path,
     policy = policy,
     lineFramed = lineFramed,
     platform = PlatformIo.Jvm,
     rawWrite = rawWrite,
+    compressor = compressor,
     clock = { now },
     owner = owner
   ).also { handles.add(it) }
@@ -738,5 +741,121 @@ class LogWriterRegistryTest {
 
     assertEquals(1, registry.liveWriterCountForTesting)
     assertTrue(unowned.appendBatch("still here\n", 1).accepted)
+  }
+
+  // MARK: - Collect, at the handle
+
+  /**
+   * The per-handle flag: a second collect on the SAME handle is refused locally,
+   * without touching the writer.
+   *
+   * The observable is time, not the outcome. Both a refusal here and a refusal
+   * at the writer's own gate return the same `NOTHING`; what separates them is
+   * that this one costs nothing. Without the flag the second call would flush,
+   * then sit on the writer's gate for the whole five seconds it was given before
+   * reporting the same thing.
+   */
+  @Test
+  fun `a second collect on one handle is refused`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val handle = acquire(
+      File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0),
+      compressor = LogFileWriter.Compressor { source, destination ->
+        inCompressor.countDown()
+        held.await()
+        source.copyTo(destination, overwrite = true)
+        true
+      }
+    )
+    assertTrue(handle.appendBatch("precious\n", 1).accepted)
+    handle.flush(1000.0)
+
+    val first = AtomicReference<LogCollectOutcome>()
+    val firstThread = Thread { first.set(handle.collectLogs(10_000.0, 10_000_000.0)) }
+    try {
+      firstThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      // Insurance against the mutation: if the bound under test were removed the
+      // test thread would block before reaching its own countDown, and the suite
+      // would hang instead of failing. Fires long after a passing run is done.
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      val second = handle.collectLogs(5000.0, 10_000_000.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertFalse(second.complete)
+      assertEquals("", second.path)
+      assertTrue(
+        "the second collect on this handle spent its deadline discovering it had lost",
+        elapsedMs < 1_000
+      )
+    } finally {
+      held.countDown()
+    }
+
+    firstThread.join(10_000)
+    assertTrue(first.get().complete)
+  }
+
+  /**
+   * The deliberate asymmetry: [LogFileHandle.close] waits out a purge and does
+   * **not** wait out a collect.
+   *
+   * A purge is waited for because tearing the writer down mid-deletion leaves
+   * the fresh file missing. A collect only reads logs and writes its own
+   * scratch, and being abandoned is already a first-class, tested outcome — so a
+   * third wait on close's budget would buy nothing and cost teardown latency,
+   * which on the JS side is a dispose that blocks the runtime.
+   *
+   * What this does not prove: that close never waits at all. A *bounded* wait
+   * added to close would still satisfy this; only an unbounded one shows up, and
+   * it shows up as a hung run rather than a red one.
+   */
+  @Test
+  fun `a collect in flight does not delay the handle close`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val handle = acquire(
+      File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0),
+      compressor = LogFileWriter.Compressor { source, destination ->
+        inCompressor.countDown()
+        held.await()
+        source.copyTo(destination, overwrite = true)
+        true
+      }
+    )
+    assertTrue(handle.appendBatch("precious\n", 1).accepted)
+    handle.flush(1000.0)
+
+    val collectThread = Thread { handle.collectLogs(10_000.0, 10_000_000.0) }
+    try {
+      collectThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      handle.close(50.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertTrue(
+        "close waited out a collect it deliberately does not wait for",
+        elapsedMs < 2_000
+      )
+    } finally {
+      held.countDown()
+    }
+    collectThread.join(10_000)
+  }
+
+  /** Opens [latch] from a daemon thread after [millis]. */
+  private fun releaseAfter(latch: CountDownLatch, millis: Long) {
+    Thread {
+      Thread.sleep(millis)
+      latch.countDown()
+    }.apply { isDaemon = true }.start()
   }
 }

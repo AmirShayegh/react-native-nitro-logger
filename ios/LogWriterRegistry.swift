@@ -301,6 +301,14 @@ public final class LogFileHandle {
   /// Set for the duration of `clearLogs`, so `close` can tell "a deletion is in
   /// flight" from "the handle is idle" without holding the lock across it.
   private var purging = false
+  /// One collect at a time on THIS handle, mirroring `purging`.
+  ///
+  /// The writer's `collectLock` already refuses a second collect on the same
+  /// writer, so this is not what makes the operation safe — it is what makes the
+  /// refusal cheap and local. A second collect on one handle is answered here
+  /// without touching the writer, without a flush, and without spending any of
+  /// its deadline discovering it lost.
+  private var collecting = false
 
   init(id: UInt64, writer: LogWriter, registry: LogWriterRegistry) {
     self.id = id
@@ -382,8 +390,31 @@ public final class LogFileHandle {
   /// Gated on liveness like every other entry point. A released handle
   /// collecting would read files a live handle is still rotating, and would
   /// write its bundle into that handle's directory.
+  ///
+  /// **`close` deliberately does not wait this out**, unlike `purging`. Closing
+  /// waits out a purge because tearing the writer down mid-deletion leaves the
+  /// fresh file missing. A collect only reads logs and writes its own scratch,
+  /// and being abandoned is already a first-class, tested outcome — so a third
+  /// wait on `close`'s budget would buy nothing and cost teardown latency.
   public func collectLogs(deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
-    guard liveGeneration() != nil else { return .nothing }
+    condition.lock()
+    guard state == .active, !collecting else {
+      condition.unlock()
+      return .nothing
+    }
+    collecting = true
+    condition.unlock()
+
+    defer {
+      condition.lock()
+      collecting = false
+      // Broadcast even though nothing waits on this today: `condition` is the
+      // one place a waiter for any of this handle's state would sleep, and a
+      // flag cleared without a wake is the shape that strands the first one
+      // somebody adds.
+      condition.broadcast()
+      condition.unlock()
+    }
     return writer.collectLogs(
       handleID: id, deadlineMs: deadlineMs, maxTotalBytes: maxTotalBytes)
   }

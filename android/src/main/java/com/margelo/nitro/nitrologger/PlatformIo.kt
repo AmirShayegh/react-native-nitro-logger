@@ -94,6 +94,25 @@ interface PlatformIo {
   fun creationTimeMillis(file: File): Long?
 
   /**
+   * Renames [from] onto [to], **replacing [to] atomically** if it exists.
+   *
+   * `File.renameTo` is not this. Its contract explicitly declines to say
+   * whether an existing destination is replaced, or whether the operation is
+   * atomic, or whether it works at all — behaviour it leaves to the platform.
+   * The support-bundle publish needs all three: a reader of the bundle path
+   * must see either the old bundle or the new one and never neither.
+   *
+   * The other half of the contract matters just as much: **a failure must leave
+   * [to] untouched.** That is what lets a collect that cannot publish leave the
+   * previous bundle in place, instead of deleting it first and then discovering
+   * it has nothing to put there.
+   *
+   * Returns false if the rename did not happen, in which case both files are
+   * where they were.
+   */
+  fun renameReplacing(from: File, to: File): Boolean
+
+  /**
    * The unit-test implementation. **Not for Android**: it is the only place in
    * this package that touches `java.nio.file`, which does not exist below API
    * 26.
@@ -123,6 +142,8 @@ interface PlatformIo {
 
     override fun creationTimeMillis(file: File): Long? = Nio.creationTimeMillis(file)
 
+    override fun renameReplacing(from: File, to: File): Boolean = Nio.renameReplacing(from, to)
+
     /**
      * Every `java.nio.file` reference in the package, in one object that
      * nothing on Android ever calls.
@@ -149,6 +170,41 @@ interface PlatformIo {
         java.nio.file.Files.isSymbolicLink(file.toPath())
       } catch (_: Throwable) {
         true
+      }
+
+      /**
+       * `Files.move` with `ATOMIC_MOVE`, which on a POSIX filesystem is one
+       * `rename(2)` — the same syscall [AndroidPlatformIo] makes directly.
+       *
+       * `ATOMIC_MOVE` rather than `REPLACE_EXISTING`, even though replacing is
+       * what this is for. `Files.move` documents that when `ATOMIC_MOVE` is
+       * given every other option is ignored, so the two cannot be combined —
+       * and of the two it is `ATOMIC_MOVE` that actually delivers the contract
+       * on [PlatformIo.renameReplacing]. `REPLACE_EXISTING` alone permits a
+       * non-atomic copy-and-delete, which is the very shape this seam exists to
+       * rule out; the replacement comes free, because that is what `rename(2)`
+       * does with an existing destination.
+       *
+       * A filesystem that cannot promise atomicity throws
+       * `AtomicMoveNotSupportedException` and this returns false. Failing
+       * closed is the point: this implementation is what the unit tests measure
+       * the contract against, so it must not quietly satisfy them with weaker
+       * semantics than the device gets.
+       *
+       * `Exception`, not `Throwable`, unlike its neighbours here. Those return
+       * a "cannot tell" value where swallowing is the whole point; this one
+       * reports a *decision*, and an `Error` — a linkage failure, an OOM — is
+       * not a rename that declined. It propagates.
+       */
+      fun renameReplacing(from: File, to: File): Boolean = try {
+        java.nio.file.Files.move(
+          from.toPath(),
+          to.toPath(),
+          java.nio.file.StandardCopyOption.ATOMIC_MOVE
+        )
+        true
+      } catch (_: Exception) {
+        false
       }
 
       fun creationTimeMillis(file: File): Long? = try {

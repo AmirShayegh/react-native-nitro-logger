@@ -378,6 +378,28 @@ class LogFileWriter internal constructor(
   private val stateLock = ReentrantLock()
   /** Held for the whole of [clearLogs], so purges cannot interleave. */
   private val purgeLock = ReentrantLock()
+
+  /**
+   * One collect at a time per writer.
+   *
+   * **Not for the reason [purgeLock] exists, and the difference is worth being
+   * exact about.** Two builds cannot corrupt each other's staging file: builds
+   * run as tasks on the single-threaded [executor], so they are already ordered
+   * end to end. This lock does not add that.
+   *
+   * What it adds is that a second collect does not *enqueue* while a first is
+   * running. Without it, N concurrent callers put N full copies of the log on
+   * the executor, each one holding up every flush behind it, and each caller
+   * then spends its whole deadline waiting for work it never began — and
+   * reports a timeout, having caused one. Refusing is both cheaper and truer.
+   *
+   * **It does not make the bundle path stable for a caller.** There is one
+   * well-known bundle name, so a later collect replaces an earlier one's file
+   * whether or not they overlapped, and a caller holding a path from a
+   * completed collect can always find different bytes there by the time it
+   * uploads. That is inherent to the name, not to concurrency.
+   */
+  private val collectLock = ReentrantLock()
   private var reservedBytes = 0L
   private var generation = 1L
   private var closed = false
@@ -1092,38 +1114,69 @@ class LogFileWriter internal constructor(
    * thread could copy in an archive that is being renamed out from under it.
    */
   fun collectLogs(handleId: Long, deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
-    val expiry = monotonic() + clampDeadline(deadlineMs)
+    // One absolute instant, computed before any waiting, and every wait below
+    // is against it rather than against a fresh budget of its own: the gate,
+    // the flush, and the build. A caller that asked for 100 ms means 100 ms for
+    // the lot — handing each step the full figure turns the deadline into a
+    // multiple of itself.
+    val budget = clampDeadline(deadlineMs)
+    val expiry = monotonic() + budget
 
-    // Everything buffered goes in. A support bundle missing the last few
-    // seconds is missing exactly the part somebody is asking about.
-    flushUntil(handleId, expiry)
-
-    val handoff = CollectHandoff()
-    var outcome = LogCollectOutcome.NOTHING
-    val done = CountDownLatch(1)
-    try {
-      executor.execute {
-        try {
-          if (!terminated) outcome = buildBundle(handoff, maxTotalBytes)
-        } finally {
-          done.countDown()
-        }
-      }
-      // The task cannot be cancelled mid-copy, but it CAN be stopped from
-      // publishing. Without that it would go on to rename a finished bundle
-      // into place seconds after this call reported there was none — a second
-      // copy of the whole log, on a device whose app was told nothing was
-      // collected, outside the retention budget it configured, and skipped by
-      // the orphan sweep because a FINISHED bundle is deliberately kept.
-      if (!done.await(remaining(expiry), TimeUnit.MILLISECONDS)) return handoff.giveUp()
+    // One collect at a time per writer — see [collectLock]. Refused, not
+    // queued: a second collect that waited its turn would spend the caller's
+    // whole deadline before starting and then report a timeout for work it
+    // never began, which is a worse answer than "not now".
+    //
+    // Taken before the flush so the whole call is one exclusive region, and
+    // before anything is submitted to the executor, so this refusal leaves
+    // nothing enqueued to publish later.
+    val acquired = try {
+      collectLock.tryLock(budget, TimeUnit.MILLISECONDS)
     } catch (_: InterruptedException) {
       Thread.currentThread().interrupt()
-      return handoff.giveUp()
-    } catch (_: RejectedExecutionException) {
-      // Nothing was ever queued, so there is nothing to stop.
-      return LogCollectOutcome.NOTHING
+      false
     }
-    return outcome
+    if (!acquired) return LogCollectOutcome.NOTHING
+
+    try {
+      // Everything buffered goes in. A support bundle missing the last few
+      // seconds is missing exactly the part somebody is asking about.
+      flushUntil(handleId, expiry)
+
+      val handoff = CollectHandoff()
+      var outcome = LogCollectOutcome.NOTHING
+      val done = CountDownLatch(1)
+      try {
+        executor.execute {
+          try {
+            if (!terminated) outcome = buildBundle(handoff, maxTotalBytes)
+          } finally {
+            done.countDown()
+          }
+        }
+        // The task cannot be cancelled mid-copy, but it CAN be stopped from
+        // publishing. Without that it would go on to rename a finished bundle
+        // into place seconds after this call reported there was none — a second
+        // copy of the whole log, on a device whose app was told nothing was
+        // collected, outside the retention budget it configured, and skipped by
+        // the orphan sweep because a FINISHED bundle is deliberately kept.
+        //
+        // Every `giveUp()` below runs BEFORE the `finally` releases the gate,
+        // which is the point: a build abandoned under the handoff's own monitor
+        // can never publish, so the next collect through the gate cannot find
+        // one racing it.
+        if (!done.await(remaining(expiry), TimeUnit.MILLISECONDS)) return handoff.giveUp()
+      } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return handoff.giveUp()
+      } catch (_: RejectedExecutionException) {
+        // Nothing was ever queued, so there is nothing to stop.
+        return LogCollectOutcome.NOTHING
+      }
+      return outcome
+    } finally {
+      collectLock.unlock()
+    }
   }
 
   /**
@@ -1144,11 +1197,20 @@ class LogFileWriter internal constructor(
     val finalFile = File(directory, supportName(baseName))
     val staging = File(directory, supportStagingName(baseName))
 
-    // Both, before anything is written. The previous bundle is replaced rather
-    // than added to, and a staging file from a collect that died mid-write is
-    // not something to append to.
+    // Staging only, and deliberately not [finalFile].
+    //
+    // Staging is this call's own scratch: a `.part` from a collect that died
+    // mid-write is not something to append to, and clearing it is what stops
+    // abandoned builds accumulating. Deleting it can destroy nothing a caller
+    // holds, because no call ever returns a `.part` path.
+    //
+    // The published bundle used to be deleted here too, and that was the
+    // defect. Every failure below — abandoned by timeout, nothing selected, a
+    // member that would not copy, a rename that failed — then left the caller
+    // of an *earlier* successful collect holding a path to a file that no
+    // longer existed, and no call ever reported destroying it. It is replaced
+    // by the rename at the end instead, which needs no pre-delete at all.
     staging.delete()
-    finalFile.delete()
 
     // Newest first: the active file, then archives. `archives` already excludes
     // `.part` and — because the bundle is not an archive name — the bundle this
@@ -1250,6 +1312,23 @@ class LogFileWriter internal constructor(
       return failed
     }
 
+    // **What serialises this against a purge is the executor, not a lock.** The
+    // rename below, and `clearLogs`'s whole sweep, are each a single task on
+    // this single-threaded executor, so their mutating phases cannot interleave
+    // — one runs to completion before the other starts.
+    //
+    // Stated precisely, because the guarantee is narrower than "purge and
+    // collect are mutually exclusive": a purge CAN linearize between this
+    // collect's flush and the submission of this build, and then it deletes
+    // artifacts this build was about to read. What it cannot do is preempt a
+    // build already running. A purge submitted behind a slow compressor waits
+    // for it — returning non-durable if its own deadline expires first, then
+    // executing when the executor frees.
+    //
+    // A shared gate would close the first gap and cost more than it is worth:
+    // purge would additionally have to wait through collect's *flush*, which
+    // touches none of the files it deletes.
+    //
     // The publish barrier, with the rename inside it. Holding the lock across
     // the rename is what makes "did this publish?" a question with one answer:
     // a waiter that takes the lock either finds nothing renamed — and marks the
@@ -1262,7 +1341,11 @@ class LogFileWriter internal constructor(
         staging.delete()
         return failed
       }
-      if (!staging.renameTo(finalFile)) {
+      // Through the platform seam rather than `File.renameTo`, which promises
+      // neither the atomic replace nor the leave-the-destination-alone-on-
+      // failure that make the pre-delete unnecessary. See
+      // [PlatformIo.renameReplacing].
+      if (!platform.renameReplacing(staging, finalFile)) {
         staging.delete()
         note(LogDegradation.GZIP)
         return failed
@@ -1755,6 +1838,11 @@ class LogFileWriter internal constructor(
       degraded = LogDegradation.NONE
       stateLock.unlock()
 
+      // The whole sweep is ONE executor task, and that is what serialises it
+      // against a collect's publish — see the matching note in [buildBundle].
+      // Splitting it into several tasks would let a build's rename land in the
+      // middle of a deletion, publishing a bundle the purge has already walked
+      // past.
       var outcome = LogClearOutcome(0, emptyList(), durable = false)
       val done = CountDownLatch(1)
 

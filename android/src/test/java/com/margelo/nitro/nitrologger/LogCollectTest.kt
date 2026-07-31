@@ -7,6 +7,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
@@ -586,4 +590,246 @@ class LogCollectTest {
 
   private fun archiveNames(): List<String> =
     directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
+
+  // MARK: - The publish barrier
+
+  /*
+   What the tests below do NOT prove.
+
+   - **Not that the replace is atomic to an external reader.** Nothing here
+     opens the bundle path while the rename runs. That property comes from
+     `Os.rename`'s contract, and this suite takes it on the contract — and does
+     not exercise `Os.rename` at all, since these run on [PlatformIo.Jvm].
+   - **Not that two completed collects leave a caller's path meaningful.** There
+     is one bundle name, so a later collect replaces an earlier one's file
+     whether or not they overlapped. Inherent to the name; `collectLock` does
+     not change it.
+   - **Not that two builds cannot corrupt each other.** They cannot, but the
+     single-threaded executor is what guarantees it, not `collectLock`. Removing
+     the lock leaves the bundles intact and only wastes the executor — which is
+     why the contention test asserts the compressor call count rather than the
+     contents.
+   */
+
+  /**
+   * **The headline fix.** A collect that produces no bundle must not destroy the
+   * one that is already there.
+   *
+   * `buildBundle` used to delete the published bundle as its *first* action,
+   * before it knew whether it would publish anything. Every failure after that
+   * — abandoned by timeout, nothing selected, a member that would not copy, a
+   * rename that failed — left the caller of an earlier successful collect
+   * holding a path to a file that no longer existed, and no call ever reported
+   * destroying it. A support flow that had collected, shown the user a size, and
+   * was about to upload would find nothing there.
+   *
+   * Nothing pre-deletes now. The publish is a replacing rename, which does not
+   * touch its destination unless it succeeds.
+   */
+  @Test
+  fun `an overrun collect leaves the earlier bundle in place`() {
+    var slow = false
+    val compressor = LogFileWriter.Compressor { source, destination ->
+      if (slow) Thread.sleep(500)
+      realGzip(source, destination)
+    }
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0), compressor = compressor)
+    w.write("precious\n")
+    w.flush(1, 1000.0)
+
+    val first = w.collectLogs(1, 5000.0, 10_000_000.0)
+    assertTrue("the setup collect has to succeed for this to test anything", first.complete)
+    assertEquals("precious\n", gunzipAll(bundle))
+
+    // Now one that cannot finish inside its deadline.
+    slow = true
+    val second = w.collectLogs(1, 50.0, 10_000_000.0)
+    assertFalse("the wait was 50ms and the build takes 500", second.complete)
+
+    // Let the abandoned build run to the end it would have reached anyway; the
+    // barrier stops it publishing, and it must not have destroyed anything on
+    // the way either.
+    w.settleForTesting()
+
+    assertEquals(
+      "a collect that published nothing deleted the bundle a previous one published",
+      "precious\n",
+      gunzipAll(bundle)
+    )
+    assertEquals(
+      "the path the first caller is still holding is the one that survived",
+      bundle.absolutePath,
+      first.path
+    )
+  }
+
+  /**
+   * A collect refused for contention must not queue a build behind the winner.
+   *
+   * Two observables, because the two ways of getting this wrong look identical
+   * from a single one. A *blocking* acquire is caught by the elapsed time: the
+   * loser would sit until the winner released. *No lock at all* is caught by the
+   * compressor call count: the loser would flush and enqueue a second full copy
+   * of the log, and the count would be two.
+   */
+  @Test
+  fun `a concurrent collect is refused rather than queued`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val calls = AtomicInteger()
+    val compressor = LogFileWriter.Compressor { source, destination ->
+      calls.incrementAndGet()
+      inCompressor.countDown()
+      held.await()
+      realGzip(source, destination)
+    }
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0), compressor = compressor)
+    w.write("precious\n")
+    w.flush(1, 1000.0)
+
+    val winner = AtomicReference<LogCollectOutcome>()
+    val winnerThread = Thread { winner.set(w.collectLogs(1, 10_000.0, 10_000_000.0)) }
+    try {
+      winnerThread.start()
+      // The winner's build is now provably inside the compressor, holding both
+      // the executor and the collect gate. No sleep, no guessing.
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      releaseAfter(held, 3_000)
+
+      // A different handle id — two destinations on ONE writer, which a
+      // per-handle flag cannot see. That is why the lock lives on the writer.
+      val began = System.nanoTime()
+      val loser = w.collectLogs(2, 100.0, 10_000_000.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertFalse(loser.complete)
+      assertEquals("", loser.path)
+      assertTrue(
+        "the refused collect waited for the winner instead of giving up on its own deadline",
+        elapsedMs < 2_000
+      )
+    } finally {
+      held.countDown()
+    }
+
+    winnerThread.join(10_000)
+    assertTrue("the winner should have published", winner.get().complete)
+    w.settleForTesting()
+
+    assertEquals(
+      "the refused collect enqueued a build of its own — the point is that it does not",
+      1,
+      calls.get()
+    )
+  }
+
+  /**
+   * Cross-operation ordering, stated exactly: **a purge cannot preempt a build
+   * that is already running**, and the executor is what guarantees it.
+   *
+   * The publish and the sweep are each a single executor task, so their mutating
+   * phases cannot interleave. What that buys, and what it does not:
+   *
+   * - A purge submitted behind a running build waits for it. If its own deadline
+   *   expires first it reports non-durable — truthfully, because it has deleted
+   *   nothing yet — and then runs when the executor frees.
+   * - It does **not** mean a purge cannot land between a collect's flush and its
+   *   build. It can, and then the build reads a directory the purge emptied.
+   *   That is a legitimate linearization, not a defect.
+   */
+  @Test
+  fun `a purge cannot preempt a build already running`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val compressor = LogFileWriter.Compressor { source, destination ->
+      inCompressor.countDown()
+      held.await()
+      realGzip(source, destination)
+    }
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0), compressor = compressor)
+    w.write("precious\n")
+    w.flush(1, 1000.0)
+
+    val collected = AtomicReference<LogCollectOutcome>()
+    val collectThread = Thread { collected.set(w.collectLogs(1, 10_000.0, 10_000_000.0)) }
+    try {
+      collectThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      releaseAfter(held, 3_000)
+
+      // The sweep cannot start: the build owns the executor.
+      val purge = w.clearLogs(50.0).first
+      assertFalse(
+        "a purge that has not run a single unlink reported a durable deletion",
+        purge.durable
+      )
+      assertEquals(
+        "and it names what it did not delete",
+        listOf(File(directory, "app.log").absolutePath),
+        purge.failedPaths
+      )
+    } finally {
+      held.countDown()
+    }
+
+    collectThread.join(10_000)
+    assertTrue("the build was not preempted; it published", collected.get().complete)
+
+    // Now let the queued sweep run. It was never cancelled — only late.
+    w.settleForTesting()
+    assertEquals(
+      "the purge ran once the build let go of the executor, and took the bundle with it",
+      emptyList<String>(),
+      directory.list()!!.filter { it.startsWith("app.log.support") }
+    )
+  }
+
+  /**
+   * The seam the publish rests on, tested directly rather than only through a
+   * collect.
+   *
+   * Both halves of [PlatformIo.renameReplacing]'s contract are load-bearing and
+   * `File.renameTo` promises neither, which is why the seam exists at all. The
+   * first is what removes the pre-delete; the second is what makes a failed
+   * publish harmless.
+   *
+   * What this does not prove: anything about [AndroidPlatformIo]. It runs
+   * `Files.move`, not `Os.rename`, because that is what the unit-test platform
+   * is — the device implementation is covered only by the instrumented job.
+   */
+  @Test
+  fun `renameReplacing replaces its destination and leaves it alone on failure`() {
+    val from = File(directory, "source").apply { writeText("new\n") }
+    val onto = File(directory, "destination").apply { writeText("old\n") }
+
+    assertTrue(PlatformIo.Jvm.renameReplacing(from, onto))
+    assertEquals("an existing destination was not replaced", "new\n", onto.readText())
+    assertFalse("the source survived its own rename", from.exists())
+
+    // Now one that cannot succeed: nothing to move.
+    val missing = File(directory, "absent")
+    assertFalse(PlatformIo.Jvm.renameReplacing(missing, onto))
+    assertEquals(
+      "a failed rename destroyed the destination it could not replace",
+      "new\n",
+      onto.readText()
+    )
+  }
+
+  /**
+   * Opens [latch] from a daemon thread after [millis].
+   *
+   * Insurance against the mutation, not against the code. Each test above gates
+   * the writer and then does bounded work on the test thread — but if a bound
+   * under test were removed, the test thread would block before reaching its own
+   * `countDown()` and the suite would hang instead of reporting a failure. A
+   * wedged run says far less than a red one, and it says it much later. This
+   * fires long after the assertions in a passing run and changes nothing there.
+   */
+  private fun releaseAfter(latch: CountDownLatch, millis: Long) {
+    Thread {
+      Thread.sleep(millis)
+      latch.countDown()
+    }.apply { isDaemon = true }.start()
+  }
 }

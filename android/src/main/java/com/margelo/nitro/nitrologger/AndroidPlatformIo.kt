@@ -160,4 +160,22 @@ object AndroidPlatformIo : PlatformIo {
    * it as authoritative.
    */
   override fun creationTimeMillis(file: File): Long? = null
+
+  /**
+   * `Os.rename` — API 21, and the raw `rename(2)`, which is what the contract
+   * on [PlatformIo.renameReplacing] describes: it replaces an existing
+   * destination atomically, and on failure it does not touch it.
+   *
+   * `Files.move` would say the same thing but is API 26; `File.renameTo`
+   * reaches the same syscall on Linux but promises none of it. There is no
+   * delete-then-rename fallback here on purpose — one would reintroduce
+   * exactly the window this call exists to close, and would run precisely when
+   * the rename is failing, which is the worst moment to be holding no bundle.
+   */
+  override fun renameReplacing(from: File, to: File): Boolean = try {
+    Os.rename(from.absolutePath, to.absolutePath)
+    true
+  } catch (_: ErrnoException) {
+    false
+  }
 }

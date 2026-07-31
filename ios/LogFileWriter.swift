@@ -162,10 +162,16 @@ public struct LogCollectOutcome: Sendable, Equatable {
 
   /// No bundle, nothing left out, nothing finished.
   ///
-  /// The answer for a writer that has been terminated or a collect whose
-  /// deadline expired. `truncated: false` is deliberate: nothing was dropped
-  /// from a bundle that does not exist, and saying otherwise would have a
-  /// caller apologising to a user for a partial upload that never happened.
+  /// The answer for a writer that has been terminated, a collect whose deadline
+  /// expired, and a collect refused because another one holds the writer or the
+  /// handle. `truncated: false` is deliberate: nothing was dropped from a bundle
+  /// that does not exist, and saying otherwise would have a caller apologising
+  /// to a user for a partial upload that never happened.
+  ///
+  /// A refusal is deliberately indistinguishable from a timeout here. Both mean
+  /// "no bundle, try again", both leave any earlier bundle untouched, and
+  /// splitting them would put a reason code in the caller's hands that it has no
+  /// different action to take on.
   public static let nothing = LogCollectOutcome(
     path: "", byteCount: 0, sourceFileCount: 0, truncated: false, complete: false)
 }
@@ -289,6 +295,29 @@ public final class LogWriter {
   /// A binary semaphore rather than `NSLock`: the timed acquire in `clearLogs`
   /// needs a monotonic deadline, and `lock(before:)` only speaks `Date`.
   private let purgeLock = DispatchSemaphore(value: 1)
+  /// One collect at a time per writer.
+  ///
+  /// **Not for the reason `purgeLock` exists, and the difference is worth being
+  /// exact about.** Two builds cannot corrupt each other's staging file: builds
+  /// run as tasks on the serial `queue`, so they are already ordered end to end.
+  /// This lock does not add that.
+  ///
+  /// What it adds is that a second collect does not *enqueue* while a first is
+  /// running. Without it, N concurrent callers put N full copies of the log on
+  /// the queue, each one holding up every flush behind it, and each caller then
+  /// spends its whole deadline waiting for work it never began — and reports a
+  /// timeout, having caused one. Refusing is both cheaper and truer.
+  ///
+  /// **It does not make the bundle path stable for a caller.** There is one
+  /// well-known bundle name, so a later collect replaces an earlier one's file
+  /// whether or not they overlapped, and a caller holding a path from a
+  /// completed collect can always find different bytes there by the time it
+  /// uploads. That is inherent to the name, not to concurrency.
+  ///
+  /// A semaphore rather than `NSLock` for the reason `purgeLock` is one: the
+  /// acquire is timed against the caller's monotonic budget, and
+  /// `lock(before:)` only speaks `Date`.
+  private let collectLock = DispatchSemaphore(value: 1)
   private var reservedBytes = 0
   private var generation: UInt64 = 1
   private var closed = false
@@ -945,7 +974,28 @@ public final class LogWriter {
   /// caller's thread could copy in an archive that is being renamed out from
   /// under it.
   func collectLogs(handleID: UInt64, deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
+    // One absolute instant, computed before any waiting, and every wait below
+    // is against it rather than against a fresh budget of its own: the gate,
+    // the flush, and the build. A caller that asked for 100 ms means 100 ms for
+    // the lot — handing each step the full figure turns the deadline into a
+    // multiple of itself.
     let expiry = DispatchTime.now() + .milliseconds(Self.clampDeadline(deadlineMs))
+
+    // One collect at a time per writer — see `collectLock`. Refused, not
+    // queued: a second collect that waited its turn would spend the caller's
+    // whole deadline before starting and then report a timeout for work it
+    // never began, which is a worse answer than "not now".
+    //
+    // Taken before the flush so the whole call is one exclusive region, and
+    // before anything is submitted to the queue, so this refusal leaves nothing
+    // enqueued to publish later.
+    guard collectLock.wait(timeout: expiry) == .success else { return .nothing }
+    // Registered here rather than after the `group.wait` below, so it runs
+    // *after* `handoff.giveUp()` on the timeout path: the return value is
+    // evaluated before the deferred blocks. That order is the point — a build
+    // abandoned under the handoff's own lock can never publish, so the next
+    // collect through this gate cannot find one racing it.
+    defer { collectLock.signal() }
 
     // Everything buffered goes in. A support bundle missing the last few
     // seconds is missing exactly the part somebody is asking about.
@@ -1034,11 +1084,20 @@ public final class LogWriter {
     let finalURL = directory.appendingPathComponent(Self.supportName(baseName))
     let stagingURL = directory.appendingPathComponent(Self.supportStagingName(baseName))
 
-    // Both, before anything is written. The previous bundle is replaced rather
-    // than added to, and a staging file from a collect that died mid-write is
-    // not something to append to.
+    // Staging only, and deliberately not `finalURL`.
+    //
+    // Staging is this call's own scratch: a `.part` from a collect that died
+    // mid-write is not something to append to, and clearing it is what stops
+    // abandoned builds accumulating. Deleting it can destroy nothing a caller
+    // holds, because no call ever returns a `.part` path.
+    //
+    // The published bundle used to be deleted here too, and that was the
+    // defect. Every failure below — abandoned by timeout, nothing selected, a
+    // member that would not copy, a rename that failed — then left the caller
+    // of an *earlier* successful collect holding a path to a file that no
+    // longer existed, and no call ever reported destroying it. It is replaced
+    // by the `rename` at the end instead, which needs no pre-delete at all.
     try? fm.removeItem(at: stagingURL)
-    try? fm.removeItem(at: finalURL)
 
     // Newest first: the active file, then archives. `archives` already
     // excludes `.part` and — because the bundle is not an archive name — the
@@ -1162,6 +1221,23 @@ public final class LogWriter {
       return failed
     }
 
+    // **What serialises this against a purge is the queue, not a lock.** The
+    // rename below, and `clearLogs`'s whole sweep, are each a single task on
+    // this serial queue, so their mutating phases cannot interleave — one runs
+    // to completion before the other starts.
+    //
+    // Stated precisely, because the guarantee is narrower than "purge and
+    // collect are mutually exclusive": a purge CAN linearize between this
+    // collect's flush and the submission of this build, and then it deletes
+    // artifacts this build was about to read. What it cannot do is preempt a
+    // build already running. A purge submitted behind a slow compressor waits
+    // for it — returning non-durable if its own deadline expires first, then
+    // executing when the queue frees.
+    //
+    // A shared gate would close the first gap and cost more than it is worth:
+    // purge would additionally have to wait through collect's *flush*, which
+    // touches none of the files it deletes.
+    //
     // The publish barrier, with the rename inside it. Holding the lock across
     // the rename is what makes "did this publish?" a question with one answer:
     // a waiter that takes the lock either finds nothing renamed — and marks the
@@ -1177,13 +1253,20 @@ public final class LogWriter {
     )
     var renameFailed = false
     let committed = handoff.commit(published) {
-      do {
-        try fm.moveItem(at: stagingURL, to: finalURL)
-        return true
-      } catch {
+      // POSIX `rename(2)`, not `FileManager.moveItem`. `moveItem` refuses an
+      // existing destination, which is what forced the pre-delete this
+      // replaces; `rename` replaces one atomically, so a reader of the bundle
+      // path sees either the old bundle or the new one and never neither.
+      //
+      // It is also the failure behaviour that matters here: `rename` does not
+      // touch its destination unless it succeeds. A failed publish therefore
+      // leaves the earlier bundle exactly where it was, which is the window
+      // closed rather than narrowed.
+      guard rename(stagingURL.path, finalURL.path) == 0 else {
         renameFailed = true
         return false
       }
+      return true
     }
     guard committed else {
       try? fm.removeItem(at: stagingURL)
@@ -1905,6 +1988,10 @@ public final class LogWriter {
     degraded = LogDegradation()
     stateLock.unlock()
 
+    // The whole sweep is ONE queue task, and that is what serialises it against
+    // a collect's publish — see the matching note in `buildBundle`. Splitting
+    // it into several tasks would let a build's rename land in the middle of a
+    // deletion, publishing a bundle the purge has already walked past.
     var outcome = LogClearOutcome(deletedCount: 0, failedPaths: [], durable: false)
     let group = DispatchGroup()
     group.enter()

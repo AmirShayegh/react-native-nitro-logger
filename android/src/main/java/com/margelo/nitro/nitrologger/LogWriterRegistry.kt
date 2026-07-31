@@ -517,6 +517,17 @@ class LogFileHandle internal constructor(
   /** A purge is running on this handle; close has to wait it out. */
   private var purging = false
 
+  /**
+   * One collect at a time on THIS handle, mirroring [purging].
+   *
+   * The writer's `collectLock` already refuses a second collect on the same
+   * writer, so this is not what makes the operation safe — it is what makes the
+   * refusal cheap and local. A second collect on one handle is answered here
+   * without touching the writer, without a flush, and without spending any of
+   * its deadline discovering it lost.
+   */
+  private var collecting = false
+
   val filePath: String get() = writer.file.absolutePath
 
   /**
@@ -569,10 +580,34 @@ class LogFileHandle internal constructor(
    * Gated on liveness like every other entry point. A released handle
    * collecting would read files a live handle is still rotating, and would
    * write its bundle into that handle's directory.
+   *
+   * **[close] deliberately does not wait this out**, unlike [purging]. Closing
+   * waits out a purge because tearing the writer down mid-deletion leaves the
+   * fresh file missing. A collect only reads logs and writes its own scratch,
+   * and being abandoned is already a first-class, tested outcome — so a third
+   * wait on close's budget would buy nothing and cost teardown latency.
    */
   fun collectLogs(deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
-    if (!isLive) return LogCollectOutcome.NOTHING
-    return writer.collectLogs(id, deadlineMs, maxTotalBytes)
+    lock.lock()
+    if (state != State.ACTIVE || collecting) {
+      lock.unlock()
+      return LogCollectOutcome.NOTHING
+    }
+    collecting = true
+    lock.unlock()
+
+    return try {
+      writer.collectLogs(id, deadlineMs, maxTotalBytes)
+    } finally {
+      lock.withLock {
+        collecting = false
+        // Signalled even though nothing waits on this today: [purgeFinished] is
+        // the one place a waiter for any of this handle's state would sleep,
+        // and a flag cleared without a wake is the shape that strands the first
+        // one somebody adds.
+        purgeFinished.signalAll()
+      }
+    }
   }
 
   fun flush(deadlineMs: Double): LogFlushOutcome {
