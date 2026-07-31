@@ -146,11 +146,18 @@ npm install --legacy-peer-deps
 cat > "$APP_DIR/App.tsx" <<'APP'
 import { useEffect, useState } from 'react';
 import { Text, View } from 'react-native';
+// The root entry point only. `createFileSink` moved to
+// `react-native-nitro-logger/unstable` in 0.3.0, and that subpath is
+// deliberately NOT imported here: Metro 0.81 — what react-native@0.78.0 pins —
+// defaults `unstable_enablePackageExports` to false, so a stock app at this
+// repository's minimum supported RN cannot resolve any subpath export. That is
+// a real constraint on consumers, recorded in the README, not something to
+// route around by configuring this app differently from the one it stands in
+// for.
 import {
   Log,
-  FileDestination,
   JsonLinesFormatter,
-  createFileSink,
+  createFileDestination,
   pub,
 } from 'react-native-nitro-logger';
 
@@ -163,7 +170,7 @@ export default function App() {
   useEffect(() => {
     let result: string;
     try {
-      const destination = new FileDestination(createFileSink(), {
+      const destination = createFileDestination({
         formatter: new JsonLinesFormatter(),
         rotation: {
           maxFileSizeBytes: 8 * 1024,
