@@ -18,4 +18,7 @@ export interface MeasureResult {
   samples: number[];
 }
 
-export function runCase(op: () => void, options: MeasureOptions): MeasureResult;
+export function runCase(
+  op: () => unknown,
+  options: MeasureOptions
+): MeasureResult;

@@ -104,7 +104,7 @@ module.exports.cases = [
       const batcher = new Batcher(acceptingSink(), { renderNotice: NOTICE });
       return {
         op() {
-          batcher.add(RECORD_163);
+          return batcher.add(RECORD_163);
         },
         teardown() {
           batcher.dispose();
@@ -121,7 +121,7 @@ module.exports.cases = [
       const bytes = utf8Length(RECORD_163);
       return {
         op() {
-          batcher.add(RECORD_163, bytes);
+          return batcher.add(RECORD_163, bytes);
         },
         teardown() {
           batcher.dispose();
@@ -144,7 +144,7 @@ module.exports.cases = [
       for (let i = 0; i < 128; i += 1) batcher.add(RECORD_163);
       return {
         op() {
-          batcher.add(RECORD_163);
+          return batcher.add(RECORD_163);
         },
         teardown() {
           batcher.dispose();
@@ -170,7 +170,7 @@ module.exports.cases = [
       return {
         op() {
           for (let i = 0; i < perBatch; i += 1) batcher.add(RECORD_163);
-          batcher.flush(1000);
+          return batcher.flush(1000);
         },
         teardown() {
           batcher.dispose();
@@ -185,7 +185,7 @@ module.exports.cases = [
     setup() {
       return {
         op() {
-          utf8Length(RECORD_163);
+          return utf8Length(RECORD_163);
         },
       };
     },
@@ -198,7 +198,7 @@ module.exports.cases = [
       const short = 'request finished';
       return {
         op() {
-          utf8Length(short);
+          return utf8Length(short);
         },
       };
     },
@@ -209,7 +209,7 @@ module.exports.cases = [
       const big = RECORD_163.repeat(21);
       return {
         op() {
-          utf8Length(big);
+          return utf8Length(big);
         },
       };
     },
@@ -224,7 +224,7 @@ module.exports.cases = [
         );
       return {
         op() {
-          utf8Length(trace);
+          return utf8Length(trace);
         },
       };
     },
@@ -237,7 +237,7 @@ module.exports.cases = [
       const cjk = '診療記録の同期が完了しました'.repeat(8);
       return {
         op() {
-          utf8Length(cjk);
+          return utf8Length(cjk);
         },
       };
     },
@@ -248,7 +248,7 @@ module.exports.cases = [
       const mixed = 'sync ok 👍 latency 41ms 🚑 retry 0 '.repeat(28);
       return {
         op() {
-          utf8Length(mixed);
+          return utf8Length(mixed);
         },
       };
     },

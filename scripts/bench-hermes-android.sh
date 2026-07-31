@@ -53,10 +53,20 @@ command -v adb >/dev/null 2>&1 || {
 }
 
 DEVICES="$(adb devices | awk 'NR>1 && $2 == "device" { print $1 }')"
-[ -n "$DEVICES" ] || {
+DEVICE_COUNT="$(printf '%s\n' "$DEVICES" | sed '/^$/d' | wc -l | tr -d ' ')"
+[ "$DEVICE_COUNT" -gt 0 ] || {
   echo "FAIL: no device is connected and ready"
   exit 1
 }
+# With several devices, every bare adb call below would die with "more than
+# one device/emulator" AFTER the minutes-long Gradle build. adb honours
+# ANDROID_SERIAL on every invocation, so requiring it up front is the whole
+# fix — no per-call -s threading.
+if [ "$DEVICE_COUNT" -gt 1 ] && [ -z "${ANDROID_SERIAL:-}" ]; then
+  echo "FAIL: $DEVICE_COUNT devices are connected; export ANDROID_SERIAL to pick one:"
+  printf '%s\n' "$DEVICES"
+  exit 1
+fi
 
 # The device's own ABI, never a hardcoded one: an APK built for the wrong ABI
 # installs fine and then loads no native library.
@@ -117,6 +127,25 @@ node -e '
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
+  // Count parity is not identity: a duplicated line and a dropped case
+  // balance to the same total. The harvested names must equal the case
+  // list exactly — no duplicates, nothing missing, nothing unknown.
+  const expected = [];
+  for (const f of ["hotpath", "format", "batcher"])
+    for (const c of require("./bench/cases/" + f + ".js").cases)
+      expected.push(c.name);
+  const seen = results.map((r) => r.name);
+  const problems = [];
+  const duplicated = seen.filter((n, i) => seen.indexOf(n) !== i);
+  if (duplicated.length) problems.push("duplicated: " + duplicated.join(", "));
+  const missing = expected.filter((n) => !seen.includes(n));
+  if (missing.length) problems.push("missing: " + missing.join(", "));
+  const unknown = seen.filter((n) => !expected.includes(n));
+  if (unknown.length) problems.push("unknown: " + unknown.join(", "));
+  if (problems.length) {
+    for (const p of problems) console.error("FAIL: harvested names " + p);
+    process.exit(1);
+  }
   fs.writeFileSync(
     outPath,
     JSON.stringify({ engine: "hermes-android", runId, results }, null, 2) + "\n"

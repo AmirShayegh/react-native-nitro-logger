@@ -7,17 +7,32 @@
  * name: the options object, the redaction walk, the marker probe, the
  * per-entry eligible array.
  *
- * Every case runs against a no-op destination. The point is the logger's own
- * bookkeeping; a real destination would drown it in I/O.
+ * Every case runs against a near-no-op destination. The point is the
+ * logger's own bookkeeping; a real destination would drown it in I/O — but
+ * `write` must still OBSERVE each entry (two stores into an exported slot),
+ * because a destination that ignores its argument invites the inliner to
+ * delete the delivery it exists to price. Each destination gets its own
+ * slot, so the two-destination case demonstrably performs both writes.
  */
 const { Logger, pub, priv } = require('../api');
 
-/** A destination that costs as close to nothing as a call can. */
+/** Written by every destination and exported: the escape hatch DCE cannot
+ * see through. Keyed by destination label. */
+const observed = {};
+module.exports.observed = observed;
+
+/** A destination that costs as close to nothing as a call can while still
+ * consuming what it is handed. */
 function noopDestination(label) {
+  const slot = { entry: undefined, writes: 0 };
+  observed[label || 'noop'] = slot;
   return {
     label: label || 'noop',
     isEnabled: true,
-    write() {},
+    write(entry) {
+      slot.entry = entry;
+      slot.writes += 1;
+    },
     flush() {},
     dispose() {},
   };
@@ -44,7 +59,11 @@ module.exports.cases = [
         .subsystem('media', 'error');
       return {
         op() {
-          logger.info('cache warm', undefined, 'ui.checkout.payment.card');
+          return logger.info(
+            'cache warm',
+            undefined,
+            'ui.checkout.payment.card'
+          );
         },
       };
     },
@@ -57,7 +76,7 @@ module.exports.cases = [
         .minimumLevel('warn');
       return {
         op() {
-          logger.info('cache warm');
+          return logger.info('cache warm');
         },
       };
     },
@@ -74,6 +93,7 @@ module.exports.cases = [
       return {
         op() {
           logger.info('response', undefined, 'net.http.client');
+          return observed.noop.writes;
         },
       };
     },
@@ -85,6 +105,7 @@ module.exports.cases = [
       return {
         op() {
           logger.info('ready');
+          return observed.noop.writes;
         },
       };
     },
@@ -106,6 +127,7 @@ module.exports.cases = [
             elapsedMs: pub(41),
             retries: pub(0),
           });
+          return observed.noop.writes;
         },
       };
     },
@@ -118,6 +140,7 @@ module.exports.cases = [
       return {
         op() {
           logger.info('session', { device: pub('ios'), owner: priv('carol') });
+          return observed.noop.writes;
         },
       };
     },
@@ -130,6 +153,7 @@ module.exports.cases = [
       return {
         op() {
           logger.info('flags', { a: pub(0), b: pub(false), c: pub('') });
+          return observed.noop.writes;
         },
       };
     },
@@ -145,6 +169,7 @@ module.exports.cases = [
       return {
         op() {
           scoped.info('tick', { seq: pub(7) });
+          return observed.noop.writes;
         },
       };
     },
@@ -158,7 +183,7 @@ module.exports.cases = [
       const scoped = logger.scoped('corr-bench', 'net.http');
       return {
         op() {
-          scoped.info('tick');
+          return scoped.info('tick');
         },
       };
     },
@@ -173,6 +198,8 @@ module.exports.cases = [
       return {
         op() {
           logger.info('ready');
+          // Both slots read: neither write can be proven dead independently.
+          return observed.first.writes + observed.second.writes;
         },
       };
     },

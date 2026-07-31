@@ -50,16 +50,19 @@ function main() {
   });
   if (instance.teardown) instance.teardown();
 
+  // Exit from the write callback: stdout to a pipe is asynchronous on
+  // POSIX, so a bare `process.exit` here can truncate the payload before it
+  // reaches the parent. Exiting at all is still required — a batcher case
+  // may have live timers, and the measurement is done once this is written.
   process.stdout.write(
     JSON.stringify({
       name,
       nsPerOp: result.nsPerOp,
       iterations: result.iterations,
       samples: result.samples,
-    }) + '\n'
+    }) + '\n',
+    () => process.exit(0)
   );
-  // A batcher case may have live timers; the measurement is done and written.
-  process.exit(0);
 }
 
 main();

@@ -27,6 +27,11 @@ final class LogPerfTests: LogWriterTestCase {
   func testMeasureAppendFlushBurst() throws {
     let handle = try makeHandle(policy: LogRotationPolicy(maxFileSizeBytes: 1_000_000_000))
     var next = 0
+    // `.full` is backpressure and gets retried; any OTHER rejection would
+    // silently turn the burst into a cheap failure-path measurement — the
+    // flag (one predicted-false branch, no XCTest call inside timing)
+    // converts that into a red test instead of a wrong number.
+    var everRejected = false
     measure {
       for _ in 0..<1_000 {
         var result = handle.appendBatch(line(next), entryCount: 1)
@@ -34,10 +39,12 @@ final class LogPerfTests: LogWriterTestCase {
           _ = handle.flush(deadlineMs: 1000)
           result = handle.appendBatch(line(next), entryCount: 1)
         }
+        if !result.accepted { everRejected = true }
         next += 1
       }
       _ = handle.flush(deadlineMs: 10_000)
     }
+    XCTAssertFalse(everRejected, "an append was rejected; the measured shape must be all-accepted")
     XCTAssertEqual(handle.status().lostEntries, 0)
   }
 
@@ -48,6 +55,9 @@ final class LogPerfTests: LogWriterTestCase {
       maxFileSizeBytes: 16_384, maxArchivedFilesCount: 10_000, compressArchives: true)
     let handle = try makeHandle(policy: policy)
     var next = 0
+    // Same acceptance discipline as the plain burst above: archives produced
+    // before a failure would satisfy the rotation assertion on their own.
+    var everRejected = false
     measure {
       // ~64 KiB per block: four rotations' worth at the 16 KiB threshold.
       for _ in 0..<1_300 {
@@ -56,10 +66,12 @@ final class LogPerfTests: LogWriterTestCase {
           _ = handle.flush(deadlineMs: 1000)
           result = handle.appendBatch(line(next), entryCount: 1)
         }
+        if !result.accepted { everRejected = true }
         next += 1
       }
       _ = handle.flush(deadlineMs: 10_000)
     }
+    XCTAssertFalse(everRejected, "an append was rejected; the measured shape must be all-accepted")
     XCTAssertGreaterThan(archiveNames().count, 0, "the burst really did rotate")
   }
 

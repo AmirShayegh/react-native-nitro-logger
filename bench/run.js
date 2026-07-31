@@ -29,8 +29,9 @@ const CASE_FILES = ['hotpath.js', 'format.js', 'batcher.js'].map((name) =>
   path.join(__dirname, 'cases', name)
 );
 
-function newestMtime(directory) {
+function mtimeRange(directory) {
   let newest = 0;
+  let oldest = Infinity;
   for (const entry of fs.readdirSync(directory, {
     recursive: true,
     withFileTypes: true,
@@ -40,14 +41,24 @@ function newestMtime(directory) {
       path.join(entry.parentPath ?? entry.path, entry.name)
     ).mtimeMs;
     if (stamp > newest) newest = stamp;
+    if (stamp < oldest) oldest = stamp;
   }
-  return newest;
+  return { newest, oldest };
 }
 
 /**
  * A stale build is the harness's one silent-lie mode: `bench/api.js` requires
  * `lib/commonjs`, so measuring after editing `src` without rebuilding
  * benchmarks last week's code under this week's commit message. Refuse.
+ *
+ * The comparison is the OLDEST built file against the NEWEST source: one
+ * `corepack yarn prepare` rewrites every output after every edit, so
+ * oldest-lib > newest-src holds exactly when the whole build postdates the
+ * whole source tree. A partial or failed build leaves at least one output
+ * older than the edit and is refused — comparing the newest built file
+ * instead would let one surviving fresh output vouch for a stale tree.
+ * The failure direction is safe: a false refusal costs one rebuild, a false
+ * pass benchmarks the wrong code silently.
  */
 function assertLibFresh() {
   const marker = path.join(ROOT, 'lib', 'commonjs', 'index.js');
@@ -57,12 +68,12 @@ function assertLibFresh() {
     );
     process.exit(1);
   }
-  const libBuilt = newestMtime(path.join(ROOT, 'lib', 'commonjs'));
-  const srcEdited = newestMtime(path.join(ROOT, 'src'));
-  if (srcEdited > libBuilt) {
+  const lib = mtimeRange(path.join(ROOT, 'lib', 'commonjs'));
+  const src = mtimeRange(path.join(ROOT, 'src'));
+  if (src.newest > lib.oldest) {
     process.stderr.write(
-      'FAIL: src is newer than lib/commonjs — run `corepack yarn prepare` ' +
-        'so the bench measures the code you edited\n'
+      'FAIL: part of lib/commonjs predates the newest src edit — run ' +
+        '`corepack yarn prepare` so the bench measures the code you edited\n'
     );
     process.exit(1);
   }

@@ -3,7 +3,8 @@
  * See ../measure.d.ts for why these exist at all.
  */
 export interface BenchCaseInstance {
-  op: () => void;
+  /** Returns its result so the measurement loop can consume it (DCE guard). */
+  op: () => unknown;
   teardown?: () => void;
 }
 
