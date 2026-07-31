@@ -24,7 +24,8 @@ import type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
  * `reopen()`. Purge through the destination if you have one.
  *
  * No stability promise: these names may change shape in a minor release. The
- * root export is the API with the compatibility commitment.
+ * root export is the API with the compatibility commitment, and
+ * `createFileDestination` there is what almost every caller wants instead.
  */
 
 export type { FileSink } from './specs/FileSink.nitro';

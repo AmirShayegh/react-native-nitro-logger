@@ -21,6 +21,9 @@ import type { FileSinkLike } from '../src/destinations/FileDestination';
 import type { NativeConsoleSinkLike } from '../src/destinations/NativeConsoleDestination';
 import { MemoryWriter } from './helpers/MemoryFileSink';
 
+/** Jest's CommonJS module scope, which this tsconfig has no types for. */
+declare const __dirname: string;
+
 // `mock`-prefixed because Jest hoists the factory above these declarations
 // and refuses to close over anything else.
 const mockAsked: string[] = [];
@@ -154,14 +157,56 @@ describe('the construction path', () => {
     expect(mockAsked).toEqual(['FileSink', 'NativeConsoleSink']);
   });
 
-  test('the root re-exports the very same functions, not copies', () => {
-    const root = require('../src/index') as typeof import('../src/index');
-    const unstable =
-      require('../src/unstable') as typeof import('../src/unstable');
+  test('the raw sink factories are not on the root barrel', () => {
+    const root = require('../src/index') as Record<string, unknown>;
 
-    // Through 0.3.0 both spellings work and must be the same function: two
-    // implementations would be two places for the hybrid-object name to drift.
-    expect(root.createFileSink).toBe(unstable.createFileSink);
-    expect(root.createNativeConsoleSink).toBe(unstable.createNativeConsoleSink);
+    // The 0.3.0 break, pinned from the consumer's side. `/unstable` is not a
+    // second spelling of a root export — it is the only way to these, which is
+    // the whole point of moving them.
+    expect(root.createFileSink).toBeUndefined();
+    expect(root.createNativeConsoleSink).toBeUndefined();
+    // And the replacement really is there, so this cannot pass by the barrel
+    // failing to load.
+    expect(typeof root.createFileDestination).toBe('function');
+    expect(typeof root.createNativeConsoleDestination).toBe('function');
+  });
+
+  test('the hybrid-object names are spelled in exactly one place', () => {
+    // Declared locally rather than imported: this tsconfig pins `types` to
+    // react-native and jest with no `@types/node`, and adding a dependency so
+    // one guard can read a directory is the worse trade. Same reasoning as the
+    // `TextEncoder` declaration in `utf8.test.ts`.
+    const { readFileSync, readdirSync } = require('fs') as {
+      readFileSync(path: string, encoding: string): string;
+      readdirSync(
+        path: string,
+        options: { withFileTypes: true }
+      ): Array<{ name: string; isDirectory(): boolean }>;
+    };
+    const { join } = require('path') as {
+      join(...parts: string[]): string;
+    };
+
+    // Two strings that fail at runtime on a device when wrong, and nowhere
+    // earlier. One file may say them; anything else is a second place to drift.
+    const root = join(__dirname, '..', 'src');
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory()
+          ? walk(join(dir, e.name))
+          : e.name.endsWith('.ts') || e.name.endsWith('.tsx')
+            ? [join(dir, e.name)]
+            : []
+      );
+
+    const files = walk(root);
+    expect(files.length).toBeGreaterThan(10);
+    const callers = files.filter((f) =>
+      /createHybridObject/.test(readFileSync(f, 'utf8'))
+    );
+
+    expect(callers.map((f) => f.slice(root.length + 1))).toEqual([
+      'unstable.ts',
+    ]);
   });
 });

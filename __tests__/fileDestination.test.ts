@@ -459,11 +459,15 @@ describe('FileDestination — collectForSupport', () => {
     destination.dispose();
 
     const first = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
-    first.path = '/tmp/somewhere-else';
+    // The cast is the point, not a workaround. `CollectOutcome`'s fields are
+    // `readonly` from 0.3.0, which tells a TypeScript caller not to do this and
+    // stops nothing at runtime — the annotation is erased, and the object that
+    // crosses the Nitro boundary is an ordinary mutable one. So the hazard the
+    // assertion below guards is still exactly as real as it was.
+    (first as { path: string }).path = '/tmp/somewhere-else';
 
-    // `CollectOutcome` crosses the Nitro boundary with mutable fields. A shared
-    // constant handed to every failed call would let one caller's edit change
-    // what the next one is told.
+    // A shared constant handed to every failed call would let one caller's
+    // edit change what the next one is told.
     const second = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
     expect(second.path).toBe('');
   });

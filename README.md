@@ -153,6 +153,21 @@ handles regulated data.** It covers what the contract does and does not
 promise, the approved-key catalog, and the compliance boundary — in short, a
 build where reveal is possible is a build for synthetic data only.
 
+## Upgrading to 0.3.0
+
+Four breaking changes, each of which the compiler points at:
+
+| Was | Now |
+| --- | --- |
+| `scope.log(msg, 'error', meta)` | `scope.log(msg, { level: 'error', metadata: meta })` |
+| `LogOptions.scopeMetadata` | gone from the public type; set it by using a scope |
+| `import { createFileSink } from 'react-native-nitro-logger'` | `…from 'react-native-nitro-logger/unstable'` |
+| mutating a `CollectOutcome` field | the six spec result types are `readonly` |
+
+The scope's six level methods (`scope.info(msg, meta)` and siblings) did not
+change. Most callers of `createFileSink` want `createFileDestination()`
+instead, which is a root export and does both steps.
+
 ## Writing to a file
 
 ```ts

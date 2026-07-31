@@ -8,6 +8,7 @@ import { createFileSink, createNativeConsoleSink } from './unstable';
 export { Log, Logger } from './Logger';
 export type { DestinationStatus, LogOptions } from './Logger';
 export { ScopedLogger } from './ScopedLogger';
+export type { ScopedLogOptions } from './ScopedLogger';
 export type {
   LogLevel,
   LazyMessage,
@@ -151,12 +152,9 @@ export type {
   CollectOutcome,
 } from './specs/FileSink.nitro';
 
-// ── Raw sink access ─────────────────────────────────────────────────────────
-// Re-exported here through 0.3.0 and moving out at the next major: the sinks
-// themselves now live behind `react-native-nitro-logger/unstable`, which is
-// where a caller that genuinely wants the layer below a destination should
-// import them from. See `src/unstable.ts` for what that layer does not do for
-// you.
-export type { FileSink } from './specs/FileSink.nitro';
-export type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
-export { createFileSink, createNativeConsoleSink } from './unstable';
+// The raw sinks are NOT re-exported here. `createFileSink`,
+// `createNativeConsoleSink`, `FileSink` and `NativeConsoleSink` live at
+// `react-native-nitro-logger/unstable`, which is where a caller that wants the
+// layer below a destination imports them from — and where the hazards of doing
+// so are written down. Use `createFileDestination` above unless you have a
+// reason not to.

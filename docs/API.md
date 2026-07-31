@@ -111,6 +111,25 @@ into every call. Same six level methods as `Logger`, minus the `subsystem`
 argument, since a scope already has one. `scoped()` nests, and a nested scope
 inherits what it does not override — **including the correlation ID**.
 
+| Method | Returns | What it does |
+| --- | --- | --- |
+| `verbose(message, metadata?)` · `debug(…)` · `info(…)` · `warning(…)` · `error(…)` · `todo(…)` | `void` | Emit at that level. Unchanged. |
+| `log(message, options?)` | `void` | The general form. `ScopedLogOptions` is `{ level?, metadata? }`. |
+| `scoped(correlation?, subsystem?, metadata?)` | `ScopedLogger` | Nests. Inherits the correlation unless you pass one. |
+
+**`log` changed shape in 0.3.0.** It was `log(message, level?, metadata?)` —
+three positionals in an order nobody could recall, and different from
+`Logger.log(message, options?)` for no reason beyond how each grew. It now
+takes options, so both spellings agree. The compiler names every line to
+change, and a JavaScript caller that misses one gets the default level rather
+than a level read silently out of an object.
+
+`ScopedLogOptions` has **no `subsystem` and no `correlation`**, deliberately. A
+scope owns both — that is what a scope is — and a call that could override them
+would let one line quietly leave the unit of work every other line belongs to.
+Use `Logger.log` for a genuinely different subsystem, or nest a `scoped()` for
+a different correlation.
+
 That is the opposite of `Logger.scoped()`, which generates a fresh one when you
 omit it, and both are right for the same reason: a correlation ID names a unit
 of work. `Logger.scoped()` starts one. A scope nested inside it is that same
@@ -128,7 +147,7 @@ the runtime cannot redact, and the rules check them in either spelling. That
 was not true before 0.1.2, when only `scoped()` was recognised and the
 constructor reported nothing.
 
-<!-- api: ScopedLogger -->
+<!-- api: ScopedLogger, ScopedLogOptions -->
 
 ### `LogOptions`, `LazyMessage`, `LogLevel`, `LogEntry`
 
@@ -600,9 +619,10 @@ destination is tested, and substituting your own implementation is a legitimate
 thing to want.
 
 `createFileSink()` and `createNativeConsoleSink()` build the raw sinks on their
-own. **They live at `react-native-nitro-logger/unstable` from 0.3.0**, still
-re-exported from the root for this release and moving out at the next major.
-The separate entry point is a warning about stability, and it does not make
+own. **They moved to `react-native-nitro-logger/unstable` in 0.3.0** and are no
+longer root exports — importing them from the root is now a build error naming
+the two lines to change. The separate entry point is a warning about
+stability, and it does not make
 them safe: a raw `clearLogs()` bumps the writer generation, which makes *every*
 `FileDestination` on that file stale — including ones the caller does not know
 about. Nothing notifies them. Each finds out when it next tries to write, has
@@ -610,10 +630,9 @@ the append rejected as a stale generation, fences itself and loses that record;
 from then on it reports `isEnabled: false` until something calls `reopen()`.
 Purge through the destination when you have one.
 
-`FileSink` and `NativeConsoleSink` are the Nitro interfaces. They are defined
-at `/unstable` now and, like the two factories, stay re-exported from the root
-through 0.3.0. `FileSinkLike` and `NativeConsoleSinkLike` are structural
-equivalents that stay at the root for good — they are what lets tests drive a
+`FileSink` and `NativeConsoleSink` are the Nitro interfaces, and moved to
+`/unstable` with the two factories. `FileSinkLike` and `NativeConsoleSinkLike`
+are structural equivalents that stay at the root — they are what lets tests drive a
 destination without a native runtime, and what you implement to substitute your
 own.
 
@@ -885,6 +904,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `scheduleMaintenance`
 - `ScheduleMaintenanceOptions`
 - `ScopedLogger`
+- `ScopedLogOptions`
 - `SinkStatus`
 - `UNCAUGHT_ERROR_MESSAGE`
 - `UNHANDLED_REJECTION_MESSAGE`

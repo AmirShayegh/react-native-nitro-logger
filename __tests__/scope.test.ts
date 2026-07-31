@@ -165,3 +165,87 @@ describe('ScopedLogger.scoped — correlation inheritance', () => {
     expect(dest.entries[0]!.correlation).toBe('unit-1');
   });
 });
+
+/**
+ * The 0.3.0 signature break, pinned from the caller's side.
+ *
+ * `log` took `(message, level?, metadata?)` and now takes
+ * `(message, options?)`. TypeScript catches the change at every call site,
+ * which is the point of making it loudly rather than adding an overload — but
+ * a JavaScript caller gets no such help, so what the old spelling does now is
+ * worth pinning too.
+ */
+describe('ScopedLogger.log — options rather than positionals', () => {
+  test('level and metadata come off the options object', () => {
+    const { logger, dest } = makeLogger();
+    const scope = logger.scoped('c1', 'net');
+
+    scope.log('with options', { level: 'error', metadata: { attempt: 2 } });
+
+    expect(dest.entries).toHaveLength(1);
+    expect(dest.entries[0]).toMatchObject({
+      level: 'error',
+      message: 'with options',
+      subsystem: 'net',
+      correlation: 'c1',
+      metadata: { attempt: 2 },
+    });
+  });
+
+  test('omitting options logs at info, as the positional default did', () => {
+    const { logger, dest } = makeLogger();
+    logger.scoped('c1').log('bare');
+    expect(dest.entries[0]).toMatchObject({ level: 'info', message: 'bare' });
+  });
+
+  test('the six level methods are unchanged', () => {
+    const { logger, dest } = makeLogger();
+    const scope = logger.scoped('c1');
+
+    scope.warning('still positional', { attempt: 1 });
+
+    expect(dest.entries[0]).toMatchObject({
+      level: 'warning',
+      message: 'still positional',
+      metadata: { attempt: 1 },
+    });
+  });
+
+  /**
+   * A JavaScript caller that missed the change passes a level string where an
+   * options object goes. The runtime reads `options?.level` off a string,
+   * which is `undefined`, so the entry is logged at the default level — the
+   * message still reaches the file, which is the behaviour a logger owes, and
+   * the level is wrong in the safe direction rather than read out of an object
+   * that is not one.
+   */
+  test('a stale positional call still logs, at the default level', () => {
+    const { logger, dest } = makeLogger();
+    const scope = logger.scoped('c1');
+
+    (scope.log as (m: string, o?: unknown) => void)('stale call', 'error');
+
+    expect(dest.entries).toHaveLength(1);
+    expect(dest.entries[0]).toMatchObject({
+      level: 'info',
+      message: 'stale call',
+    });
+  });
+
+  test('a scope keeps its subsystem and correlation whatever a call says', () => {
+    const { logger, dest } = makeLogger();
+    const scope = logger.scoped('owned', 'billing');
+
+    // Not in `ScopedLogOptions`, so this is a type error — and inert at
+    // runtime, which is what makes the omission safe rather than merely tidy.
+    (scope.log as (m: string, o?: unknown) => void)('hijack attempt', {
+      subsystem: 'other',
+      correlation: 'someone-elses',
+    });
+
+    expect(dest.entries[0]).toMatchObject({
+      subsystem: 'billing',
+      correlation: 'owned',
+    });
+  });
+});

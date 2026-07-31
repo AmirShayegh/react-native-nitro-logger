@@ -696,6 +696,15 @@ describe('no-computed-metadata-key', () => {
         "const s = Log.scoped('c'); s.info('m', { state: 'x' });",
         "Log.scoped('c', 'sub', { user: 'u1' });",
         "Log.log('m', { metadata: { state: 'x' } });",
+        // A resolved `ScopedLogger` never reads `scopeMetadata` off its
+        // caller: `log` takes `ScopedLogOptions` and supplies the scope's own
+        // defaults itself, so this property is dropped on the floor. Reporting
+        // it would be a privacy warning about data that cannot reach a log,
+        // which is how a rule gets switched off. The `Log.log` and
+        // `unknownLogger.log` twins in the invalid block are what keep this
+        // from being a hole rather than a distinction.
+        "const s = Log.scoped('c'); s.log('m', { scopeMetadata: { [patientId]: 'x' } });",
+        "Log.scoped('c').log('m', { scopeMetadata: { patient } });",
         "Log.info('m', undefined, 'network');",
         // A const object the rule can follow is as reviewable as an inline one.
         `${IMPORT_LOG} const md = { state: 'x' }; Log.info('m', md);`,
@@ -813,12 +822,12 @@ describe('no-computed-metadata-key', () => {
         // A ScopedLogger named `logger` must not be read as the Logger, or
         // its third argument goes unexamined.
         {
-          code: "const logger = Log.scoped('c'); logger.log('m', 'info', { [patientId]: 'x' });",
+          code: "const logger = Log.scoped('c'); logger.log('m', { level: 'info', metadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         // An unresolved receiver could be either shape, so both are checked.
         {
-          code: "logger.log('m', 'info', { [patientId]: 'x' });",
+          code: "logger.log('m', { level: 'info', metadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         // Catalog enforcement mirrors the runtime's approved-key list.
@@ -902,6 +911,15 @@ describe('no-computed-metadata-key', () => {
         },
         {
           code: "Log.logMessage('m', { scopeMetadata: { [patientId]: 'x' } });",
+          errors: [{ messageId: 'computed' }],
+        },
+        // A receiver nobody could resolve is checked as both shapes, because
+        // the Logger reading is live and this rule fails loud.
+        // A receiver nobody could resolve is checked as both shapes: the
+        // Logger reading is live, and this rule fails loud. Note the object
+        // literal does not settle it — since 0.3.0 both `log`s take one.
+        {
+          code: "logger.log('m', { scopeMetadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         {
@@ -1160,7 +1178,7 @@ describe('literal-subsystem', () => {
       // ScopedLogger has no subsystem argument; the second argument is
       // metadata and must not be flagged.
       "const s = Log.scoped('c'); s.info('m', { state: 'x' });",
-      "const s = Log.scoped('c'); s.log('m', 'info', { state: 'x' });",
+      "const s = Log.scoped('c'); s.log('m', { level: 'info', metadata: { state: 'x' } });",
       // Free functions. Every check in this rule starts from a receiver, and
       // these have none, so `installErrorHandler({ subsystem })` was invisible
       // to the entire plugin — on a name that rides every uncaught-error entry
@@ -1610,8 +1628,16 @@ describe('plugin configs', () => {
    * options; wrong in the other and a whole method's options object goes
    * unchecked, which is exactly what `logMessage` did in the spread branch of
    * `no-derived-correlation`. `METADATA_OPTION_FIELDS` says which fields of
-   * that object reach redaction, and a field added to `LogOptions` and not
-   * here is caller data nothing lints.
+   * that object reach redaction, and a field added to the options shape and
+   * not here is caller data nothing lints.
+   *
+   * **Both option interfaces, not just the public one.** `scopeMetadata` moved
+   * off `LogOptions` into the unexported `InternalLogOptions` in 0.3.0, and
+   * reading only the public interface here would have quietly demanded the
+   * plugin stop checking it. Nothing about the runtime changed: `logMessage`
+   * reads that field off whatever object it is handed, so a JavaScript caller
+   * can still put a patient name there, and the rule is now the *only* thing
+   * that would say so. What the plugin models is what the runtime reads.
    *
    * Read from the TypeScript AST rather than restated, so the assertion is
    * against the source and not against a second copy of the same guess.
@@ -1642,7 +1668,8 @@ describe('plugin configs', () => {
     for (const statement of file.statements) {
       if (
         ts.isInterfaceDeclaration(statement) &&
-        statement.name.text === 'LogOptions'
+        (statement.name.text === 'LogOptions' ||
+          statement.name.text === 'InternalLogOptions')
       ) {
         for (const member of statement.members) {
           if (!ts.isPropertySignature(member) || !member.type) continue;
@@ -1672,6 +1699,11 @@ describe('plugin configs', () => {
     // otherwise satisfy every comparison below.
     expect(optionFields.size).toBeGreaterThan(3);
     expect(optionsMethods.size).toBeGreaterThan(0);
+    // And guards the union specifically: were `InternalLogOptions` renamed or
+    // folded away, the loop above would read one interface, find no
+    // `scopeMetadata`, and demand a *smaller* model rather than failing.
+    expect(optionFields.has('scopeMetadata')).toBe(true);
+    expect(optionFields.has('metadata')).toBe(true);
 
     expect([...optionsMethods].sort()).toEqual([...OPTIONS_METHODS].sort());
 

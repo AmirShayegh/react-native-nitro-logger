@@ -9,17 +9,17 @@ import type { HybridObject } from 'react-native-nitro-modules';
  */
 export interface RotationConfig {
   /** Soft threshold; overshoot bounded by one batch. */
-  maxFileSizeBytes: number;
+  readonly maxFileSizeBytes: number;
   /** Archives to retain by count; 0 keeps none. */
-  maxArchivedFilesCount: number;
+  readonly maxArchivedFilesCount: number;
   /** Rotate the current file once this old, regardless of size. */
-  maxFileAgeSeconds?: number;
+  readonly maxFileAgeSeconds?: number;
   /** Gzip archives as they rotate out. */
-  compressArchives: boolean;
+  readonly compressArchives: boolean;
   /** Delete archives older than this even if under the count cap. */
-  maxArchiveAgeSeconds?: number;
+  readonly maxArchiveAgeSeconds?: number;
   /** Bound on current file + all archives combined. */
-  maxTotalLogBytes?: number;
+  readonly maxTotalLogBytes?: number;
 }
 
 /** Why an appendBatch was not accepted. */
@@ -36,39 +36,39 @@ export type RejectReason = 'full' | 'staleGeneration' | 'closed' | 'failed';
  * durably flushed.
  */
 export interface SinkStatus {
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
   /** Payload-free degradation bitmask: rotation|gzip|prune|sidecar|protection|exclusivity. */
-  degraded: number;
+  readonly degraded: number;
 }
 
 export interface AppendResult {
-  accepted: boolean;
+  readonly accepted: boolean;
   /** Present only when accepted is false. */
-  rejectReason?: RejectReason;
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
-  degraded: number;
+  readonly rejectReason?: RejectReason;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
+  readonly degraded: number;
 }
 
 export interface FlushOutcome {
   /** True when every previously accepted byte reached storage and fsync. */
-  durable: boolean;
-  timedOut: boolean;
-  pendingBytes: number;
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
-  degraded: number;
+  readonly durable: boolean;
+  readonly timedOut: boolean;
+  readonly pendingBytes: number;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
+  readonly degraded: number;
 }
 
 export interface ClearOutcome {
-  deletedCount: number;
-  failedPaths: string[];
+  readonly deletedCount: number;
+  readonly failedPaths: readonly string[];
   /** False when any artifact survived or the deadline elapsed. */
-  durable: boolean;
+  readonly durable: boolean;
   /**
    * Whether the writer came back with a usable file afterwards.
    *
@@ -83,7 +83,7 @@ export interface ClearOutcome {
    * is genuinely complete — which is what a compliance caller asked — but the
    * destination must stay fenced until an explicit retry gets a live file back.
    */
-  rebound: boolean;
+  readonly rebound: boolean;
 }
 
 /**
@@ -103,11 +103,11 @@ export interface CollectOutcome {
    * write-a-file-here primitive is not what a support flow needs and is a
    * much larger thing to have to defend.
    */
-  path: string;
+  readonly path: string;
   /** Size of the bundle on disk. Zero when `path` is empty. */
-  byteCount: number;
+  readonly byteCount: number;
   /** How many log files went in. */
-  sourceFileCount: number;
+  readonly sourceFileCount: number;
   /**
    * Some log files were left out.
    *
@@ -117,7 +117,7 @@ export interface CollectOutcome {
    * `getLogFilePaths().length`, not by a reason string that would have to
    * name a path.
    */
-  truncated: boolean;
+  readonly truncated: boolean;
   /**
    * The collect ran to the end of what it set out to do.
    *
@@ -126,7 +126,7 @@ export interface CollectOutcome {
    * was nothing to collect, which is a different answer from a failure and
    * one a support flow should not report as an error.
    */
-  complete: boolean;
+  readonly complete: boolean;
 }
 
 /**

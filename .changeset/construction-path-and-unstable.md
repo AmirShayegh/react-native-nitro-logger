@@ -16,11 +16,11 @@ double is how it is tested and substituting your own implementation is a
 legitimate thing to want.
 
 `createFileSink` and `createNativeConsoleSink`, with the `FileSink` and
-`NativeConsoleSink` types, now live at `react-native-nitro-logger/unstable`.
-They are still re-exported from the root for this release and move out at the
-next major. The root re-export is the *same function object*, not a second
-implementation — there is one place each hybrid-object name is spelled, and a
-test pins that.
+`NativeConsoleSink` types, now live at `react-native-nitro-logger/unstable`
+and are no longer root exports — see the breaking-changes entry. There is still
+exactly one place each hybrid-object name is spelled, and a test walks `src/`
+to prove it: those two strings fail at runtime on a device and nowhere
+earlier.
 
 The separate entry point is a warning about stability. It does not make the
 raw sinks safe, and the hazard has nothing to do with stability: a raw

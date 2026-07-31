@@ -17,12 +17,36 @@ export interface LogOptions {
   level?: LogLevel;
   subsystem?: string;
   metadata?: LogMetadata;
+  correlation?: string;
+}
+
+/**
+ * {@link LogOptions} plus the one field only a `ScopedLogger` should set.
+ *
+ * Exported for `ScopedLogger` to import and for nothing else — deliberately
+ * absent from the package barrel, which is what makes it internal. An
+ * `@internal` tag would not have done: it is a doc convention, and the field
+ * would still be there in the JavaScript build, in the editor's completions,
+ * and in every consumer's mental model of the options object.
+ *
+ * `scopeMetadata` was on the public interface through 0.2.0 and should not
+ * have been. It is a scope's own defaults, and the only correct value is the
+ * one the scope threads through; a caller passing it directly gets metadata
+ * that loses every collision with `metadata` and is validated one step more
+ * weakly, for no benefit over just using `metadata`.
+ *
+ * **`logMessage` still reads it at runtime**, from any object it is handed —
+ * removing a field from a TypeScript interface removes nothing from a
+ * JavaScript build. That is deliberate rather than an oversight: the
+ * redaction path must treat whatever arrives on that field as caller data, and
+ * the ESLint rules go on checking it for exactly that reason.
+ */
+export interface InternalLogOptions extends LogOptions {
   /** Scope defaults, outranked by `metadata` on any key they share. Kept a
    * separate field rather than pre-merged: redaction settles precedence per
    * key and validates the winner before reading it, which a merge would
    * defeat by reading everything first. `ScopedLogger` sets this. */
-  scopeMetadata?: LogMetadata;
-  correlation?: string;
+  readonly scopeMetadata?: LogMetadata;
 }
 
 /** A destination is cut off after this many consecutive write failures. */
@@ -491,7 +515,9 @@ export class Logger {
       level,
       message: text,
       metadata: redactMetadata(
-        options?.scopeMetadata,
+        // Read off the wider shape, not the public one: a JavaScript caller
+        // can put anything on this field and the redaction path has to see it.
+        (options as InternalLogOptions | undefined)?.scopeMetadata,
         options?.metadata,
         this.privacySettings()
       ),

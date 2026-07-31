@@ -56,11 +56,16 @@ const LOG_METHODS = new Set([...LEVEL_METHODS, 'log', 'logMessage']);
 const CONFIG_METHODS = new Set(['subsystem', 'resetSubsystem']);
 
 /**
- * Methods whose second argument is a `LogOptions` object rather than metadata.
+ * Methods whose second argument is an options object rather than metadata.
  *
- * `Log.log` is only this shape when its receiver resolves to the Logger — a
- * ScopedLogger's `log` takes `(message, level, metadata)`. `logMessage` has no
- * such overload, so it is always the options shape.
+ * From 0.3.0 both `log`s agree: `ScopedLogger.log` takes
+ * `(message, ScopedLogOptions)` where it used to take
+ * `(message, level, metadata)`, so the second argument is an options object
+ * whichever receiver a call turns out to have, and the metadata question no
+ * longer needs the receiver resolved at all. What still differs is which
+ * fields that object may carry — a scope owns its subsystem and correlation,
+ * so those appear only in the Logger shape, which is what
+ * {@link logCallShape} is still consulted for.
  */
 const OPTIONS_METHODS = new Set(['log', 'logMessage']);
 
@@ -73,6 +78,16 @@ const OPTIONS_METHODS = new Set(['log', 'logMessage']);
  * the same pipeline unchecked.
  */
 const METADATA_OPTION_FIELDS = ['metadata', 'scopeMetadata'];
+
+/**
+ * The one metadata field a resolved `ScopedLogger` call cannot deliver.
+ *
+ * `ScopedLogger.log` reads `options.metadata` and supplies the scope's own
+ * defaults itself, so this property on a `ScopedLogOptions` is ignored. Named
+ * here rather than spelled inline at the filter, so the two lists cannot drift
+ * apart silently.
+ */
+const SCOPE_METADATA_FIELD = 'scopeMetadata';
 
 /** Every method whose arguments are public by contract. */
 const API_METHODS = new Set([...LOG_METHODS, ...CONFIG_METHODS, 'scoped']);
@@ -2053,11 +2068,20 @@ function optionsProperty(context, node, name) {
 }
 
 /**
- * `Log.log(msg, options)` and `scope.log(msg, level, meta)` share a name.
- * When the receiver is ambiguous the second argument decides: a bare level
- * string means the ScopedLogger shape, an object literal means the Logger
- * shape, and anything else — including an omitted argument, since a scope's
- * level is defaulted — means both have to be checked.
+ * Which option fields a `log` call's second argument may actually carry.
+ *
+ * Both receivers take an options object there since 0.3.0, so this no longer
+ * decides *where* to look — only whether `subsystem` and `correlation` are
+ * fields the runtime would read. A `ScopedLogOptions` has neither: a scope
+ * owns both, and a call that spelled them would be handing the runtime
+ * properties it never looks at, so reporting one would be a warning about
+ * something that is not logged.
+ *
+ * When the receiver is ambiguous the second argument still offers a hint — a
+ * bare level string is the pre-0.3.0 scoped spelling and carries no fields
+ * either way — and anything unresolved means both interpretations are checked,
+ * which is the fail-loud direction for a rule about data that must not reach a
+ * log.
  */
 function logCallShape({ receiver, args, method }, context) {
   // `logMessage` exists only on the Logger and takes exactly one shape,
@@ -2068,8 +2092,15 @@ function logCallShape({ receiver, args, method }, context) {
   if (receiver === 'logger') return 'logger';
   const second = unwrap(args[1]);
   const level = staticStringValue(context, second);
+  // A bare level string is the pre-0.3.0 scoped spelling, and carries no
+  // option fields under any reading.
   if (level !== null && LEVEL_METHODS.has(level)) return 'scoped';
-  if (second && second.type === 'ObjectExpression') return 'logger';
+  // An object literal used to mean the Logger shape, because only the Logger
+  // took one. Since 0.3.0 both do, so it distinguishes nothing and saying
+  // 'logger' here would be certainty this function does not have. 'both' is
+  // the honest answer and the fail-loud one: a field that only the Logger
+  // reads is still reported, which is the right direction for a rule about
+  // data that must not reach a log.
   return 'both';
 }
 
@@ -2077,8 +2108,8 @@ function logCallShape({ receiver, args, method }, context) {
  * Every argument position carrying metadata for this call.
  *
  * `Log.<level>(message, metadata, subsystem)` · `scope.<level>(message,
- * metadata)` · `scope.log(message, level, metadata)` · `Log.log(message,
- * { metadata })`.
+ * metadata)` · `Log.log(message, { metadata })` · `scope.log(message,
+ * { metadata })` — the last two being the same position since 0.3.0.
  */
 function metadataArguments(context, call) {
   // Spread is handled by the rule, which has the call node to report on.
@@ -2088,16 +2119,29 @@ function metadataArguments(context, call) {
     return isOmitted(context, args[1]) ? [] : [found(args[1])];
   }
 
+  // `metadata` needs no shape check any more: both `log`s read it from the
+  // same field of the same argument since 0.3.0.
+  //
+  // `scopeMetadata` still does, for the reason `subsystem` and `correlation`
+  // do. `ScopedLogger.log` reads `options.metadata` and builds its own
+  // internal options with the scope's own defaults, so a `scopeMetadata`
+  // property on a `ScopedLogOptions` is dropped on the floor — reporting one
+  // would be a privacy warning about data that cannot reach a log, which is
+  // the kind of false positive that gets a rule switched off. Through the
+  // Logger, or through a receiver nobody could resolve, it is live: the field
+  // came off the public `LogOptions` in 0.3.0 and `logMessage` still reads it
+  // from whatever object arrives, which makes this rule the only thing left
+  // that would notice a patient name in it.
   const shape = logCallShape(call, context);
+  const fields =
+    shape === 'scoped'
+      ? METADATA_OPTION_FIELDS.filter((f) => f !== SCOPE_METADATA_FIELD)
+      : METADATA_OPTION_FIELDS;
+
   const results = [];
-  if (shape === 'scoped' || shape === 'both') {
-    if (!isOmitted(context, args[2])) results.push(found(args[2]));
-  }
-  if (shape === 'logger' || shape === 'both') {
-    for (const field of METADATA_OPTION_FIELDS) {
-      const property = optionsProperty(context, args[1], field);
-      if (property.kind !== 'absent') results.push(property);
-    }
+  for (const field of fields) {
+    const property = optionsProperty(context, args[1], field);
+    if (property.kind !== 'absent') results.push(property);
   }
   // One node, one result. An options object nobody can read is unreadable for
   // every field at once — a spread or a computed key makes `optionsProperty`

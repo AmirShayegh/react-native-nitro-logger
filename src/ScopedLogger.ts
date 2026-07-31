@@ -1,6 +1,22 @@
 import type { LazyMessage, LogLevel, LogMetadata } from './types';
-import type { Logger } from './Logger';
+import type { InternalLogOptions, Logger } from './Logger';
 import { safeSnapshotMetadata } from './metadata';
+
+/**
+ * What a {@link ScopedLogger.log} call may say for itself.
+ *
+ * Two fields, and the omissions are the design. A scope owns its `subsystem`
+ * and its `correlation` — that is what a scope is — so neither appears here.
+ * A call that could override them would let one line quietly leave the unit of
+ * work every other line belongs to, which is the trail a scope exists to keep
+ * intact.
+ */
+export interface ScopedLogOptions {
+  /** Defaults to `'info'`, as the old positional form did. */
+  readonly level?: LogLevel;
+  /** Call-site metadata. Wins over the scope's defaults on any shared key. */
+  readonly metadata?: LogMetadata;
+}
 
 /**
  * A lightweight logger that tags every message with a correlation ID,
@@ -29,13 +45,31 @@ export class ScopedLogger {
     this.metadata = snapshot ? Object.freeze(snapshot) : undefined;
   }
 
-  log(
-    message: LazyMessage,
-    level: LogLevel = 'info',
-    metadata?: LogMetadata
-  ): void {
-    this.logger.logMessage(message, {
-      level,
+  /**
+   * The general form, taking options rather than positional arguments.
+   *
+   * **Changed in 0.3.0**, and loudly on purpose. It was
+   * `log(message, level?, metadata?)` — three positionals, in an order nobody
+   * could recall, and different from `Logger.log(message, options?)` for no
+   * reason beyond how each grew. A caller that passed a level still passes a
+   * level; the compiler names the two lines to change, and a JavaScript caller
+   * gets `'info'` rather than a level silently read from an object.
+   *
+   * `ScopedLogOptions` deliberately has no `subsystem` and no `correlation`:
+   * a scope owns both, and letting a call override them would make the scope's
+   * one job — every line in this unit of work carrying the same tag —
+   * something a single call could quietly opt out of. Use `Logger.log` or a
+   * nested `scoped()` for a genuinely different unit.
+   *
+   * The six level methods are unchanged: `info(message, metadata?)` and its
+   * siblings already had no ambiguity worth fixing.
+   */
+  log(message: LazyMessage, options?: ScopedLogOptions): void {
+    // Typed as the internal shape rather than passed as a literal: the public
+    // `LogOptions` no longer carries `scopeMetadata`, and this is the one
+    // caller that is supposed to set it.
+    const threaded: InternalLogOptions = {
+      level: options?.level ?? 'info',
       subsystem: this.subsystem,
       // Handed over unmerged: redaction settles precedence per key and
       // validates the winner BEFORE reading it, so a getter behind a
@@ -48,33 +82,34 @@ export class ScopedLogger {
       // time. A default behind an unapproved key was therefore read once, when
       // the scope was built. Call-site metadata has no such step.
       scopeMetadata: this.metadata,
-      metadata,
+      metadata: options?.metadata,
       correlation: this.correlation,
-    });
+    };
+    this.logger.logMessage(message, threaded);
   }
 
   verbose(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'verbose', metadata);
+    this.log(message, { level: 'verbose', metadata });
   }
 
   debug(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'debug', metadata);
+    this.log(message, { level: 'debug', metadata });
   }
 
   info(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'info', metadata);
+    this.log(message, { level: 'info', metadata });
   }
 
   warning(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'warning', metadata);
+    this.log(message, { level: 'warning', metadata });
   }
 
   error(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'error', metadata);
+    this.log(message, { level: 'error', metadata });
   }
 
   todo(message: LazyMessage, metadata?: LogMetadata): void {
-    this.log(message, 'todo', metadata);
+    this.log(message, { level: 'todo', metadata });
   }
 
   /**
