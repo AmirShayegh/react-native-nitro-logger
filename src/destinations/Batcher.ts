@@ -73,7 +73,22 @@ export interface BatcherOptions {
   readonly maxPendingBytes?: number;
   /** Sink queue depth at which pushing pauses. Default 256 KB. */
   readonly watermarkBytes?: number;
-  /** Largest single batch. Default 256 KB. */
+  /**
+   * Largest single batch of RECORDS. Default 256 KB.
+   *
+   * A consolidated loss notice is appended after this budget has been spent
+   * and does not count against it, so a batch handed to the sink can exceed
+   * this by the size of one notice — up to `maxEntryBytes` on the
+   * destination, 64 KB at its default. Deliberate: charging the notice
+   * against the same budget would let a large one starve the records out of
+   * their own batch, which is the pipeline's diagnostics jamming the
+   * pipeline. Bounded on both sides — the destination renders every notice
+   * under `maxEntryBytes`, and a sink that still cannot take the batch
+   * answers `full`, which sheds records until it fits.
+   *
+   * Pinned by 'the loss notice rides on top of the batch budget, not inside
+   * it'.
+   */
   readonly maxBatchBytes?: number;
 }
 
@@ -582,11 +597,24 @@ export class Batcher {
 
     // The notice goes after the records it does not describe, so a reader
     // meets the surviving entries first and the gap where the others were.
-    const batch = `${lines.join('\n')}\n`;
+    //
+    // Counted BEFORE the sentinel, and that ordering is the whole risk in
+    // this shape: this number is what the sink is told it is receiving, and
+    // what a rejected batch is counted as lost in. An empty sentinel is not a
+    // record. Pinned by 'sends the records it batched, and says how many',
+    // 'holds records until the byte threshold, then sends one batch' and 'a
+    // failed batch is lost whole — the batch is the loss unit'.
+    const batchEntryCount = lines.length;
+    // The record terminator as a final empty element, so one `join` produces
+    // the payload. `${lines.join('\n')}\n` built the joined string and then a
+    // second one a byte longer, which on the catch-up path is a quarter of a
+    // megabyte materialised twice.
+    lines.push('');
+    const batch = lines.join('\n');
 
     let result: AppendResult;
     try {
-      result = this.target.appendBatch(batch, lines.length);
+      result = this.target.appendBatch(batch, batchEntryCount);
     } catch {
       // A throwing sink is a failing sink. The batch is gone either way.
       this.loseHead(entryCount, entryBytes);

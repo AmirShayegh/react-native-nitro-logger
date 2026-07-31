@@ -382,6 +382,43 @@ describe('Batcher — backpressure', () => {
     expect(writer.lines()).toContain('held');
   });
 
+  test('the loss notice rides on top of the batch budget, not inside it', () => {
+    // `maxBatchBytes` bounds the RECORDS in a batch, and the consolidated loss
+    // notice is appended after that loop has closed — its bytes never join
+    // `entryBytes`. So a batch can exceed the budget by one notice, which at
+    // the defaults is 256 KB of records plus up to 64 KB of notice.
+    //
+    // That is deliberate headroom rather than an oversight, and this test is
+    // where it stops being an undocumented one. The alternative — counting the
+    // notice against the budget — would let a large enough notice starve the
+    // records out of their own batch, which is the pipeline's diagnostics
+    // jamming the pipeline. The overshoot is bounded on both sides: the
+    // destination renders every notice under `maxEntryBytes`, and a sink that
+    // still cannot take the batch answers `full`, which sheds records.
+    //
+    // What is asserted is the bound, not merely that an overshoot happens:
+    // records within budget, the notice on top, and the excess exactly one
+    // notice wide.
+    const { batcher, sink } = build({
+      batchBytes: 1_000_000, // nothing pushes until the explicit flush
+      maxBatchBytes: 50, // two 21-byte records fit, and no more
+      maxPendingEntries: 2, // so the third is dropped and owed
+    });
+
+    batcher.add(record(20, 'a'));
+    batcher.add(record(20, 'b'));
+    batcher.add(record(20, 'c')); // refused at the entry cap: 1 entry/21 bytes
+    batcher.flush(1000);
+
+    const sent = sink.appendCalls[0]!.batch;
+    const noticeLine = notice({ entries: 1, bytes: 21 });
+    expect(sent.endsWith(`${noticeLine}\n`)).toBe(true);
+
+    const withoutNotice = sent.length - (noticeLine.length + 1);
+    expect(withoutNotice).toBeLessThanOrEqual(50);
+    expect(sent.length).toBeGreaterThan(50);
+  });
+
   test('a batch that leaves records behind leaves exactly those behind', () => {
     // A PARTIAL drain: `maxBatchBytes` binds before the buffer is empty, so
     // the batch takes a prefix and the rest must still be there afterwards.

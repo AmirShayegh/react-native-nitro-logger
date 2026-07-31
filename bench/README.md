@@ -90,10 +90,25 @@ window said a change with no plausible connection to the case had tripled
 its cost.
 
 When the machine cannot be quietened, **alternate the two builds** rather
-than running all of one side then all of the other, and keep the minimum
-per side. Drift then has to be present for every repetition of one side and
-absent from every repetition of the other to survive, instead of merely
-happening to fall between the two halves of a single pair.
+than running all of one side then all of the other. Drift then has to be
+present for every repetition of one side and absent from every repetition
+of the other to survive, instead of merely happening to fall between the
+two halves of a single pair.
+
+**Take the median per side, and print the spread.** Earlier this file said
+to take the minimum, on the usual reasoning that contention only ever makes
+a number worse. That is not true here. Measuring B4 across four
+interleaved rounds, one reading of `batcher.add.saturated-drop` came back
+at 130 ns while the other seven readings of the same code ranged 394–410;
+the minimum-per-side rule promoted that single glitch to the reported
+value and produced a confident **−67% on a case the change cannot reach**.
+The same case run six times on its own reads 397–406, so it is not
+bimodal — one reading was simply wrong, and low.
+
+A median needs a majority of the readings to be wrong before it moves, and
+a printed spread makes an outlier something the reader can see instead of
+something the statistic absorbs. If the two spreads overlap, there is no
+result, whatever the medians say.
 
 ## What this proves, and does not
 

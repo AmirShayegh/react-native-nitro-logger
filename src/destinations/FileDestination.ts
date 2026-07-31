@@ -81,6 +81,14 @@ export interface FileDestinationOptions {
   /**
    * Largest single rendered record, in UTF-8 bytes. Default 64 KB — roomy for
    * a stack trace, far under the sink's payload cap so a batch always fits.
+   *
+   * It also bounds the batcher's OVERSHOOT of `maxBatchBytes`. A consolidated
+   * loss notice is rendered under this limit and then appended to a batch
+   * whose record budget is already spent, so the largest batch the sink can
+   * be handed is `maxBatchBytes + maxEntryBytes` — 320 KB at both defaults,
+   * not 256. Raising this raises that, which is the reason the two numbers
+   * are worth reading together. See `maxBatchBytes` in `Batcher.ts` for why
+   * the notice is not charged against the budget.
    */
   readonly maxEntryBytes?: number;
   readonly batchBytes?: number;
