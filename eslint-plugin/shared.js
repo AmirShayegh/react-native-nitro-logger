@@ -1598,7 +1598,32 @@ function classifyReceiver(context, node, seen = new Set()) {
       }
 
       const init = bindingInit(variable);
-      if (init) return classifyReceiver(context, init, seen);
+      if (init) {
+        const resolved = classifyReceiver(context, init, seen);
+        if (resolved !== null) return resolved;
+        // A `null` here used to end the classification, and that conflated
+        // two different answers.
+        //
+        // `new Widget()` is a null that was *decided*: `classifyConstruction`
+        // looked at the callee, found nothing logger-shaped, and said so.
+        // That is evidence, and `loggerClassNames` is how a project narrows
+        // what counts — so it has to keep meaning something.
+        //
+        // `useLogger()` is a null that is merely *undecided*: a factory this
+        // analysis cannot see through. Treating it as evidence switched every
+        // rule off at the call sites most likely to be real — `const Log =
+        // useLogger()` is the canonical spelling, bound to the documented
+        // name — and did it silently. That is rule 1 at the top of this file:
+        // a receiver that merely might be a logger is `'ambiguous'`, not
+        // discarded.
+        //
+        // So only the undecided case falls through to the name heuristic, and
+        // it widens to `'ambiguous'`, never `'logger'`. The distinction is
+        // provenance: what comes out of an opaque factory may behave like the
+        // singleton, but nothing here establishes that it IS the singleton,
+        // and correlation provenance must not assume it.
+        if (unwrap(init)?.type === 'NewExpression') return null;
+      }
 
       // A parameter, or a binding we cannot pin down. The name is a hint,
       // never proof.

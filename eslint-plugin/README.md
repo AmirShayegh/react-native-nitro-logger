@@ -185,6 +185,24 @@ They are a control, not a proof. Analysis is per-file and stops at the module
 boundary: metadata assembled in another file and imported arrives opaque, and is
 reported as `unanalyzable` rather than approved.
 
+### A logger from a factory is checked, but never trusted
+
+`const Log = useLogger()` is followed as far as it can be. The rules cannot
+see through the call, so they fall back on the name: a binding spelled like a
+logger is treated as one that **might** be, and every rule applies at its call
+sites. Until 0.3.0 an unresolvable initializer switched all four rules off
+instead, which is the opposite of what a receiver nobody can rule out deserves.
+
+What it does not buy is trust. Such a receiver is `ambiguous`, never the
+singleton, so anything that depends on knowing *which* logger you have stays
+conservative — `no-derived-correlation` in particular will not assume the
+argument roles of `Log.scoped()` on a value whose provenance is unknown.
+
+Constructions are the deliberate exception. `new Widget()` was examined and
+found not to be a logger, and that is a decision rather than a shrug, so it
+still ends the analysis — which is what keeps `loggerClassNames` able to
+narrow anything.
+
 ### Loggers installed by a function call are not followed
 
 This is the one limitation worth knowing before you rely on these rules.

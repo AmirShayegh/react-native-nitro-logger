@@ -2517,3 +2517,111 @@ describe('every constructible logger is classified', () => {
     expect(['logger', 'scoped']).toContain(classification);
   });
 });
+
+/**
+ * A logger that arrives from a factory, which is how most apps get one.
+ *
+ * `classifyReceiver` resolved a binding's initializer and returned whatever
+ * that produced — including `null`. So a binding whose initializer it could
+ * not see through was classified as "not a logger", and every rule went
+ * silent at every call on it.
+ *
+ * The spelling that hits hardest is the ordinary one:
+ *
+ *     const Log = useLogger();
+ *     Log.info(`patient ${patient.mrn} admitted`);
+ *
+ * Canonical name, real logger, PHI in a template literal, and not one
+ * diagnostic — because a hook is a call this analysis cannot follow. The
+ * file's own rule 1 says a receiver that merely might be a logger is
+ * `'ambiguous'` rather than discarded, and this was the place that did not
+ * honour it.
+ *
+ * The widening is deliberately to `'ambiguous'` and not `'logger'`, and
+ * deliberately does not apply to a construction: `new Widget()` is a `null`
+ * that was *decided*, which is what keeps `loggerClassNames` meaningful.
+ */
+describe('a logger bound from an opaque factory is still checked', () => {
+  const lint = (code, rules) =>
+    new Linter()
+      .verify(code, {
+        plugins: { n: plugin },
+        languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+        rules,
+      })
+      .map((m) => m.messageId);
+
+  const DYNAMIC = { 'n/no-dynamic-message': 'error' };
+
+  test('the canonical name rebound through a hook no longer silences the rules', () => {
+    expect(
+      lint('const Log = useLogger();\nLog.info(`user ${id}`);', DYNAMIC)
+    ).toEqual(['dynamic']);
+  });
+
+  test.each([
+    ['a factory call', 'const log = makeLogger();'],
+    ['an awaited factory', 'const log = await getLogger();'],
+    ['a conditional', 'const log = flag ? a : b;'],
+    ['a property read', 'const log = deps.logger;'],
+  ])('%s bound to a logger name is checked', (_name, decl) => {
+    expect(lint(`${decl}\nlog.info(\`user \${id}\`);`, DYNAMIC)).toEqual([
+      'dynamic',
+    ]);
+  });
+
+  test('all four rules come back, not just the one', () => {
+    expect(
+      lint(
+        'const Log = useLogger();\n' +
+          'Log.info(`user ${id}`);\n' +
+          'Log.info("m", { [key]: 1 });\n' +
+          'Log.scoped(patient.id);\n' +
+          'Log.info("m", undefined, subsystemFor(x));',
+        {
+          'n/no-dynamic-message': 'error',
+          'n/no-computed-metadata-key': 'error',
+          'n/no-derived-correlation': 'error',
+          'n/literal-subsystem': 'error',
+        }
+      ).sort()
+      // Two `dynamic`s, and they come from different rules: `literal-subsystem`
+      // names its message that as well as `no-dynamic-message` does. Four
+      // reports from four rules, which is the claim.
+    ).toEqual(['computed', 'derived', 'dynamic', 'dynamic']);
+  });
+
+  /**
+   * The deliberate silences, observed passing before AND after the widening.
+   *
+   * A silence pin that was never exercised proves only that the rule is off,
+   * so each of these is a case the widening could plausibly have swept in and
+   * must not have.
+   */
+  test.each([
+    ['a name nothing documents as a logger', 'const widget = getWidget();'],
+    ['a rejected construction', 'const log = new Widget();'],
+  ])('%s stays silent', (_name, decl) => {
+    const receiver = decl.includes('widget') ? 'widget' : 'log';
+    expect(
+      lint(`${decl}\n${receiver}.info(\`user \${id}\`);`, DYNAMIC)
+    ).toEqual([]);
+  });
+
+  test('narrowing loggerClassNames still silences a construction', () => {
+    // The escape hatch and the widening do not collide, because a `null` from
+    // `classifyConstruction` is a decision rather than a shrug. Without that
+    // distinction this reports, and a documented option stops working.
+    expect(
+      lint(
+        "import { Logger } from 'tslog';\nconst log = new Logger();\nlog.info(`user ${id}`);",
+        {
+          'n/no-dynamic-message': [
+            'error',
+            { loggerClassNames: ['AppLogger'] },
+          ],
+        }
+      )
+    ).toEqual([]);
+  });
+});
