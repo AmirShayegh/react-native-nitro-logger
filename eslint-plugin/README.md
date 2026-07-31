@@ -277,6 +277,44 @@ Object.assign(handlers, { emit: Log.info }); // Object.assign
 Those six forms are the supported set. Anything that hands the logger to a
 function and lets the function install it is not.
 
+Since 0.3.0 the same six forms are followed for the **receiver** as well as
+the method, which is a different question one level over:
+
+```js
+const holder = { audit: Log };
+holder.audit.info(`patient ${id} admitted`); // reported
+```
+
+Before 0.3.0 a receiver written as `container.property` was classified from
+the property NAME alone — the only signal available for `this.logger` or
+`deps.log` — so a field spelled anything else took its call site outside all
+four rules on the strength of its spelling, with the literal that settles the
+question sitting two lines above it.
+
+What this does **not** widen is trust. `holder.audit` is checked as a logger
+everywhere and is still not provably the singleton, so
+`Log.scoped(holder.audit.newCorrelationId())` is still a derived correlation
+ID. Widening what is checked is safe; widening what is trusted would launder
+any object's method into an approved ID generator.
+
+`this.<field>` is **not** followed, even when the field is initialized in the
+same class:
+
+```js
+class C {
+  audit = Log;
+  m() {
+    this.audit.info(`patient ${id}`); // NOT reported
+  }
+}
+```
+
+Resolving it means matching a class field against the instance a method runs
+on, which is the interprocedural analysis this plugin deliberately stops
+short of. `this.logger` and `this.log` are still checked, by the name hint.
+Both behaviours are pinned by fixtures, so restoring the analysis is a
+decision someone makes rather than a side effect of an unrelated change.
+
 **Which methods are checked.** The six level helpers (`verbose`, `debug`,
 `info`, `warning`, `error`, `todo`), plus `log` and `logMessage` — the latter
 because it is public and is what every other emitting method delegates to.

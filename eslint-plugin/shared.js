@@ -1855,6 +1855,71 @@ function describeMethodReference(context, node, args) {
 }
 
 /**
+ * `holder.audit.info(…)` — the receiver is a property of a container this file
+ * can read.
+ *
+ * [classifyReceiver] answers a member-expression receiver from the property
+ * NAME alone, because for `this.logger.info(…)` and `deps.log.info(…)` that is
+ * all there is. But when the container is a literal or an assignment target in
+ * this file, the name is not all there is: `const holder = { audit: Log }`
+ * settles what `holder.audit` holds, and answering "the property is not called
+ * `logger`, so this is not a logger" over the top of it took a call site
+ * outside all four rules on the strength of its spelling.
+ *
+ * The machinery is [receiverPropertyCandidates], which the method path at
+ * `describeCall` has used since 0.2 for `handlers.emit(…)`. It is the same
+ * question one level over: there, which METHOD the property holds; here, which
+ * RECEIVER. Reusing it means the two agree about writes, `Object.assign`, and
+ * which of them can reach this call — and it means the same deliberate
+ * limitation applies to both. A container populated by a function call is not
+ * followed.
+ *
+ * ## What this deliberately does not reach
+ *
+ * `this.audit.info(…)`. `receiverPropertyCandidates` resolves a container
+ * through a variable binding, and `this` is not one — a class field would have
+ * to be matched against the instance the method runs on, which is a different
+ * analysis and one with the same interprocedural tail that was cut off the
+ * method path. It keeps the name hint and nothing more, pinned by fixtures so
+ * that changing it is a decision rather than a side effect.
+ */
+function classifyPropertyReceiver(context, node, callNode) {
+  const current = unwrap(node);
+  if (!current || current.type !== 'MemberExpression') return null;
+  const name = staticPropertyName(context, current);
+  if (name === null) return null;
+
+  const candidates = receiverPropertyCandidates(
+    context,
+    current.object,
+    name,
+    callNode
+  );
+  if (candidates.length === 0) return null;
+
+  const classified = candidates.map((value) =>
+    classifyReceiver(context, value)
+  );
+  // Exactly one possible value: it is what the property holds, so its own
+  // classification stands — including `null`, which is the answer for
+  // `const deps = { analytics }; deps.analytics.info(x)` and has to stay one.
+  if (classified.length === 1) return classified[0];
+  // Several, and at least one is a logger. Which runs is unknowable, so the
+  // rules apply — but never as the singleton, whose provenance is exactly what
+  // is in doubt.
+  //
+  // No rule currently distinguishes the two: every consumer of the
+  // classification branches on `'scoped'` against everything else, and TRUST
+  // does not run through here at all — `isTrustedLogger` takes its own path
+  // and this function does not feed it, which is why
+  // `holder.audit.newCorrelationId()` is still a derived correlation ID. So
+  // this line is a forward constraint rather than a behaviour anything can
+  // observe today, and it is stated that way rather than credited with
+  // protection it does not currently provide.
+  return classified.some((value) => value !== null) ? 'ambiguous' : null;
+}
+
+/**
  * Describe any call into the logger's public API — level helpers, `log`,
  * `scoped`, `subsystem`, `resetSubsystem` — normalizing away
  * `.call`/`.apply`/`.bind`, computed access, destructured methods and method
@@ -1877,7 +1942,9 @@ function describeCall(context, node) {
       if (inner && inner.type === 'MemberExpression') {
         const method = staticPropertyName(context, inner);
         if (method !== null && API_METHODS.has(method)) {
-          const receiver = classifyReceiver(context, inner.object);
+          const receiver =
+            classifyReceiver(context, inner.object) ??
+            classifyPropertyReceiver(context, inner.object, node);
           if (receiver === null) return null;
           const args = outer === 'call' ? node.arguments.slice(1) : [];
           return {
@@ -1893,9 +1960,15 @@ function describeCall(context, node) {
     }
 
     const method = staticPropertyName(context, callee);
-    const receiver = classifyReceiver(context, callee.object);
+    let receiver = classifyReceiver(context, callee.object);
 
     if (method !== null && API_METHODS.has(method)) {
+      // Only once the method says this could be a logger call at all. The
+      // container walk is not free, and `cache.get(key)` has no business
+      // paying for it.
+      if (receiver === null) {
+        receiver = classifyPropertyReceiver(context, callee.object, node);
+      }
       if (receiver === null) return null;
       return {
         method,

@@ -134,6 +134,20 @@ describe('no-dynamic-message', () => {
       // Not a logger — out of scope, must not produce noise.
       'analytics.info(`user ${id}`);',
       'notALogger.debug(dynamic);',
+      // A container field that resolves to something which is NOT a logger
+      // stays silent. The container walk added in 0.3.0 answers "what does
+      // this property hold", and `analytics` is an answer, not a shrug.
+      'const deps = { audit: analytics }; deps.audit.info(`user ${id}`);',
+      // KNOWN LIMITATION, pinned: `this.<field>` is not followed even when
+      // the field initializer is in the same class. Resolving it means
+      // matching a class field against the instance a method runs on, which
+      // is the interprocedural analysis deliberately cut off the method path
+      // — see `receiverPropertyCandidates`. `this.logger` is still CHECKED,
+      // by the name hint, which is why the fixture below uses a field named
+      // something else. Restoring this is a decision someone makes on
+      // purpose.
+      `${IMPORT_LOG} class C { audit = Log; m() { this.audit.info(\`patient \${id}\`); } }`,
+      `${IMPORT_LOG} class C { constructor() { this.audit = Log; } m() { this.audit.info(\`patient \${id}\`); } }`,
     ],
     invalid: [
       {
@@ -572,6 +586,37 @@ describe('no-dynamic-message', () => {
         code: 'const handlers = { emit: Log.info }; handlers.emit(patientName);',
         errors: [{ messageId: 'dynamic' }],
       },
+      // And a RECEIVER held in a container is still that receiver. Until
+      // 0.3.0 a member-expression receiver was classified from the property
+      // name alone, so a container field spelled anything other than
+      // `logger`/`log`/`Log` took the call site outside all four rules — on
+      // the strength of its spelling, with the object literal that settles
+      // the question two lines up.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log.scoped('c', 'net') }; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Assigned rather than in the literal, and through `Object.assign` —
+      // the same three spellings the method path already followed, because
+      // this reuses that machinery rather than reimplementing it.
+      {
+        code: `${IMPORT_LOG} const holder = {}; holder.audit = Log; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_LOG} const holder = {}; Object.assign(holder, { audit: Log }); holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Two possible receivers, one of them a logger: which runs is
+      // unknowable, so the rules apply rather than falling silent.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: analytics }; function later() { holder.audit.info(patientName); } holder.audit = Log; later();`,
+        errors: [{ messageId: 'dynamic' }],
+      },
       {
         code: '(Log.info.bind(Log))(patientName);',
         errors: [{ messageId: 'dynamic' }],
@@ -741,6 +786,13 @@ describe('no-computed-metadata-key', () => {
         },
         {
           code: "const s = Log.scoped('c'); s.info('m', { [k]: 'x' });",
+          errors: [{ messageId: 'computed' }],
+        },
+        // The 0.3.0 container walk, pinned here too: a call site it used to
+        // miss was outside all four rules at once, so each of them keeps a
+        // fixture rather than trusting that one shared code path covers it.
+        {
+          code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info('m', { [patientId]: 'x' });`,
           errors: [{ messageId: 'computed' }],
         },
         {
@@ -1040,6 +1092,17 @@ describe('no-derived-correlation', () => {
           code: 'function newCorrelationId() { return patient.mrn; } Log.scoped(newCorrelationId());',
           errors: [{ messageId: 'derived' }],
         },
+        // Nor is a logger held in a container, and this is the half of the
+        // 0.3.0 container walk worth pinning. `holder.audit.info(…)` is now
+        // CHECKED by all four rules — see the message rule's fixtures — and
+        // `holder.audit` is still not the singleton, so an ID minted through
+        // it is derived. Widening what is checked is safe; widening what is
+        // trusted would launder any object's method into an approved
+        // generator, which is what this rule's own header warns about.
+        {
+          code: `${IMPORT_LOG} const holder = { audit: Log }; Log.scoped(holder.audit.newCorrelationId());`,
+          errors: [{ messageId: 'derived' }],
+        },
         // A Logger imported from somewhere else is not the Logger. This is
         // also what an app that re-exports the logger from its own module
         // hits, which is why `loggerModules` exists and is documented as the
@@ -1230,6 +1293,13 @@ describe('literal-subsystem', () => {
         errors: [{ messageId: 'dynamic' }],
       },
       { code: 'Log.resetSubsystem(name);', errors: [{ messageId: 'dynamic' }] },
+      // The 0.3.0 container walk — see the message rule's fixtures for what
+      // it is and the correlation rule's for what it deliberately does not
+      // widen.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info('m', {}, dynamicName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
       // Computed method access must read as dot access.
       {
         code: "Log['subsystem'](patientName, 'debug');",
