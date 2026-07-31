@@ -483,6 +483,33 @@ describe('sanitizeError — the frame-tail parser vs its regex specification', (
     }
   });
 
+  // CRLF stacks, whole and untrimmed. `parseFrames` splits on `\n` and trims
+  // each line, so a CRLF line reaches the parser with its `\r` already gone —
+  // the same contract the regex era had (JS `$` without `m` matches only at
+  // end of input, so `FRAME_TAIL.exec('file:1:2\r')` was null and the
+  // pre-regex trim was what made CRLF stacks parse; both verified against the
+  // shipped 0.3.0 build). The single-line oracle above mirrors that trim.
+  // This case pins the whole-stack path so the trim cannot be refactored away
+  // without a frame-dropping regression being named here.
+  test('every frame of a CRLF stack survives', () => {
+    const error = new Error('x');
+    Object.defineProperty(error, 'stack', {
+      value:
+        'Error\r\n' +
+        '    at foo (/a/index.bundle:1:2)\r\n' +
+        '    at bar (/a/index.bundle:3:4)\r\n' +
+        '    at baz (/a/index.bundle:5:6)',
+    });
+
+    const result = sanitizeError(error);
+    expect(result.frames).toEqual([
+      'index.bundle:1:2',
+      'index.bundle:3:4',
+      'index.bundle:5:6',
+    ]);
+    expect(result.framesTruncated).toBe(false);
+  });
+
   // The shape the regex was slow on: many colon-dense lines, each of which
   // fails to parse only at its very last character. 256 lines × 1024 chars of
   // rejection measured 225 ms under the regex on a desktop — several times
