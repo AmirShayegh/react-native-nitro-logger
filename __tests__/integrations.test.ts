@@ -3,6 +3,7 @@ import {
   ERROR_METADATA_KEYS,
   installErrorHandler,
   UNCAUGHT_ERROR_MESSAGE,
+  __resetErrorHandlers,
 } from '../src/integrations/errorHandler';
 import type { ErrorUtilsLike } from '../src/integrations/errorHandler';
 import { flushOnBackground } from '../src/integrations/appState';
@@ -510,6 +511,94 @@ describe('installErrorHandler', () => {
       errorUtils: undefined,
     });
     expect(() => uninstall()).not.toThrow();
+  });
+
+  // A dev-time reload re-evaluates this module but leaves the old handler on
+  // ErrorUtils, and the old evaluation's uninstall closure is unreachable —
+  // nobody can ever remove that handler again. Without retirement every
+  // reload stacks one more handler: N sanitizer runs per error, N fatal
+  // flushes inside the crash window, N retained logger graphs.
+  // `__resetErrorHandlers` simulates the re-evaluation.
+  describe('across a module reload', () => {
+    test('a fresh evaluation retires the handler its predecessor leaked', () => {
+      const first = wired();
+      installErrorHandler({
+        logger: first.logger,
+        errorUtils: first.errorUtils,
+      });
+
+      __resetErrorHandlers();
+      const second = new Logger();
+      const secondDestination = new RecordingDestination();
+      second.removeDestination('console').addDestination(secondDestination);
+      installErrorHandler({ logger: second, errorUtils: first.errorUtils });
+
+      first.errorUtils.throw(new Error('x'), true);
+
+      expect(secondDestination.entries).toHaveLength(1);
+      // The predecessor's logger sees nothing — no second entry, and no
+      // second flush spent inside the fatal window.
+      expect(first.destination.entries).toHaveLength(0);
+      expect(first.destination.flushes).toBe(0);
+    });
+
+    test('the handler that predates both of ours is still reached, once', () => {
+      const errorUtils = new FakeErrorUtils();
+      const seen: unknown[] = [];
+      errorUtils.setGlobalHandler((error) => seen.push(error));
+
+      const first = new Logger();
+      first.removeDestination('console');
+      installErrorHandler({ logger: first, errorUtils });
+
+      __resetErrorHandlers();
+      const second = new Logger();
+      second.removeDestination('console');
+      installErrorHandler({ logger: second, errorUtils });
+
+      const thrown = new Error('x');
+      errorUtils.throw(thrown, true);
+
+      // Exactly once: the retired wrapper is skipped, not re-dispatched.
+      expect(seen).toEqual([thrown]);
+    });
+
+    test('two installs from the same evaluation both stay live', () => {
+      // Retirement is keyed on the module instance, not on being installed
+      // earlier: two deliberate installs in one evaluation — two subsystems,
+      // two loggers — must both keep logging.
+      const first = wired();
+      installErrorHandler({
+        logger: first.logger,
+        errorUtils: first.errorUtils,
+      });
+
+      const second = new Logger();
+      const secondDestination = new RecordingDestination();
+      second.removeDestination('console').addDestination(secondDestination);
+      installErrorHandler({ logger: second, errorUtils: first.errorUtils });
+
+      first.errorUtils.throw(new Error('x'), false);
+
+      expect(secondDestination.entries).toHaveLength(1);
+      expect(first.destination.entries).toHaveLength(1);
+    });
+
+    test('an unbranded handler is never retired by a reload', () => {
+      // The current handler belongs to someone else — a crash reporter set
+      // up before either evaluation of us. A reload must not touch it.
+      const errorUtils = new FakeErrorUtils();
+      const seen: unknown[] = [];
+      errorUtils.setGlobalHandler((error) => seen.push(error));
+
+      __resetErrorHandlers();
+      const { logger } = wired();
+      installErrorHandler({ logger, errorUtils });
+
+      const thrown = new Error('x');
+      errorUtils.throw(thrown, false);
+      expect(seen).toEqual([thrown]);
+    });
   });
 });
 
