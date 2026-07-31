@@ -331,14 +331,17 @@ describe('privacy markers', () => {
  * fail-closed: one entry that fails the rule empties the whole catalog, and
  * `metadataKeyCatalog` only ever intersects, so nothing invalid can be in
  * there to find. That is a real property of the current code and a
- * completely reasonable thing for a future edit to break — "skip the bad
- * entry instead of throwing away fifty good ones" is an obvious kindness
- * that would put an unapproved key into the catalog with no regex left
- * downstream to stop it.
+ * completely reasonable thing for a future edit to break — "stop throwing
+ * away fifty good keys over one bad one" is an obvious kindness, and the
+ * version of it that keeps the bad key puts an unapproved name into the
+ * catalog with no regex left downstream to stop it.
  *
  * So the invariant is asserted directly here, and
- * `scripts/mutants/P4-catalog-admits-invalid-key.patch` makes exactly that
- * edit and requires this suite to notice.
+ * `scripts/mutants/P4-catalog-admits-invalid-key.patch` is that edit in its
+ * dangerous form: it drops the key-rule test so an invalid string is
+ * admitted to the catalog, and this suite has to notice. (The harmless form
+ * — dropping the bad entry and keeping the rest — would leave the catalog
+ * full of valid keys and prove nothing, which is why it is not the mutant.)
  */
 describe('the metadata key catalog cannot hold a key the rule rejects', () => {
   const REJECTED = [

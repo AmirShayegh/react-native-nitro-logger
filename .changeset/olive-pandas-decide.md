@@ -21,11 +21,20 @@ correctly, it is simply not remembered — the keys are caller-supplied strings,
 and an unbounded cache of them would be a process-lifetime record of every
 subsystem name ever logged.
 
-**One behaviour change, and it is for a subclass rather than a caller.** A class
-extending `ScopedLogger` that overrides `log()` to observe every call will no
-longer see calls that the level filter drops, because the level methods now
-return before reaching `log()`. Overriding `log()` to change what gets logged
-is unaffected — those calls pass the level check first.
+**One behaviour change, and it is for a subclass rather than a caller.** The six
+convenience methods used to reach the overridable method underneath them on
+every call, and now they reach it only on calls that pass the level check. So a
+subclass of `Logger` that overrides `logMessage()`, or of `ScopedLogger` that
+overrides `log()`, no longer sees the calls the level filter drops — whatever
+the override was for. That includes overrides that would have acted on those
+calls rather than merely watched them: re-routing a filtered call, raising its
+level, or deliberately emitting it is no longer possible from there, because
+the call does not arrive.
+
+Two things are unchanged. Calls that pass the level check still go through the
+overridden method exactly as before, and a direct call to `logMessage()` or to
+`log()` is untouched — which is the path every integration in this package
+uses (the error handler, the rejection handler, the bridges).
 
 `Logger.passesLevel(level, subsystem?)` is public as a consequence:
 `ScopedLogger` has to be able to ask. It answers the level question and nothing

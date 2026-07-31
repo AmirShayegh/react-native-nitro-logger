@@ -100,9 +100,12 @@ export class ScopedLogger {
    *
    * **One named behaviour change**, for a subclass rather than a caller:
    * these methods no longer route a FILTERED call through {@link log}, so a
-   * subclass that overrides `log` to observe every call will no longer see
-   * the calls that were going to be dropped. Overriding `log` to change what
-   * is logged still works — those calls all pass the level first.
+   * subclass that overrides `log` no longer sees the calls that were going
+   * to be dropped — whatever it overrode `log` for. Not just observation:
+   * an override that would have re-routed such a call, raised its level or
+   * emitted it anyway cannot, because the call does not arrive. Calls that
+   * pass the level check still go through the override as before, and a
+   * direct call to `log` is untouched. Disclosed in the changeset.
    */
   verbose(message: LazyMessage, metadata?: LogMetadata): void {
     if (!this.logger.passesLevel('verbose', this.subsystem)) return;

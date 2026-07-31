@@ -357,10 +357,12 @@ function admitKey(
     //
     // That "provably" is load-bearing, and it is pinned rather than assumed:
     // `privacy.test.ts` asserts the invariant directly, and
-    // `scripts/mutants/P4-catalog-admits-invalid-key.patch` makes
-    // `buildCatalog` skip bad entries instead of emptying — the exact future
-    // edit that would let an unapproved key reach a log with no regex left
-    // to stop it — and the suite has to catch it.
+    // `scripts/mutants/P4-catalog-admits-invalid-key.patch` drops the key-rule
+    // test from `buildCatalog` so an invalid string is ADMITTED to the catalog
+    // — which is what breaks the invariant, and therefore what the suite has
+    // to catch. Merely skipping a bad entry would not: the catalog would still
+    // contain only valid keys, membership would still imply the rule, and the
+    // mutant would prove nothing about the line below.
     if (!catalog.has(key)) return false;
   } else {
     if (requireCatalog) return false;

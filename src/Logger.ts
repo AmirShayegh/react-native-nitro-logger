@@ -509,7 +509,14 @@ export class Logger {
   }
 
   /**
-   * Would a message at this level, in this subsystem, be logged at all?
+   * Does this level clear the effective minimum for this subsystem?
+   *
+   * The level threshold and nothing else. It is NOT a prediction that the
+   * message would be delivered: a `true` here says only that the level
+   * passed, and the call can still reach no destination because there are
+   * none registered, because every one is disabled, or because a
+   * destination's own `minimumLevel` turns it away. Those are decided in
+   * `logMessage`, per destination, on the entry.
    *
    * Public because `ScopedLogger` has to ask it — the same reason
    * `logMessage` is public — and for no other. It is the level decision on
@@ -539,6 +546,14 @@ export class Logger {
   // dropped. The decision it fed is the same one `logMessage` makes on
   // arrival, so nothing here changes what is logged; the object is simply
   // not built when the answer is already no.
+  //
+  // It does change one thing, and `logMessage` being public is why: a
+  // subclass that overrides `logMessage` used to receive every convenience
+  // call, including the ones about to be filtered, and now receives only the
+  // ones that pass. That is a loss of reach, not merely of visibility — an
+  // override cannot re-route, re-level or deliberately emit a call that never
+  // arrives. Direct calls to `logMessage` are unaffected, which is the path
+  // every integration in this package takes. Disclosed in the changeset.
 
   verbose(
     message: LazyMessage,
