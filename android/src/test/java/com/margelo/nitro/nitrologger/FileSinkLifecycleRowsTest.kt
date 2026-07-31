@@ -4,7 +4,6 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -20,21 +19,21 @@ import java.io.File
  * in one file rather than in three hand-written suites that drifted apart on
  * four rows without anyone noticing.
  *
+ * Every answer below is produced by calling [FileSinkAnswers], which is the
+ * object `HybridFileSink` delegates to for all nine of these ops.
+ *
  * ## What this does NOT prove
  *
- * That `HybridFileSink` answers this way. That file extends a nitrogen-generated
- * base and cannot be constructed off a device, so nothing here executes a line
- * of it. [answer] below derives each answer from [FileSinkLifecycle] the way the
- * adapter does — deliberately through the same `snapshot()` / `artifactSource()`
- * calls, so a change to the lifecycle's verdict breaks this suite — but the
- * marshalling in between is out of reach until the `FileSinkAnswers` extraction
- * lands. At that point [answer] delegates instead of deriving, and these same
- * rows start pinning the adapter.
+ * That the `Wire*`-to-nitrogen copy in `HybridFileSink` is faithful. That class
+ * extends a nitrogen-generated base and still cannot be constructed off a
+ * device. What it now contains is a field-for-field copy and nothing else —
+ * `PackageManifestTests` pins that with a line ceiling and a ban on
+ * `lifecycle.` calls — and the copy itself is covered end to end only by the
+ * min-rn smoke jobs. A real reduction of the gap, not its elimination.
  */
 class FileSinkLifecycleRowsTest {
   private lateinit var directory: File
   private lateinit var registry: LogWriterRegistry
-  private val handles = mutableListOf<LogFileHandle>()
 
   @Before
   fun setUp() {
@@ -47,18 +46,8 @@ class FileSinkLifecycleRowsTest {
 
   @After
   fun tearDown() {
-    handles.forEach { runCatching { it.close(500.0) } }
-    handles.clear()
     directory.deleteRecursively()
   }
-
-  private fun handle(name: String = "app.log"): LogFileHandle = registry.acquire(
-    path = File(directory, name).absolutePath,
-    policy = LogRotationPolicy.of(),
-    lineFramed = true,
-    platform = PlatformIo.Jvm,
-    clock = { 1_700_000_000_000L }
-  ).also { handles.add(it) }
 
   // MARK: loading
 
@@ -99,7 +88,8 @@ class FileSinkLifecycleRowsTest {
   // MARK: the two modes
 
   /** A sink that was never opened: no handle, and nothing can exist yet. */
-  private fun neverOpened(): FileSinkLifecycle = FileSinkLifecycle()
+  private fun neverOpened(): FileSinkAnswers =
+    FileSinkAnswers(registry = registry, platform = PlatformIo.Jvm, owner = null)
 
   /**
    * A sink that opened, wrote, and closed: no handle, and files may exist.
@@ -109,18 +99,15 @@ class FileSinkLifecycleRowsTest {
    * would answer `pathCount: 0` and agree with the never-opened row for a
    * reason the table does not describe.
    */
-  private fun openedThenClosed(): FileSinkLifecycle {
-    val lifecycle = FileSinkLifecycle()
-    assertEquals(FileSinkLifecycle.Claim.GRANTED, lifecycle.beginOpen())
-    val live = handle()
-    assertEquals(FileSinkLifecycle.Installation.INSTALLED, lifecycle.finishOpen(live))
-    live.appendBatch("{\"m\":1}\n", 1L)
-    lifecycle.beginClose().handle?.close(1000.0)
-    assertNull("the mode is defined by having no handle", lifecycle.current())
-    return lifecycle
+  private fun openedThenClosed(): FileSinkAnswers {
+    val answers = neverOpened()
+    answers.open(File(directory, "app.log").absolutePath, LogRotationPolicy.of(), true)
+    answers.appendBatch("{\"m\":1}\n", 1.0)
+    assertTrue(answers.close(1000.0).durable)
+    return answers
   }
 
-  private fun lifecycleFor(mode: String): FileSinkLifecycle = when (mode) {
+  private fun sinkFor(mode: String): FileSinkAnswers = when (mode) {
     "neverOpened" -> neverOpened()
     "openedThenClosed" -> openedThenClosed()
     // Never a skip. A mode this target cannot build is a mode this target does
@@ -136,93 +123,91 @@ class FileSinkLifecycleRowsTest {
   )
 
   /**
-   * Each branch is the body `HybridFileSink` runs when its handle is null,
-   * reading the same lifecycle calls in the same order.
+   * Calls [FileSinkAnswers] and renders the answer's fields to strings.
    *
-   * Returns null for an op this target does not implement, which the caller
-   * turns into a failure.
+   * It does not decide anything: every value below comes back from the object
+   * under test. Returns null for an op this target does not implement, which
+   * the caller turns into a failure.
    */
-  private fun answer(op: String, lifecycle: FileSinkLifecycle): Map<String, String>? = when (op) {
+  private fun answer(op: String, answers: FileSinkAnswers): Map<String, String>? = when (op) {
     "appendBatch" -> {
-      if (lifecycle.current() != null) null
-      else mapOf(
-        "accepted" to "false", "rejectReason" to "closed", "queuedBytes" to "0",
-        "lostBytes" to "0", "lostEntries" to "0", "degraded" to "0"
+      val r = answers.appendBatch("{\"m\":2}\n", 1.0)
+      mapOf(
+        "accepted" to r.accepted.toString(),
+        // The wire spelling, not a default: an implementation that refused
+        // without saying why would be reporting something the table does not
+        // describe.
+        "rejectReason" to (r.rejectReason?.wire ?: "<absent>"),
+        "queuedBytes" to number(r.queuedBytes),
+        "lostBytes" to number(r.lostBytes),
+        "lostEntries" to number(r.lostEntries),
+        "degraded" to number(r.degraded)
       )
     }
 
-    "getStatus", "maintain" -> {
-      if (lifecycle.current() != null) null
-      else mapOf(
-        "queuedBytes" to "0", "lostBytes" to "0", "lostEntries" to "0", "degraded" to "0"
-      )
-    }
+    "getStatus" -> status(answers.getStatus())
+
+    "maintain" -> status(answers.maintain(1000.0))
 
     "collectLogs" -> {
-      if (lifecycle.current() != null) null
-      else mapOf(
-        "path" to "", "byteCount" to "0", "sourceFileCount" to "0",
-        "complete" to "true", "truncated" to "false"
+      val o = answers.collectLogs(1000.0, 1_000_000.0)
+      mapOf(
+        "path" to o.path,
+        "byteCount" to number(o.byteCount),
+        "sourceFileCount" to number(o.sourceFileCount),
+        "complete" to o.complete.toString(),
+        "truncated" to o.truncated.toString()
       )
     }
 
-    "flush" -> {
-      val snapshot = lifecycle.snapshot()
-      if (snapshot.handle != null) null
-      else noHandleFlush(snapshot.durableWithoutHandle)
-    }
+    "flush" -> flush(answers.flush(1000.0))
 
     "close" -> {
-      val first = lifecycle.beginClose()
-      if (first.handle != null) {
-        null
-      } else {
-        val second = lifecycle.beginClose()
-        assertEquals(
-          "closing twice must answer what the first close answered",
-          first.durableWithoutHandle, second.durableWithoutHandle
-        )
-        noHandleFlush(second.durableWithoutHandle)
-      }
+      val first = answers.close(1000.0)
+      val second = answers.close(1000.0)
+      // Idempotence is a relation between two calls, so it cannot be a row.
+      // The table pins what the answer *is*; this pins that asking twice does
+      // not change it.
+      assertEquals("closing twice must answer what the first close answered", first, second)
+      flush(second)
     }
 
     "clearLogs" -> {
-      val snapshot = lifecycle.snapshot()
-      if (snapshot.handle != null) null
-      else mapOf(
-        "deletedCount" to "0", "failedPathCount" to "0",
-        "durable" to snapshot.durableWithoutHandle.toString(), "rebound" to "false"
+      val o = answers.clearLogs(1000.0)
+      mapOf(
+        "deletedCount" to number(o.deletedCount),
+        "failedPathCount" to o.failedPaths.size.toString(),
+        "durable" to o.durable.toString(),
+        "rebound" to o.rebound.toString()
       )
     }
 
-    // `snapshot()`, not `artifactSource()`. A sink that opened and closed knows
-    // where its bundle would be but cannot confirm it is gone, and `true` there
-    // deletes the caller's obligation to retry. This is the one row that was
-    // wrong in shipped code, and it was found by review rather than by a test
-    // because no test could reach the file.
-    "deleteSupportBundle" -> {
-      val snapshot = lifecycle.snapshot()
-      if (snapshot.handle != null) null
-      else mapOf("deleted" to snapshot.durableWithoutHandle.toString())
-    }
+    "deleteSupportBundle" -> mapOf("deleted" to answers.deleteSupportBundle(1000.0).toString())
 
-    "getLogFilePaths" -> {
-      val source = lifecycle.artifactSource()
-      when {
-        source.handle != null -> null
-        source.path == null -> mapOf("pathCount" to "0")
-        else -> mapOf(
-          "pathCount" to LogFileWriter.artifactPaths(File(source.path!!)).size.toString()
-        )
-      }
-    }
+    "getLogFilePaths" -> mapOf("pathCount" to answers.getLogFilePaths().size.toString())
 
     else -> null
   }
 
-  private fun noHandleFlush(durable: Boolean): Map<String, String> = mapOf(
-    "durable" to durable.toString(), "timedOut" to "false", "pendingBytes" to "0",
-    "queuedBytes" to "0", "lostBytes" to "0", "lostEntries" to "0", "degraded" to "0"
+  /**
+   * `Double` renders as `0.0`, and the table says `0`. Integral values only,
+   * which every field here is — a fractional byte count would fail loudly
+   * rather than being rounded into agreement.
+   */
+  private fun number(value: Double): String =
+    if (value == Math.rint(value) && !value.isInfinite()) value.toLong().toString()
+    else value.toString()
+
+  private fun status(s: WireSinkStatus): Map<String, String> = mapOf(
+    "queuedBytes" to number(s.queuedBytes), "lostBytes" to number(s.lostBytes),
+    "lostEntries" to number(s.lostEntries), "degraded" to number(s.degraded)
+  )
+
+  private fun flush(o: WireFlushOutcome): Map<String, String> = mapOf(
+    "durable" to o.durable.toString(), "timedOut" to o.timedOut.toString(),
+    "pendingBytes" to number(o.pendingBytes), "queuedBytes" to number(o.queuedBytes),
+    "lostBytes" to number(o.lostBytes), "lostEntries" to number(o.lostEntries),
+    "degraded" to number(o.degraded)
   )
 
   // MARK: guards
@@ -299,7 +284,7 @@ class FileSinkLifecycleRowsTest {
           fail("row `${row.op}` has no answer for `$mode`")
           continue
         }
-        val actual = answer(row.op, lifecycleFor(mode))
+        val actual = answer(row.op, sinkFor(mode))
         if (actual == null) {
           fail("no dispatcher for `${row.op}`, or it found a live handle in `$mode`")
           continue
