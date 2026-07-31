@@ -11,6 +11,7 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -38,8 +39,26 @@ class LogFileWriterTest {
    * time, which the filesystem stamps and no injection can move. A clock set
    * to a fixed constant in the past makes every file look like it was created
    * in the future.
+   *
+   * ## Why atomic
+   *
+   * The test thread advances it; the **writer thread** reads it, through the
+   * `clock` lambda, on every rotation check. A plain `var` is a data race
+   * across those two threads with no happens-before edge between them, so
+   * nothing obliges the writer to ever see an advance — the JIT is free to
+   * hoist the read out of its loop. For 235 short sequential tests that has
+   * never visibly bitten, which is exactly why it is worth fixing before
+   * `LogBurstTest` runs the executor hot for thousands of records.
+   *
+   * `AtomicLong` rather than `@Volatile`, because the natural way to write
+   * these tests is `+=`, and a volatile read-modify-write is not atomic. Today
+   * every advance happens on the test thread, where that would be survivable —
+   * but `a failed compression keeps the plaintext archive` already advances the
+   * clock a line away from an injected `compressor` lambda that runs on the
+   * writer thread, and the day one moves inside is not a day anyone will be
+   * looking for it.
    */
-  private var now = System.currentTimeMillis()
+  private val now = AtomicLong(System.currentTimeMillis())
 
   /**
    * Injected monotonic clock, separate from [now] on purpose.
@@ -47,14 +66,16 @@ class LogFileWriterTest {
    * Deadlines and backoff read this one; ages and archive stamps read [now].
    * Keeping them independent is what lets a test move the wall clock backwards
    * — the thing an NTP correction does — and assert that no deadline grew.
+   *
+   * Atomic for the same reason as [now], and read from the same thread.
    */
-  private var steady = 0L
+  private val steady = AtomicLong(0)
   private val opened = mutableListOf<LogFileWriter>()
 
   @Before
   fun setUp() {
-    now = System.currentTimeMillis()
-    steady = 0L
+    now.set(System.currentTimeMillis())
+    steady.set(0)
     directory = File.createTempFile("nitro-logger-test", "").let {
       it.delete()
       File(it.absolutePath + "-dir").apply { mkdirs() }
@@ -86,8 +107,8 @@ class LogFileWriterTest {
       platform = platform,
       rawWrite = rawWrite,
       compressor = compressor,
-      clock = { now },
-      monotonic = monotonic ?: { steady }
+      clock = { now.get() },
+      monotonic = monotonic ?: { steady.get() }
     ).also { opened.add(it) }
   }
 
@@ -308,7 +329,7 @@ class LogFileWriterTest {
     w.write("early\n")
     w.flush(1, 1000.0)
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("late\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -336,7 +357,7 @@ class LogFileWriterTest {
     val counts = mutableListOf<Int>()
     repeat(10) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
       w.flush(1, 1000.0)
       w.settleForTesting()
       counts.add(directory.list()!!.count { LogFileWriter.isArchiveName(it, "app.log") })
@@ -365,9 +386,9 @@ class LogFileWriterTest {
     assertTrue(firstRound.isNotEmpty())
     // Age the archive past the cap by its modification time, which is what the
     // sweep actually reads.
-    firstRound.forEach { File(directory, it).setLastModified(now - 120_000) }
+    firstRound.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
-    now += 1_000
+    now.addAndGet(1_000)
     w.write("0123456789012345\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -385,7 +406,7 @@ class LogFileWriterTest {
     )
     repeat(3) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -404,7 +425,7 @@ class LogFileWriterTest {
     )
     repeat(2) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -427,8 +448,8 @@ class LogFileWriterTest {
         policy = LogRotationPolicy.of(),
         lineFramed = true,
         platform = PlatformIo.Jvm,
-        clock = { now },
-        monotonic = { steady },
+        clock = { now.get() },
+        monotonic = { steady.get() },
         openSweepGate = {
           inSweep.countDown()
           held.await()
@@ -481,7 +502,7 @@ class LogFileWriterTest {
           policy = LogRotationPolicy.of(),
           lineFramed = true,
           platform = PlatformIo.Jvm,
-          clock = { now },
+          clock = { now.get() },
           openSweepGate = {
             inSweep.countDown()
             held.await()
@@ -503,7 +524,7 @@ class LogFileWriterTest {
         policy = LogRotationPolicy.of(),
         lineFramed = true,
         platform = PlatformIo.Jvm,
-        clock = { now }
+        clock = { now.get() }
       )
       other.close(1000.0)
       val elapsedMs = (System.nanoTime() - began) / 1_000_000
@@ -553,8 +574,8 @@ class LogFileWriterTest {
         policy = LogRotationPolicy.of(),
         lineFramed = true,
         platform = PlatformIo.Jvm,
-        clock = { now },
-        monotonic = { steady },
+        clock = { now.get() },
+        monotonic = { steady.get() },
         openSweepGate = {
           inSweep.countDown()
           held.await()
@@ -613,8 +634,8 @@ class LogFileWriterTest {
       policy = LogRotationPolicy.of(),
       lineFramed = true,
       platform = recorder,
-      clock = { now },
-      monotonic = { steady }
+      clock = { now.get() },
+      monotonic = { steady.get() }
     ).also { opened.add(it) }
 
     assertTrue(w.append(1, w.currentGeneration, "x\n", 1).accepted)
@@ -735,7 +756,7 @@ class LogFileWriterTest {
 
       // Past it on the only clock the backoff reads. Nothing else changed —
       // the fault is still in force and the file is still over its threshold.
-      steady += LogFileWriterConstants.ROTATION_BACKOFF_MS + 1
+      steady.addAndGet(LogFileWriterConstants.ROTATION_BACKOFF_MS + 1)
       w.write("0123456789\n")
       w.flush(1, 1000.0)
       w.settleForTesting()
@@ -753,7 +774,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(4) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -797,7 +818,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(4) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1071,7 +1092,7 @@ class LogFileWriterTest {
     w.settleForTesting()
     assertFalse("a plain write must not bypass the backoff", logs.exists())
 
-    steady += LogFileWriterConstants.REOPEN_BACKOFF_MS
+    steady.addAndGet(LogFileWriterConstants.REOPEN_BACKOFF_MS)
     w.write("window elapsed\n")
     w.settleForTesting()
     assertTrue("once the window passes the write reopens", File(logs, "app.log").exists())
@@ -1613,7 +1634,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
 
     // The control, and the point: the file is old enough to rotate and stays
     // put, because nothing has written to it. Without this the assertion below
@@ -1642,9 +1663,9 @@ class LogFileWriterTest {
 
     val rotated = archives()
     assertTrue(rotated.isNotEmpty())
-    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+    rotated.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
-    now += 1_000
+    now.addAndGet(1_000)
     assertEquals("retention does not sweep itself either", rotated.size, archives().size)
 
     w.maintain(1, 1000.0)
@@ -1662,7 +1683,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.flush(1, 1000.0)
     w.settleForTesting()
 
@@ -1682,7 +1703,7 @@ class LogFileWriterTest {
     w.settleForTesting()
     assertEquals(0, w.status(1).degraded and LogDegradation.GZIP)
 
-    now += 61_000
+    now.addAndGet(61_000)
     val status = w.maintain(1, 1000.0)
 
     assertTrue(
@@ -1720,10 +1741,10 @@ class LogFileWriterTest {
 
     val rotated = archives()
     assertTrue(rotated.isNotEmpty())
-    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+    rotated.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
     w.close(1, 1000.0)
-    now += 1_000
+    now.addAndGet(1_000)
     w.maintain(1, 1000.0)
 
     assertEquals("an archive this writer no longer owns is not its to expire",
@@ -1764,7 +1785,7 @@ class LogFileWriterTest {
     )
     repeat(4) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1794,7 +1815,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
 
     assertEquals("hello\n", File(directory, "app.log").readText())
-    assertEquals(now.toString(), File(directory, "app.log.meta").readText().trim())
+    assertEquals(now.get().toString(), File(directory, "app.log.meta").readText().trim())
   }
 
   /// The sidecar is authoritative once written, and the filesystem is only ever
@@ -1808,11 +1829,11 @@ class LogFileWriterTest {
   fun `a filesystem that reports the mtime as creation time cannot defeat age rotation`() {
     val mtimeAsCreation = object : PlatformIo by PlatformIo.Jvm {
       // Always "just now", the way an mtime looks after a write.
-      override fun creationTimeMillis(file: File): Long? = now
+      override fun creationTimeMillis(file: File): Long? = now.get()
     }
 
     // A previous run recorded the real creation time an hour ago.
-    File(directory, "app.log.meta").writeText((now - 3_600_000).toString())
+    File(directory, "app.log.meta").writeText((now.get() - 3_600_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0),
@@ -1834,7 +1855,7 @@ class LogFileWriterTest {
   /// postpones rotation until wall time catches up.
   @Test
   fun `a sidecar dated in the future is rewritten rather than obeyed`() {
-    File(directory, "app.log.meta").writeText((now + 86_400_000).toString())
+    File(directory, "app.log.meta").writeText((now.get() + 86_400_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0)
@@ -1845,10 +1866,10 @@ class LogFileWriterTest {
     // to `now`: a plausible filesystem creation time is allowed to win the seed,
     // and on a one-second-granularity filesystem that is a little earlier.
     val rewritten = File(directory, "app.log.meta").readText().trim().toLong()
-    assertTrue("the sidecar is still in the future: $rewritten vs $now", rewritten <= now)
+    assertTrue("the sidecar is still in the future: $rewritten vs $now", rewritten <= now.get())
 
     // And with a sane start time, age rotation still works.
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("late\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1869,7 +1890,7 @@ class LogFileWriterTest {
     )
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("rotate me\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1907,7 +1928,7 @@ class LogFileWriterTest {
 
     // A previous run left the file an hour old, so the first write rotates.
     val sidecar = File(directory, "app.log.meta")
-    sidecar.writeText((now - 3_600_000).toString())
+    sidecar.writeText((now.get() - 3_600_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0),
@@ -1926,13 +1947,13 @@ class LogFileWriterTest {
     assertFalse("the reopen was supposed to fail", w.hasLiveStreamForTesting)
     assertEquals(
       "the stale sidecar should not have been overwritten",
-      (now - 3_600_000).toString(),
+      (now.get() - 3_600_000).toString(),
       sidecar.readText().trim()
     )
 
     // Let the file open again, past the reopen backoff.
     refuseOpen = false
-    steady += 5_000
+    steady.addAndGet(5_000)
 
     repeat(4) { w.write("still young\n") }
     w.flush(1, 1000.0)
@@ -2028,7 +2049,7 @@ class LogFileWriterTest {
     val w = writer()
     val resume = w.stallForTesting()
     try {
-      now -= 3_600_000 // the wall clock steps back an hour, mid-flight
+      now.addAndGet(-3_600_000) // the wall clock steps back an hour, mid-flight
       val started = System.nanoTime()
       val outcome = w.flush(1, 200.0)
       val elapsedMs = (System.nanoTime() - started) / 1_000_000
@@ -2088,7 +2109,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(2) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -2124,7 +2145,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(6) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()

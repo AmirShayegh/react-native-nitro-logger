@@ -14,6 +14,7 @@ import org.junit.Test
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -37,12 +38,16 @@ class LogWriterRegistryTest {
    * compares it against the creation time the filesystem stamps: a clock fixed
    * in the past makes every file look like it was created in the future, and
    * nothing ever ages.
+   *
+   * Atomic for the reason `LogFileWriterTest`'s twin is: the test thread
+   * advances it and the writer thread reads it, with no happens-before edge
+   * between them.
    */
-  private var now = System.currentTimeMillis()
+  private val now = AtomicLong(System.currentTimeMillis())
 
   @Before
   fun setUp() {
-    now = System.currentTimeMillis()
+    now.set(System.currentTimeMillis())
     directory = File.createTempFile("nitro-registry-test", "").let {
       it.delete()
       File(it.absolutePath + "-dir").apply { mkdirs() }
@@ -77,7 +82,7 @@ class LogWriterRegistryTest {
     platform = PlatformIo.Jvm,
     rawWrite = rawWrite,
     compressor = compressor,
-    clock = { now },
+    clock = { now.get() },
     owner = owner
   ).also { handles.add(it) }
 
@@ -377,7 +382,7 @@ class LogWriterRegistryTest {
     keeper.flush(1000.0)
 
     released.close(1000.0)
-    now += 61_000
+    now.addAndGet(61_000)
 
     // The control: the file is old enough to rotate, and a live handle would
     // rotate it — the assertion below is about who is asking, not about whether
