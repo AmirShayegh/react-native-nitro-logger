@@ -63,6 +63,13 @@ jobs:
       - name: Typecheck the documentation samples
         run: yarn check-docs
 
+      # The counts `docs/PARITY.md` states, against the floors CI enforces.
+      # Needs no test run, which is why it sits here rather than in the three
+      # matrix jobs: it checks the document against the gate, and the gate
+      # checks itself against a real report.
+      - name: Check the parity counts
+        run: yarn check-parity-counts
+
       # The git tag the podspec points at must be the tag the release creates.
       # Through 0.1.2 it interpolated a bare "0.1.2" while Changesets tags
       # `react-native-nitro-logger@0.1.2`, so a CocoaPods consumer installing
@@ -266,6 +273,16 @@ jobs:
 
       - name: Build package
         run: yarn prepare
+
+      # The documentation samples again, this time resolved the way `exports`
+      # sends a consumer: through `lib/typescript/**` rather than through
+      # `src/index.tsx`. The `lint` job checks the source surface, which is the
+      # right place for it — a renamed export should break the docs in the
+      # commit that renames it. What it cannot see is a type that the source
+      # exports and the declaration build drops, which typechecks there and
+      # fails for every reader.
+      - name: Typecheck the documentation against the published surface
+        run: yarn check-docs-lib
 
       # Every `__DEV__` in the built library is a place redaction can be turned
       # off. The set is meant to be small and unchanging; this fails if it grows

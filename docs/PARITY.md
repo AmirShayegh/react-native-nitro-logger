@@ -16,6 +16,28 @@ Nothing here is aspirational. Every "identical" row is covered by a golden;
 every difference is either enforced by a test or unreachable through the
 public API, and the table says which.
 
+## How much of this is actually enforced
+
+<!-- test-counts: js=1077/26 swift=247/12 kotlin=240/11 -->
+
+| Target                              | Tests | Suites |
+| ----------------------------------- | ----- | ------ |
+| JavaScript / TypeScript (`jest`)    | 1077  | 26     |
+| iOS (`swift test`)                  | 247   | 12     |
+| Android (`testDebugUnitTest`)       | 240   | 11     |
+
+A count is a weak claim on its own — it says how much was run, not what was
+proven — and it is here for one specific thing: these are floors, not
+observations. `scripts/check-test-reports.sh` fails if any target reports
+fewer, so a suite that stops being discovered cannot be mistaken for a suite
+that passes. That failure mode is not hypothetical for a repository with three
+test runners: a renamed Gradle task, a Swift target dropped from `Package.swift`
+or a Jest `testPathIgnorePatterns` typo each produce a green run over nothing.
+
+The numbers above and the floors in that script are checked against each other
+by `scripts/check-parity-counts.sh`, so this table cannot quietly go stale —
+which is the only thing that would make it worse than no table at all.
+
 ## JSON record
 
 Field order is fixed on both sides so output diffs cleanly.

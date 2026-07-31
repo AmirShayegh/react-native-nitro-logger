@@ -75,7 +75,8 @@
     "nitrogen": "nitrogen",
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
-    "check-docs": "./scripts/check-doc-samples.sh",
+    "check-docs": "./scripts/check-doc-samples.sh --target src",
+    "check-docs-lib": "./scripts/check-doc-samples.sh --target lib",
     "check-eslint-consumer": "./scripts/check-eslint-consumer.sh",
     "check-android-instrumented": "./scripts/check-android-instrumented.sh",
     "check-test-reports": "./scripts/check-test-reports.sh",
@@ -83,9 +84,11 @@
     "check-package-exports": "./scripts/check-package-exports.sh",
     "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",
     "check-doc-links": "./scripts/check-doc-links.sh",
+    "check-parity-counts": "./scripts/check-parity-counts.sh",
     "changeset": "changeset",
     "check-podspec-tag": "./scripts/check-podspec-tag.sh",
-    "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish"
+    "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish",
+    "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag"
   },
   "keywords": [
     "react-native",
