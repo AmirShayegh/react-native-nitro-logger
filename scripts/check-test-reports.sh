@@ -53,8 +53,8 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=235
-    REQUIRED_SUITES="BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
+    MINIMUM=240
+    REQUIRED_SUITES="BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)
     RUN_STATUS=$?
