@@ -101,6 +101,15 @@ jobs:
       - name: Prove the pinned defects are still caught
         run: ./scripts/check-mutants.sh
 
+      # And the third question: not "do the tests agree", not "would they
+      # notice", but "is there anything they never look at". Ratchets two
+      # points below what the suite measures, per directory as well as
+      # globally, because a global number lets one well-covered area pay for
+      # an untested one. Runs the suite a second time — a couple of seconds,
+      # and worth not folding into the run above, whose job is the count.
+      - name: Check coverage has not drained out of a directory
+        run: yarn test:coverage
+
   # The vendored iOS writer, under XCTest rather than on a simulator.
   #
   # `Package.swift` builds it without the Nitro adapter precisely so this job
