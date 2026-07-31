@@ -231,6 +231,7 @@ const logFile = new FileDestination(createFileSink(), {
 | `flush(deadlineMs?)` | `BatchFlushOutcome` | `durable` says whether it reached disk. |
 | `maintain(deadlineMs?)` | `number` | Rotation and the retention sweep, on demand. Returns the same mask as `degradation()`, read once the bounded wait is over. |
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
+| `reopen(deadlineMs?)` | `boolean` | The way back from a fence. See below. |
 | `collectForSupport({ maxTotalBytes, deadlineMs? })` | `CollectOutcome` | One gzip bundle of the whole log, for a support upload. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
@@ -259,6 +260,36 @@ usually is not.
 
 **`purge()` after `dispose()` returns `durable: false`.** A disposed
 destination cannot see the files, so it cannot honestly claim they are gone.
+
+**`reopen(deadlineMs?)` is the way back from a fence**, and it returns whether
+the destination can write when the call returns. A fence is deliberately
+permanent until something asks for a retry: a destination fenced by *another*
+handle's purge, or by a purge that deleted durably and then could not reopen,
+stays disabled, and before 0.3.0 there was nothing to ask. Constructing a
+replacement is a poor substitute rather than an impossible one. On the same
+canonical path a second handle is eligible to share the writer when its
+rotation policy and framing match, and differing ones are a config conflict —
+though matching them is no promise of success either, since an acquisition can
+still fail on a previous writer that is still closing, on the filesystem, or on
+the lock. Whichever way it goes, the fenced destination is still alive, holding
+its retain on the writer and its registration with whatever logger it was given
+to, until someone disposes it.
+
+It closes this handle and opens a fresh one with the same path, rotation and
+framing it was constructed with. A disposed destination returns `false` and
+stays disposed, because dispose is a release and not a pause. An unfenced one
+returns `true` having touched nothing, since closing a live handle to prove it
+could be reopened would throw away the buffer and the file position. A failed
+open leaves it fenced, which is the only safe direction for this to fail in; a
+failed *close* does not, because there was nothing drainable behind a fence and
+the open is what decides. `deadlineMs` bounds the close, the only half that
+waits.
+
+`true` says a handle was acquired — not that the file behind it holds what the
+old one did. After another handle's purge it is a fresh, empty file, which is
+the purge working. The new file also does not open with a loss notice about the
+old one: the fence clears what was owed on the way in, because a count of
+deliberately deleted records describes the deletion.
 
 **`collectForSupport({ maxTotalBytes, deadlineMs? })`** packs the log files into one gzip bundle beside them and returns a
 `CollectOutcome`. `gunzip` on that file gives you the whole log as

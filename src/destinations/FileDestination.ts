@@ -212,8 +212,9 @@ interface Rendered {
  * generation is stale — someone purged the file underneath it — the buffer is
  * discarded rather than replayed into the new file, and the destination
  * disables itself. Pre-purge records must not reappear after a compliance
- * deletion. The handle that invoked the purge rebinds; any other one does
- * not, and reacquisition is the native registry's job.
+ * deletion. The handle that invoked the purge rebinds; any other one does not,
+ * and stays fenced until someone calls {@link FileDestination.reopen} — the
+ * fence is permanent by design, but no longer permanent in practice.
  */
 export class FileDestination implements LogDestination {
   readonly label: string;
@@ -224,8 +225,22 @@ export class FileDestination implements LogDestination {
   private readonly batcher: Batcher;
   private readonly maxEntryBytes: number;
   private readonly path: string;
-  /** Held for the M5 registry's reacquisition path, which needs the same
-   * config the handle was opened with. */
+  /**
+   * A **copy** of the rotation config, held so {@link FileDestination.reopen}
+   * can acquire the new handle with what the first one was opened with.
+   *
+   * Copied rather than kept by reference because the caller owns the object it
+   * passed and may go on mutating it, and a reopen has to reproduce the
+   * original acquisition rather than whatever the object says later. The
+   * native registry compares policies to decide whether a second handle on a
+   * file may share the writer, so a drifted config is not a quiet difference —
+   * it is a `CONFIG_CONFLICT` against a sibling handle that is still open, and
+   * the reopen fails.
+   *
+   * Read once, here, before the sink is opened: a config assembled from
+   * getters is evaluated at construction, which is the moment the caller
+   * chose, and a throwing one fails the constructor before any handle exists.
+   */
   private readonly rotation: RotationConfig | undefined;
 
   private fenced = false;
@@ -242,7 +257,10 @@ export class FileDestination implements LogDestination {
     );
     this.path =
       options.path ?? `${sink.defaultLogDirectory}/${DEFAULT_FILENAME}`;
-    this.rotation = options.rotation;
+    this.rotation =
+      options.rotation === undefined
+        ? undefined
+        : Object.freeze({ ...options.rotation });
 
     this.batcher = new Batcher(sink, {
       renderNotice: (lost) => this.renderLossNotice(lost),
@@ -464,9 +482,9 @@ export class FileDestination implements LogDestination {
    * written into the window where deletion is in flight; the JS buffer is
    * discarded rather than flushed, because flushing it would write pre-purge
    * records into the file a moment before deleting it — or worse, a moment
-   * after. Only a durable deletion lifts the fence. A partial or timed-out
-   * one leaves this handle disabled until an explicit retry, so a late
-   * deletion can never race a fresh write.
+   * after. Only a durable deletion lifts the fence. A partial or timed-out one
+   * leaves this handle disabled until {@link FileDestination.reopen}, so a
+   * late deletion can never race a fresh write.
    *
    * Discarded counts come back here rather than going into a loss notice: a
    * "4,182 entries dropped" line at the top of a file that was just cleared
@@ -515,7 +533,7 @@ export class FileDestination implements LogDestination {
     // `durable` alone resumes writing into a handle the sink never rebound —
     // every record accepted, rejected as `staleGeneration`, and dropped. The
     // deletion is still complete and still reported as such; the destination
-    // just stays disabled until an explicit retry gets a live file back.
+    // just stays disabled until `reopen()` gets a live file back.
     //
     // `=== true`, not `!== false`. An absent field is not a promise, and the
     // sink most likely to omit it is one that predates it — including a native
@@ -540,6 +558,82 @@ export class FileDestination implements LogDestination {
       discardedEntries: discarded.entries,
       discardedBytes: discarded.bytes,
     };
+  }
+
+  /**
+   * The way back from a fence: close this handle and open a fresh one.
+   *
+   * A fence is deliberately permanent until something asks for a retry, and
+   * until 0.3.0 nothing could. `purge` says so twice — "disabled until an
+   * explicit retry" — and there was no retry to make; a destination fenced by
+   * another handle's purge, or by a purge that deleted durably and could not
+   * reopen, was dead for the life of the process.
+   *
+   * Constructing a replacement was the only recourse, and it is a poor one
+   * rather than an impossible one. On the same canonical path a second handle
+   * is eligible to share the writer when the rotation policy and framing
+   * match; differing ones are a `CONFIG_CONFLICT`. Matching them is not a
+   * promise of success either — an acquisition still fails on a previous
+   * writer that is still closing, or on the filesystem, or on the lock. And
+   * whichever way it goes, the fenced destination is still alive: holding its
+   * retain on the writer, still registered with whatever logger it was given
+   * to, until someone disposes it.
+   *
+   * Returns whether this destination can write when the call returns.
+   *
+   * - Disposed → `false`. The sink is closed and the handle is gone; a
+   *   disposed destination is finished, not resting, and reopening one would
+   *   resurrect an object its owner has already released.
+   * - Not fenced → `true`, having touched nothing. Closing a live handle to
+   *   prove it can be reopened would throw away the buffer and the file
+   *   position for a question already answered.
+   * - Otherwise the sink is closed and reopened with the same path, rotation
+   *   and framing it was constructed with. On success the fence lifts and the
+   *   batcher rebinds to the new generation; on failure it stays fenced and
+   *   the destination is exactly as dead as it was, which is the only safe
+   *   direction for this to fail in.
+   *
+   * `deadlineMs` bounds the close, the only half that waits — it drains and
+   * fsyncs a handle that may have a queue behind it. `open` does not take one.
+   * A close that throws is swallowed rather than reported: this handle is
+   * fenced, so there was nothing worth draining, and whether the reopen worked
+   * is the question the return value answers.
+   *
+   * **What `true` does not claim.** It says a handle was acquired, not that
+   * the file behind it is the one this destination was writing to before.
+   * Reopening after another handle's purge lands on a fresh, empty file —
+   * which is the point of the purge — and nothing here can or should undo
+   * that.
+   *
+   * **The new file does not open with a notice about the old one**, and that
+   * falls out of two decisions rather than a rule written here. `Batcher.fence`
+   * clears the owed delta on the way in, because a notice about deliberately
+   * deleted data would describe the deletion; and `write` above refuses while
+   * fenced, so nothing accumulates behind the fence either. A reopened
+   * destination starts clean. What `Batcher.rebind` preserves is the loss
+   * accounting of a batcher driven directly — this destination cannot reach
+   * that state, and the reason is the `isEnabled` guard, not luck.
+   */
+  reopen(deadlineMs: number = DEFAULT_DEADLINE_MS): boolean {
+    if (this.disposed) return false;
+    if (!this.fenced) return true;
+
+    try {
+      this.sink.close(deadlineMs);
+    } catch {
+      // Nothing was drainable behind a fence. If the handle is still open the
+      // `open` below fails as a config conflict, which is the honest answer.
+    }
+
+    try {
+      this.sink.open(this.path, this.rotation, this.lineFramed);
+    } catch {
+      return false;
+    }
+
+    this.fenced = false;
+    this.batcher.rebind();
+    return true;
   }
 
   /** Idempotent: flush what is buffered, release the timer, close the sink. */

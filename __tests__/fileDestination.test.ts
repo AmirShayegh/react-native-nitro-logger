@@ -1293,3 +1293,239 @@ describe('MemoryFileSink — the no-handle rows both adapters implement', () => 
     expect(sink.getLogFilePaths()).toEqual(['/memory/logs/app.log']);
   });
 });
+
+/**
+ * `reopen()` — the way back from a fence.
+ *
+ * A fence is permanent by design, and until 0.3.0 it was permanent in
+ * practice: `purge` promised "disabled until an explicit retry" twice over and
+ * there was no retry to make. These pin what the retry does and, just as
+ * importantly, what it refuses to do.
+ *
+ * What none of them prove: that the file behind the new handle holds what the
+ * old one wrote. It does not, after a purge, and that is the purge working.
+ */
+describe('FileDestination.reopen', () => {
+  /** Fence `victim` from the outside — a second handle purges the writer out
+   * from under it, exactly as a compliance deletion on another destination
+   * does. The rejection arrives on the next append, so one is forced. */
+  function fenceFromOutside(
+    victim: FileDestination,
+    other: MemoryFileSink,
+    path = '/memory/logs/app.log'
+  ): void {
+    other.open(path, undefined, true);
+    other.clearLogs(1000);
+    victim.write(entry({ message: 'rejected by a stale generation' }));
+    victim.flush(1000);
+    expect(victim.isEnabled).toBe(false);
+  }
+
+  test('a handle fenced by another purge writes again after reopen', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+    const opensBefore = sink.openCount;
+
+    expect(destination.reopen(1000)).toBe(true);
+    expect(destination.isEnabled).toBe(true);
+    expect(sink.openCount).toBe(opensBefore + 1);
+
+    destination.write(entry({ message: 'after the retry' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('after the retry');
+  });
+
+  /**
+   * "The config the first one had" means the values at construction, not the
+   * caller's object as it stands now.
+   *
+   * The caller owns what it passed and may keep mutating it. Reopening with a
+   * drifted policy is not a quiet difference: the native registry compares
+   * policies to decide whether two handles may share a writer, so a reopen
+   * carrying a changed one is a `CONFIG_CONFLICT` against a sibling handle
+   * that is still open — a recovery path that fails because of an edit made
+   * somewhere else entirely.
+   */
+  test('the new handle is opened with the config the first one had', () => {
+    const rotation = {
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    };
+    const { destination, sink, writer } = build({
+      path: '/memory/logs/custom.log',
+      rotation,
+      formatter: new DefaultFormatter(),
+    });
+    fenceFromOutside(destination, writer.attach(), '/memory/logs/custom.log');
+
+    // The caller edits its own object between the two opens.
+    rotation.maxFileSizeBytes = 999;
+    rotation.compressArchives = false;
+
+    expect(destination.reopen(1000)).toBe(true);
+    expect(sink.openedPath).toBe('/memory/logs/custom.log');
+    expect(sink.openedRotation).toEqual({
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    });
+    // A copy, not the caller's object — which is the whole point.
+    expect(sink.openedRotation).not.toBe(rotation);
+    // Framing follows the formatter, and DefaultFormatter makes no guarantee.
+    expect(sink.openedLineFramed).toBe(false);
+  });
+
+  test('the first open already gets the snapshot, not the caller object', () => {
+    const rotation = {
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    };
+    const { sink } = build({ rotation });
+
+    expect(sink.openedRotation).toEqual(rotation);
+    expect(sink.openedRotation).not.toBe(rotation);
+    // Frozen, so nothing downstream can edit the record of what was opened.
+    expect(Object.isFrozen(sink.openedRotation)).toBe(true);
+  });
+
+  test('an unfenced destination is left completely alone', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'still buffered' }));
+    const opens = sink.openCount;
+    const closes = sink.closeCalls;
+
+    expect(destination.reopen(1000)).toBe(true);
+    // No close, no open: the buffer and the file position are worth more than
+    // a proof that reopening would have worked.
+    expect(sink.openCount).toBe(opens);
+    expect(sink.closeCalls).toBe(closes);
+    expect(destination.isEnabled).toBe(true);
+  });
+
+  test('a disposed destination refuses, and stays disposed', () => {
+    const { destination, sink } = build();
+    destination.dispose();
+    const opens = sink.openCount;
+
+    expect(destination.reopen(1000)).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+    // Not reopened behind its owner's back: dispose is a release, not a pause.
+    expect(sink.openCount).toBe(opens);
+  });
+
+  test('an open that fails leaves the destination exactly as fenced as it was', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    sink.throwNextOpens = 1;
+    expect(destination.reopen(1000)).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+
+    // And the fence still means what it meant: records go nowhere, and the
+    // retry can be made again.
+    destination.write(entry({ message: 'must not appear' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).not.toContain(
+      'must not appear'
+    );
+    expect(destination.reopen(1000)).toBe(true);
+  });
+
+  test('a close that throws does not stop the reopen', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    sink.throwNextCloses = 1;
+    // The close is best-effort — there was nothing drainable behind a fence,
+    // and the open is what decides.
+    expect(destination.reopen(1000)).toBe(true);
+    expect(destination.isEnabled).toBe(true);
+    destination.write(entry({ message: 'through despite the close' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain(
+      'through despite the close'
+    );
+  });
+
+  /**
+   * The reopened file starts clean, and this is the assertion that says so.
+   *
+   * Two separate decisions produce it and neither is stated as a rule here:
+   * `Batcher.fence` clears the owed delta on the way in, because a notice about
+   * deliberately deleted data would describe the deletion; and `write` refuses
+   * while fenced, so nothing piles up behind the fence to be owed later. A
+   * post-purge file opening with "4,182 entries dropped" would be a statement
+   * about data someone was legally obliged to delete.
+   */
+  test('the reopened file does not open with a notice about the old one', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    // Written while fenced: refused at the door, and not counted as a drop
+    // either — the logger never routes to a destination reporting
+    // `isEnabled: false`, so these can only arrive by a direct call.
+    destination.write(entry({ message: 'refused while fenced' }));
+    destination.write(entry({ message: 'also refused while fenced' }));
+
+    expect(destination.reopen(1000)).toBe(true);
+    destination.write(entry({ message: 'the first record of the new file' }));
+    destination.flush(1000);
+
+    const written = records(writer);
+    expect(written.map((r) => r.message)).toEqual([
+      'the first record of the new file',
+    ]);
+    // Neither the refused records nor a count of them.
+    const text = JSON.stringify(written);
+    expect(text).not.toContain('refused while fenced');
+    expect(text).not.toContain('dropped');
+    expect(sink.openCount).toBeGreaterThan(1);
+  });
+
+  test('reopen after a purge through this same handle is a no-op', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'pre-purge' }));
+    const outcome = destination.purge(1000);
+    expect(outcome.rebound).toBe(true);
+    const opens = sink.openCount;
+
+    // The purge already rebound this handle — `clearLogs` does that itself,
+    // and re-opening a live writer is a config conflict.
+    expect(destination.reopen(1000)).toBe(true);
+    expect(sink.openCount).toBe(opens);
+  });
+
+  test('reopen recovers a purge that deleted durably but could not reopen', () => {
+    const { destination, sink, writer } = build();
+    writer.reopenFails = true;
+    const outcome = destination.purge(1000);
+
+    // The compliance answer is still true; the destination is still dead.
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+
+    writer.reopenFails = false;
+    expect(destination.reopen(1000)).toBe(true);
+    destination.write(entry({ message: 'writing again' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('writing again');
+    expect(sink.openCount).toBeGreaterThan(1);
+  });
+
+  test('the deadline goes to the close, which is the half that waits', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+    const seen: number[] = [];
+    const realClose = sink.close.bind(sink);
+    sink.close = (deadlineMs: number) => {
+      seen.push(deadlineMs);
+      return realClose(deadlineMs);
+    };
+
+    destination.reopen(250);
+    expect(seen).toEqual([250]);
+  });
+});

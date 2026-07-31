@@ -204,6 +204,22 @@ export class MemoryFileSink implements FileSinkLike {
   /** Throw out of the next N appends, as a native call can. */
   throwNextAppends = 0;
   /**
+   * Throw out of the next N opens, as `HybridFileSink` does on an open failure
+   * or a config conflict — the two reasons a `FileDestination` constructor can
+   * throw, and the two a `reopen` has to survive.
+   *
+   * Thrown *after* `mayHaveArtifacts` is forfeited, matching the real one: the
+   * log directory may already exist by the time the open fails.
+   */
+  throwNextOpens = 0;
+  /**
+   * Throw out of the next N closes. A close and an open are separate native
+   * calls with separate failure modes, and a reopen that treated a failed
+   * close as a failed reopen would refuse to recover from the more likely of
+   * the two.
+   */
+  throwNextCloses = 0;
+  /**
    * Which of the two bits every no-handle answer is derived from.
    *
    * The natives do not carry a "closed" boolean; they carry a handle that is
@@ -310,6 +326,10 @@ export class MemoryFileSink implements FileSinkLike {
     // directory may already have been created by the time an open throws, so a
     // sink whose open failed can no longer claim that nothing exists.
     this.mayHaveArtifacts = true;
+    if (this.throwNextOpens > 0) {
+      this.throwNextOpens -= 1;
+      throw new Error('native open failed');
+    }
     this.writer.claimPath(path);
     this.state = 'open';
     this.openedPath = path;
@@ -455,6 +475,10 @@ export class MemoryFileSink implements FileSinkLike {
 
   close(deadlineMs: number): FlushOutcome {
     this.closeCalls += 1;
+    if (this.throwNextCloses > 0) {
+      this.throwNextCloses -= 1;
+      throw new Error('native close failed');
+    }
     // Idempotent, like `beginClose`: the second close finds no handle and
     // answers without draining anything. Draining again would let a test see a
     // durable flush from a sink that has nothing left to flush through.
