@@ -72,6 +72,22 @@ jobs:
       - name: Typecheck the min-rn harness apps
         run: yarn check-harness
 
+      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 19 shell
+      # scripts that hold most of this repository's gates are unparsed until
+      # something runs them — and several only run inside the emulator and
+      # simulator jobs, so an unterminated heredoc or a stray `fi` costs
+      # minutes to discover. `bash -n` parses without executing. The floor is
+      # there because a glob that matched nothing would otherwise pass.
+      - name: Syntax-check the shell scripts
+        run: |
+          count=0
+          for f in scripts/*.sh; do bash -n "$f"; count=$((count + 1)); done
+          if [ "$count" -lt 19 ]; then
+            echo "FAIL: parsed only $count scripts; the glob is not matching"
+            exit 1
+          fi
+          echo "ok: $count shell scripts parse"
+
       # The counts `docs/PARITY.md` states, against the floors CI enforces.
       # Needs no test run, which is why it sits here rather than in the three
       # matrix jobs: it checks the document against the gate, and the gate
