@@ -63,6 +63,15 @@ jobs:
       - name: Typecheck the documentation samples
         run: yarn check-docs
 
+      # The consumer apps the min-rn jobs write out are TypeScript inside a
+      # shell heredoc, so `lint` and `typecheck` above cannot see them. 0.3.0
+      # moved `createFileSink` to a subpath export, both templates kept
+      # importing it from the root, and the first thing that noticed was
+      # min-rn-android failing after 7m34s of emulator time. Two seconds here
+      # instead.
+      - name: Typecheck the min-rn harness apps
+        run: yarn check-harness
+
       # The counts `docs/PARITY.md` states, against the floors CI enforces.
       # Needs no test run, which is why it sits here rather than in the three
       # matrix jobs: it checks the document against the gate, and the gate
@@ -296,6 +305,13 @@ jobs:
       # fails for every reader.
       - name: Typecheck the documentation against the published surface
         run: yarn check-docs-lib
+
+      # And the harness apps against that same surface, for the same reason —
+      # more sharply here, because these apps really do install the packed
+      # tarball, so `lib/typescript/**` is not a stand-in for what they resolve.
+      # It is what they resolve.
+      - name: Typecheck the min-rn harness apps against the published surface
+        run: yarn check-harness-lib
 
       # Every `__DEV__` in the built library is a place redaction can be turned
       # off. The set is meant to be small and unchanging; this fails if it grows

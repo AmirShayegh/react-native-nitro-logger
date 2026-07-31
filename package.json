@@ -78,6 +78,8 @@
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
     "check-docs": "./scripts/check-doc-samples.sh --target src",
     "check-docs-lib": "./scripts/check-doc-samples.sh --target lib",
+    "check-harness": "./scripts/check-harness-samples.sh --target src",
+    "check-harness-lib": "./scripts/check-harness-samples.sh --target lib",
     "check-eslint-consumer": "./scripts/check-eslint-consumer.sh",
     "check-android-instrumented": "./scripts/check-android-instrumented.sh",
     "check-test-reports": "./scripts/check-test-reports.sh",
