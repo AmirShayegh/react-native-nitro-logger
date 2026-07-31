@@ -562,19 +562,66 @@ final class LogSecureFileTests: LogWriterTestCase {
     XCTAssertFalse(LogSecureFile.hasExpectedMode(logURL, isDirectory: false))
   }
 
-  func testWriterFlagsProtectionWhenAModeCannotBeApplied() throws {
+  /// A protection shortfall on the *file* is reported rather than swallowed.
+  ///
+  /// This test used to arrange the fault with `UF_IMMUTABLE` and guard its
+  /// assertion behind `if let handle = try? makeHandle()`. The immutable flag
+  /// denies `open(O_RDWR)` with `EPERM` for any uid, root included, so the
+  /// optional never bound and the body never ran: **zero assertions on every
+  /// run since it was written**, reported as a pass each time. `XCTUnwrap`
+  /// would not have fixed it — the open genuinely cannot succeed under that
+  /// flag, so it would have become always-red rather than always-vacuous.
+  ///
+  /// It also asserted on the wrong thing. The writer folds the directory's
+  /// shortfall and the file's into one `.protection` bit, and on macOS the
+  /// directory's backup exclusion fails for an ordinary temporary directory —
+  /// so `status().degraded` already carries that bit before the file is
+  /// considered at all. Measured: the handle's mask is 16 with nothing wrong,
+  /// while `secure(file)` returns an empty shortfall. Any assertion about the
+  /// file route made through the aggregate mask is therefore satisfied by the
+  /// directory route and says nothing.
+  ///
+  /// So this asks the file call directly, where the answer is the file's own.
+  func testAFileProtectionShortfallIsReported() throws {
     try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-    FileManager.default.createFile(atPath: logURL.path, contents: nil,
-                                   attributes: [.posixPermissions: 0o644])
-    TestFlags.makeImmutable(logURL)
-    defer { chflags(logURL.path, 0) }
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    LogSecureFile.injectFileProtectionFaultForTesting(.protection, under: root)
+    defer { LogSecureFile.clearFileProtectionFaultsForTesting(under: root) }
 
-    // The file opens (it exists and is writable through an existing
-    // descriptor), but the mode cannot be corrected — which the caller learns
-    // from the degradation mask rather than from silence.
-    if let handle = try? makeHandle() {
-      XCTAssertNotEqual(handle.status().degraded & LogDegradation.protection.rawValue, 0)
-    }
+    let shortfall = LogSecureFile.secure(logURL, isDirectory: false)
+
+    XCTAssertTrue(shortfall.contains(.protection),
+                  "a protection the file did not receive must be reported")
+  }
+
+  /// The positive control, and the reason the test above is not vacuous.
+  ///
+  /// Without it, a `secure` that reported `.protection` unconditionally would
+  /// satisfy the assertion — which is exactly the state the aggregate mask is
+  /// in on this platform. An empty shortfall here is what makes the flag above
+  /// attributable to the injected fault.
+  func testAFileWithNoInjectedFaultReportsNothing() throws {
+    try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+
+    XCTAssertEqual(LogSecureFile.secure(logURL, isDirectory: false), [],
+                   "nothing was wrong with this file; nothing may be reported")
+  }
+
+  /// The seams are separate, and this is the statement that keeps them so.
+  ///
+  /// A single map covering both would let a directory test's injected fault
+  /// reach the file route, lighting `.protection` there regardless of what the
+  /// directory decided — which is the defect the directory seam's own comment
+  /// warns about, and the reason widening it was the wrong fix.
+  func testTheDirectorySeamDoesNotReachTheFileRoute() throws {
+    try FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: root)
+    defer { LogSecureFile.clearDirectoryProtectionFaultsForTesting(under: root) }
+
+    XCTAssertEqual(LogSecureFile.secure(logURL, isDirectory: false), [],
+                   "a directory fault must not answer for a file")
   }
 
   func testWriterRefusesToOpenWhereItCannotCreate() throws {

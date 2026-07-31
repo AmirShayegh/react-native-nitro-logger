@@ -570,14 +570,45 @@ internal enum LogSecureFile {
     seamLock.unlock()
   }
 
+  /// The file twin, and deliberately a *separate* map rather than dropping the
+  /// `isDirectory` guard above.
+  ///
+  /// Widening the directory seam to cover both would have destroyed the reason
+  /// it is restricted: a fault reaching the file route lights `.protection` no
+  /// matter what the directory route decides, so the four directory tests
+  /// would start passing with the decision they exist to pin discarded. Two
+  /// maps keep each seam unable to answer for the other.
+  ///
+  /// This exists because the file-mode branch had no working statement at all.
+  /// `testWriterFlagsProtectionWhenAModeCannotBeApplied` tried to arrange the
+  /// fault with `UF_IMMUTABLE`, which denies `open(O_RDWR)` with `EPERM` for
+  /// any uid — so `try? makeHandle()` returned nil, the `if let` never bound,
+  /// and the test executed zero assertions on every run since it was written.
+  /// `XCTUnwrap` would not have fixed it: the open genuinely cannot succeed,
+  /// so it would have been always-red rather than always-vacuous.
+  private static var fileProtectionFaults: [String: Shortfall] = [:]
+
+  static func injectFileProtectionFaultForTesting(_ shortfall: Shortfall, under root: URL) {
+    seamLock.lock()
+    fileProtectionFaults[root.path] = shortfall
+    seamLock.unlock()
+  }
+
+  static func clearFileProtectionFaultsForTesting(under root: URL) {
+    seamLock.lock()
+    fileProtectionFaults.removeValue(forKey: root.path)
+    seamLock.unlock()
+  }
+
   /// Path-boundary prefix match: `/a/b` covers `/a/b` and `/a/b/c`, and does
   /// NOT cover `/a/bc` — a bare `hasPrefix` would, and the UUID roots only make
   /// that collision unlikely, not impossible.
-  private static func injectedFault(for url: URL) -> Shortfall {
+  private static func injectedFault(for url: URL, isDirectory: Bool) -> Shortfall {
     seamLock.lock()
     defer { seamLock.unlock() }
+    let faults = isDirectory ? directoryProtectionFaults : fileProtectionFaults
     var result = Shortfall()
-    for (root, fault) in directoryProtectionFaults
+    for (root, fault) in faults
     where url.path == root || url.path.hasPrefix(root + "/") {
       result.formUnion(fault)
     }
@@ -586,7 +617,7 @@ internal enum LogSecureFile {
 
   /// Data protection plus backup exclusion, reported rather than thrown.
   private static func protect(_ url: URL, isDirectory: Bool) -> Shortfall {
-    var shortfall = isDirectory ? injectedFault(for: url) : Shortfall()
+    var shortfall = injectedFault(for: url, isDirectory: isDirectory)
 
     #if os(iOS) || os(tvOS) || os(watchOS)
     // Directories carry a protection class too, and it is what newly created

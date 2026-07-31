@@ -7,7 +7,19 @@ import os
 /// line longer than the unified log will store — is a pure function of its
 /// input, so it lives where XCTest can reach it. `HybridNativeConsoleSink` is
 /// the adapter around this and holds no logic of its own.
+///
+/// `emit` exists so the tests can watch what would have gone to the unified
+/// log, and it is the Kotlin twin's pattern for the twin's reason. The unified
+/// log is not readable back from a unit test — `OSLogStore` needs entitlements
+/// a test bundle does not have — so a writer that called `os_log` directly
+/// could only ever be tested by not testing it. Three tests here did exactly
+/// that: they called `logBatch` and asserted nothing at all, passing whether
+/// or not a single line was written.
 public final class NativeConsoleWriter {
+
+  /// What one entry would be: its severity, the category it is filed under,
+  /// and the text. Defaults to the real `os_log` call.
+  public typealias Emitter = (OSLogType, String, String) -> Void
 
   /// Bytes of message text per `os_log` call.
   ///
@@ -24,18 +36,30 @@ public final class NativeConsoleWriter {
 
   private let lock = NSLock()
   private var logger: os.Logger?
+  /// The resolved category, kept beside the bound logger.
+  ///
+  /// `os.Logger` does not hand back the category it was built with, so without
+  /// this there is nothing to assert a filing destination against — the empty
+  /// -string fallback in `install` could file everything under `""` and no
+  /// test could tell.
+  private var category: String = NativeConsoleWriter.fallbackCategory
+  private let emit: Emitter?
 
-  public init() {}
+  public init() { self.emit = nil }
+
+  /// Test seam. The default initializer keeps the real `os_log` path.
+  init(emit: @escaping Emitter) { self.emit = emit }
 
   /// Binds the subsystem and category. Calling it again rebinds.
   public func install(subsystem: String, category: String) {
     // Empty strings produce a logger that is legal but unfindable in Console,
     // so fall back to something a developer can actually search for.
     let subsystem = subsystem.isEmpty ? Self.fallbackSubsystem : subsystem
-    let category = category.isEmpty ? "log" : category
+    let category = category.isEmpty ? Self.fallbackCategory : category
     let bound = os.Logger(subsystem: subsystem, category: category)
     lock.lock()
     logger = bound
+    self.category = category
     lock.unlock()
   }
 
@@ -48,11 +72,15 @@ public final class NativeConsoleWriter {
   /// into missing logs.
   public func logBatch(levels: [Double], messages: [String]) {
     guard !messages.isEmpty else { return }
-    let logger = self.resolvedLogger()
+    let (logger, category) = self.resolvedLogger()
 
     for (index, message) in messages.enumerated() {
       let type = Self.osLogType(forCode: index < levels.count ? levels[index] : 2)
       for chunk in Self.chunks(of: message) {
+        if let emit {
+          emit(type, category, chunk)
+          continue
+        }
         // `.public` because redaction already happened in the JavaScript layer
         // — what arrives here is the final rendered line, and marking it
         // private would hide it from the developer without protecting anything
@@ -67,20 +95,27 @@ public final class NativeConsoleWriter {
   /// Losing every line because a caller forgot a setup call is a worse failure
   /// than logging under a guessed category, and this is the diagnostic channel
   /// — the one you reach for when something else has already gone wrong.
-  private func resolvedLogger() -> os.Logger {
+  private func resolvedLogger() -> (os.Logger, String) {
     lock.lock()
     if let logger {
+      let category = self.category
       lock.unlock()
-      return logger
+      return (logger, category)
     }
-    let fallback = os.Logger(subsystem: Self.fallbackSubsystem, category: "log")
+    let fallback = os.Logger(
+      subsystem: Self.fallbackSubsystem, category: Self.fallbackCategory)
     logger = fallback
+    category = Self.fallbackCategory
     lock.unlock()
-    return fallback
+    return (fallback, Self.fallbackCategory)
   }
 
   private static let fallbackSubsystem =
     Bundle.main.bundleIdentifier ?? "com.nitrologger"
+
+  /// One constant rather than the two `"log"` literals this used to have, so
+  /// the pre-install fallback and the empty-category fallback cannot drift.
+  static let fallbackCategory = "log"
 
   // MARK: - Level mapping
 
