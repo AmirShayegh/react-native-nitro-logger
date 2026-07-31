@@ -158,6 +158,17 @@ describe('no-dynamic-message', () => {
       // exactly as it did before the walk existed: neither the value nor the
       // name says logger.
       'const deps = { audit: getLogger() }; deps.audit.info(`user ${id}`);',
+      // A container inside a container is the same question one level in, so
+      // the walk recurses rather than reading `inner.audit` off its own
+      // spelling. Here the inner literal settles it: not a logger, silent.
+      'const inner = { audit: analytics }; const holder = { logger: inner.audit }; holder.logger.info(`user ${id}`);',
+      // ...and travels outward only when it says logger. `deps.analytics` in
+      // a field spelled `audit` leaves nothing anywhere that says logger.
+      'const holder = { audit: deps.analytics }; holder.audit.info(`user ${id}`);',
+      // Containers that name each other resolve to nothing and, crucially,
+      // terminate. Neither field is spelled like a logger, so nothing is
+      // reported — the assertion that matters is that this test finishes.
+      'const a = { x: b.y }; const b = { y: a.x }; a.x.info(`user ${id}`);',
       // KNOWN LIMITATION, pinned: `this.<field>` is not followed even when
       // the field initializer is in the same class. Resolving it means
       // matching a class field against the instance a method runs on, which
@@ -640,6 +651,30 @@ describe('no-dynamic-message', () => {
       },
       {
         code: 'const deps = { logger: flag ? a : b }; deps.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Nesting, in both directions. Reading `inner.audit` from its own
+      // property name would rebuild the defect one level deeper: the name
+      // `audit` says "not a logger", that answer would look decisive, and the
+      // outer `logger` hint would be discarded — silencing a call the file
+      // fully proves is `Log`. So a member candidate takes the walk too.
+      {
+        code: `${IMPORT_LOG} const inner = { audit: Log }; const holder = { logger: inner.audit }; holder.logger.info(\`patient \${id}\`);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // And when the inner container is not in this file at all, `deps.audit`
+      // is a shrug rather than a denial, so the outer name still decides.
+      {
+        code: 'const holder = { logger: deps.audit }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // The other half of that: an unreadable container whose property IS
+      // spelled like a logger is the only evidence there is, so it is used —
+      // even though the field holding it is spelled like something else. A
+      // shrug hands the question back to the outer name; a name that says
+      // "logger" is an answer and travels outward.
+      {
+        code: 'const holder = { audit: deps.logger }; holder.audit.info(`patient ${id}`);',
         errors: [{ messageId: 'dynamic' }],
       },
       // Several candidates, one of them unreadable: it cannot be ruled out as

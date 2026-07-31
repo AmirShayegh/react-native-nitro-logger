@@ -1904,12 +1904,20 @@ function describeMethodReference(context, node, args) {
  * before this walk existed. That is the *dangerous* direction: a false
  * negative in a privacy rule looks exactly like compliance.
  *
- * So [decidedClassification] separates the two, on the same line
- * `classifyReceiver` already draws for bindings: a name — an identifier or a
- * member expression — was looked at and answered, and a construction was
- * examined and rejected; a call, a conditional, an `await` or anything else
- * opaque was not. An undecided candidate makes this whole walk answer
+ * So [classifyCandidate] separates the two: an identifier had the name
+ * heuristic applied and answered, a construction was examined and rejected,
+ * and anything else opaque — a call, a conditional, an `await` — was not
+ * understood. An undecided candidate makes this whole walk answer
  * `undefined`, which hands the question back to the name.
+ *
+ * A candidate that is itself `container.property` is the same question one
+ * level further in, so it takes the same walk. Classifying it from its own
+ * property name would rebuild the defect this paragraph is about:
+ * `const inner = { audit: Log }; const holder = { logger: inner.audit }` is
+ * fully settled by the file, and reading `inner.audit` as "not spelled like a
+ * logger" would silence a call the outer name would otherwise have caught.
+ * `seen` is what makes the recursion terminate over containers that reference
+ * each other.
  *
  * ## What this deliberately does not reach
  *
@@ -1921,9 +1929,14 @@ function describeMethodReference(context, node, args) {
  * hint and nothing more, pinned by fixtures so that changing it is a decision
  * rather than a side effect.
  */
-function classifyPropertyReceiver(context, node, callNode) {
+function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
   const current = unwrap(node);
   if (!current || current.type !== 'MemberExpression') return undefined;
+  // Containers that reference each other resolve to nothing rather than
+  // looping — the same treatment the constant resolver gives a cycle.
+  if (seen.has(current)) return undefined;
+  seen.add(current);
+
   const name = staticPropertyName(context, current);
   if (name === undefined || name === null) return undefined;
 
@@ -1935,22 +1948,16 @@ function classifyPropertyReceiver(context, node, callNode) {
   );
   if (candidates.length === 0) return undefined;
 
-  const classified = candidates.map((value) => ({
-    value,
-    receiver: classifyReceiver(context, value),
-  }));
-  const opaque = classified.filter(
-    (entry) => entry.receiver === null && !decidedClassification(entry.value)
+  const classified = candidates.map((value) =>
+    classifyCandidate(context, value, callNode, seen)
   );
+  const opaque = classified.filter((receiver) => receiver === undefined);
 
   // Exactly one possible value: it is what the property holds, so its own
   // classification stands — including `null`, which is the answer for
-  // `const deps = { analytics }; deps.analytics.info(x)` and has to stay one.
-  // Unless nothing was decided about it, in which case the name still knows
-  // more than this walk does.
-  if (classified.length === 1) {
-    return opaque.length > 0 ? undefined : classified[0].receiver;
-  }
+  // `const deps = { analytics }; deps.analytics.info(x)` and has to stay one,
+  // and including `undefined`, which hands the question back to the name.
+  if (classified.length === 1) return classified[0];
   // Several, and at least one is a logger — or at least one is unreadable,
   // which cannot be ruled out as one. Which runs is unknowable, so the rules
   // apply — but never as the singleton, whose provenance is exactly what is in
@@ -1964,25 +1971,29 @@ function classifyPropertyReceiver(context, node, callNode) {
   // this line is a forward constraint rather than a behaviour anything can
   // observe today, and it is stated that way rather than credited with
   // protection it does not currently provide.
-  return classified.some((entry) => entry.receiver !== null) ||
-    opaque.length > 0
+  return classified.some((receiver) => receiver != null) || opaque.length > 0
     ? 'ambiguous'
     : null;
 }
 
 /**
- * Was `classifyReceiver`'s `null` an answer, or a shrug?
+ * One value a container property could hold: what it is, or `undefined` for
+ * "this was found and not understood".
  *
- * The two are different facts and the difference decides whether the property
- * name still gets a say. This draws the line where `classifyReceiver` already
- * draws it for a binding's initializer:
+ * The distinction is the whole point, and it decides whether the property name
+ * one level up still gets a say. `classifyReceiver` returns `null` for both
+ * "looked at, not a logger" and "cannot see through this", and only the first
+ * is evidence:
  *
- *   - a **name** — an identifier, or a member expression — was looked at. The
- *     name heuristic is the answer for those and it applies here too, so a
- *     `null` means "this is not spelled like a logger", which is a decision.
+ *   - an **identifier** had the name heuristic applied, so its `null` means
+ *     "not spelled like a logger", which is a decision.
  *   - a **construction** was examined by `classifyConstruction` and found not
  *     to be a logger. `classifyReceiver` calls that evidence in as many words,
  *     and `loggerClassNames` depends on it continuing to mean something.
+ *   - a **member expression** is another container property, so it takes the
+ *     same walk rather than being answered from its own spelling. If that walk
+ *     can read it, the answer is real; if it cannot, this is `undefined` — an
+ *     unresolvable `deps.audit` is not evidence about the field holding it.
  *   - anything else — a call, a conditional, an `await`, a template — was not
  *     understood. `getLogger()` is the canonical one, and it is exactly the
  *     shape a real logger arrives in.
@@ -1990,14 +2001,25 @@ function classifyPropertyReceiver(context, node, callNode) {
  * Undecided is the safe answer to be wrong about: it costs a fallback to the
  * name, which is what the analysis did before this walk existed.
  */
-function decidedClassification(node) {
-  const current = unwrap(node);
-  if (!current) return false;
-  return (
-    current.type === 'Identifier' ||
-    current.type === 'MemberExpression' ||
-    current.type === 'NewExpression'
-  );
+function classifyCandidate(context, value, callNode, seen) {
+  const current = unwrap(value);
+  if (!current) return undefined;
+
+  if (current.type === 'MemberExpression') {
+    const nested = classifyPropertyReceiver(context, current, callNode, seen);
+    if (nested !== undefined) return nested;
+    // Nothing readable behind it, so its own property name is all there is —
+    // and a name that says "not a logger" one level down says nothing about
+    // the field up here.
+    const hint = classifyReceiver(context, current);
+    return hint === null ? undefined : hint;
+  }
+
+  const receiver = classifyReceiver(context, current);
+  if (receiver !== null) return receiver;
+  return current.type === 'Identifier' || current.type === 'NewExpression'
+    ? null
+    : undefined;
 }
 
 /**
