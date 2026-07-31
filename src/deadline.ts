@@ -60,12 +60,16 @@ export type Deadline = () => number;
  * the flush before it has drained anything. Neither is rare enough to accept on
  * the path that runs while an app is dying.
  *
- * The clock is resolved **once per deadline** and captured for its lifetime,
+ * The clock is **captured once per deadline** and held for its lifetime,
  * because `performance.now()` and `Date.now()` count from different origins:
  * mixing the two inside one deadline subtracts an epoch from a stopwatch and
- * gets a budget of roughly fifty years. Resolving per deadline rather than once
- * per process is what lets a React Native runtime that installs `performance`
- * after this module is imported still be picked up.
+ * gets a budget of roughly fifty years.
+ *
+ * *Which* clock that is gets resolved once per process — but only once a
+ * monotonic one has been found. Until then every deadline probes again, which
+ * is what lets a React Native runtime that installs `performance` after this
+ * module is imported still be picked up. See {@link resolveClock} for why the
+ * memo is one-directional.
  *
  * What is subtracted is **elapsed time floored to whole milliseconds**, not the
  * raw difference. `performance.now()` answers in fractions of a millisecond, and
@@ -104,20 +108,56 @@ export function startDeadline(deadlineMs: number): Deadline {
 }
 
 /**
+ * The monotonic clock, once one has been found. Never cleared.
+ *
+ * Undefined means "not found yet", which is a different statement from "this
+ * host has none" — see {@link resolveClock} for why the difference is the
+ * whole design of the memo.
+ */
+let monotonic: (() => number) | undefined;
+
+/**
  * `performance.now` bound to its host, or `Date.now` when there is none.
  *
  * Guarded rather than assumed: a logger must not be the reason a call fails,
  * and a host whose `performance` is a getter that throws is a host this still
  * has to keep a deadline on. A candidate that answers with anything but a
  * finite number is not a clock and is declined.
+ *
+ * **Memoised on success, and only on success.** The asymmetry is the point,
+ * not an oversight:
+ *
+ * - Finding `performance.now` is a permanent fact about a host. Nothing takes
+ *   a runtime's monotonic clock away, so re-deriving it per deadline bought
+ *   a property read, an optional call, a `bind` allocation and a probe call
+ *   every time — on, among other paths, the flush that runs while the app is
+ *   dying and the budget is being counted in milliseconds.
+ * - NOT finding one is not permanent. A React Native runtime can install
+ *   `performance` after this module is imported, and a host answering
+ *   non-finite once may simply not have finished starting up. Remembering the
+ *   `Date.now` fallback would freeze the wall clock in for the life of the
+ *   process on exactly the hosts that were about to get better, and the
+ *   deadline docstring above is a promise about monotonicity. So the fallback
+ *   is returned without being recorded, and the next deadline asks again.
+ *   `__tests__/deadline.test.ts` pins that directly.
+ *
+ * **What this does not do:** follow a host that REPLACES `globalThis
+ * .performance` after a successful resolution. The function bound from the
+ * first one is kept for the life of the process. No runtime this library
+ * supports does that, and a clock that has already answered finitely is a
+ * worse thing to abandon than to keep.
  */
 function resolveClock(): () => number {
+  if (monotonic !== undefined) return monotonic;
   try {
     const host = globalThis as { performance?: { now?: () => number } };
     const now = host.performance?.now;
     if (typeof now === 'function') {
       const read = now.bind(host.performance);
-      if (Number.isFinite(read())) return read;
+      if (Number.isFinite(read())) {
+        monotonic = read;
+        return read;
+      }
     }
   } catch {
     // Not a clock. The wall clock still bounds the wait, just less well.
