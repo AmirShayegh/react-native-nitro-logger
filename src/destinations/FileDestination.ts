@@ -298,6 +298,18 @@ export class FileDestination implements LogDestination {
 
   write(entry: LogEntry): void {
     if (!this.isEnabled) return;
+    // Asked before rendering, because rendering is the expensive half of
+    // writing a log line and a full buffer will drop whatever comes out of it.
+    // Under sustained backpressure that is the difference between formatting
+    // every record for the wastebasket and formatting none of them.
+    //
+    // The record is still counted — it was a real entry that did not reach the
+    // file — but with no byte count, because producing one means rendering it.
+    // See {@link LossCounts}, where that asymmetry is the documented contract.
+    if (!this.batcher.hasRoom()) {
+      this.batcher.noteLoss(1, 0);
+      return;
+    }
     const rendered = this.renderRecord(entry);
     if (rendered === undefined) return;
     // The byte count travels with the record. Enforcing `maxEntryBytes` means

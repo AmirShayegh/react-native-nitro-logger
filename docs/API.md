@@ -684,6 +684,38 @@ it, `BatchFlushOutcome` is what a flush reports, `LossCounts` is what went
 missing, and `FenceReason` (`'staleGeneration' | 'closed'`) says why it stopped
 accepting writes.
 
+`BatcherOptions.renderNotice` is **required**, and stays that way. A default
+would have to pick a format, and the only one available here is JSON Lines —
+which, written into a destination whose formatter is anything else, produces a
+file that no longer parses as what it claims to be. The notice is a record in
+the log, so only the owner knows how to spell one.
+
+`maxBatchBytes` (default 256 KiB) is the ceiling on a single handoff to the
+sink, distinct from `batchBytes` (default 4 KiB), which is the size at which a
+drain is *triggered*. The first bounds how much crosses the bridge in one call;
+the second decides when to make the call. A buffer that has grown past the
+trigger — because the sink was busy, or a burst outran it — is handed over in
+several bounded batches rather than one enormous one.
+
+`LossCounts.entries` is exact for what the pipeline accepted; it does not count
+a record handed to a fenced or disposed destination, which the `isEnabled`
+guard turns away before anything accepts responsibility for it.
+`LossCounts.bytes` is a **lower bound**: from 0.3.0 it counts the bytes of
+records that were rendered and then dropped, and a record turned away before
+rendering contributes `0`. That is the deliberate price of not formatting
+records the buffer has already refused — under sustained overload the count of
+lost entries stays right while their total size under-reports. Alert on
+`entries`.
+
+Being formatted is not being written, in either direction. Entries reach
+`LogFormatter.format` and still never reach the file — the buffer fills, the
+sink rejects the batch, the handle is fenced mid-flight — and entries are
+dropped by a level filter without arriving there at all. From 0.3.0 a full
+buffer skips the call too. **A formatter must not carry state that later
+records depend on**: one stamping a sequence number is numbering its own calls,
+not the file's lines, and those have never been the same sequence. Derive what
+a record says from the entry it is given.
+
 <!-- api: Batcher, BatchTarget, BatcherOptions, BatchFlushOutcome, LossCounts, FenceReason -->
 
 ### `utf8Length(text)`

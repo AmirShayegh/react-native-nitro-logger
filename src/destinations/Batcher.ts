@@ -19,7 +19,27 @@ export interface BatchTarget {
   flush(deadlineMs: number): FlushOutcome;
 }
 
-/** Entries that never reached the file, and the bytes they would have been. */
+/**
+ * Entries that never reached the file, and the bytes they would have been.
+ *
+ * `entries` is exact for everything this pipeline accepted: a record the
+ * batcher took responsibility for and could not deliver is counted once,
+ * wherever it was lost. It does not count what never got that far — an entry
+ * filtered out by level was never destined for the file, and one handed to a
+ * fenced or disposed destination is turned away by the `isEnabled` guard
+ * before anything here sees it. Nothing accepted it, so nothing owes a notice
+ * for it.
+ *
+ * `bytes` is narrower than it looks, and from 0.3.0 deliberately so: it is the
+ * bytes of records that were **rendered and then dropped**. A record turned
+ * away before rendering — the buffer already full, so formatting it would have
+ * been work done for the wastebasket — has no length to report and adds `0`.
+ * The alternative was rendering every record just to have an exact byte total
+ * for the ones being thrown away, which is the cost this exists to avoid.
+ *
+ * So under sustained overload `bytes` under-reports while `entries` stays
+ * right. Alert on `entries`; read `bytes` as the lower bound it is.
+ */
 export interface LossCounts {
   readonly entries: number;
   readonly bytes: number;
@@ -279,6 +299,30 @@ export class Batcher {
     this.observed.localEntries += toCount(entries);
     this.observed.localBytes += toCount(bytes);
     this.ensureTimer();
+  }
+
+  /**
+   * Whether *any* record could be accepted right now.
+   *
+   * For an owner that would otherwise render a record only to have it dropped:
+   * formatting is the expensive part of writing a log line, and under sustained
+   * backpressure it is work done entirely for the wastebasket.
+   *
+   * Deliberately conservative, and the asymmetry is the contract. `false`
+   * means no record of any size fits — the buffer is at its entry cap, at or
+   * past its byte cap, or there is nowhere to write at all. `true` does not
+   * promise that *this* record fits, because that depends on a length only
+   * rendering can produce, and a caller that skipped rendering to ask has not
+   * got one. So a record can still be dropped by {@link add} after a `true`
+   * answer, with its bytes counted exactly; what cannot happen is a `false`
+   * that turns away a record which would have been accepted.
+   */
+  hasRoom(): boolean {
+    if (this.disposed || this.fenced) return false;
+    if (this.pending.length >= this.maxPendingEntries) return false;
+    // `>=`, not `>`: a record costs at least its newline, so a buffer already
+    // at the cap has room for nothing.
+    return this.pendingBytes < this.maxPendingBytes;
   }
 
   /** Losses with no notice in the file yet. */

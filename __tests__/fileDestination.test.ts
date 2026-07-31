@@ -1529,3 +1529,241 @@ describe('FileDestination.reopen', () => {
     expect(seen).toEqual([250]);
   });
 });
+
+/**
+ * Records turned away before they are rendered.
+ *
+ * Formatting is the expensive half of writing a log line, and under sustained
+ * backpressure every record the buffer will refuse is formatted for the
+ * wastebasket. `Batcher.hasRoom()` is asked first so that work is not done.
+ *
+ * The cost is stated rather than hidden: a record dropped before rendering has
+ * no length to report, so `LossCounts.bytes` becomes a lower bound while
+ * `entries` stays exact. These pin both halves — that the render really is
+ * skipped, and that the entry is still counted.
+ */
+describe('FileDestination — dropping before rendering', () => {
+  /** A formatter that reports how often it was actually asked to work. */
+  function counting(): { formatter: LogFormatter; calls: () => number } {
+    const inner = new JsonLinesFormatter();
+    let calls = 0;
+    return {
+      formatter: {
+        get framing() {
+          return inner.framing;
+        },
+        format(e: LogEntry): string {
+          calls += 1;
+          return inner.format(e);
+        },
+      },
+      calls: () => calls,
+    };
+  }
+
+  test('a record the full buffer will refuse is never formatted', () => {
+    const { formatter, calls } = counting();
+    const { destination } = build({ maxPendingEntries: 1, formatter });
+
+    destination.write(entry({ message: 'fills the buffer' }));
+    expect(calls()).toBe(1);
+
+    destination.write(entry({ message: 'never rendered' }));
+    destination.write(entry({ message: 'nor this one' }));
+    expect(calls()).toBe(1);
+  });
+
+  test('the refused records are still counted, exactly', () => {
+    const { destination } = build({ maxPendingEntries: 1 });
+
+    destination.write(entry({ message: 'kept' }));
+    destination.write(entry({ message: 'refused' }));
+    destination.write(entry({ message: 'refused too' }));
+
+    const loss = destination.unreportedLoss();
+    expect(loss.entries).toBe(2);
+    // No bytes, because producing a byte count means rendering. This is the
+    // documented asymmetry, not an oversight.
+    expect(loss.bytes).toBe(0);
+  });
+
+  test('the notice still reaches the file and names the right count', () => {
+    const { destination, writer } = build({ maxPendingEntries: 1 });
+
+    destination.write(entry({ message: 'kept' }));
+    destination.write(entry({ message: 'refused' }));
+    destination.flush(1000);
+
+    const written = records(writer);
+    expect(written).toHaveLength(2);
+    expect(written[1]).toMatchObject({
+      message: 'log entries were dropped',
+      metadata: { droppedEntries: 1 },
+    });
+  });
+
+  test('rendering resumes once a flush frees the buffer', () => {
+    const { formatter, calls } = counting();
+    const { destination, writer } = build({ maxPendingEntries: 1, formatter });
+
+    destination.write(entry({ message: 'first' }));
+    destination.write(entry({ message: 'refused' }));
+    const before = calls();
+
+    destination.flush(1000);
+    destination.write(entry({ message: 'after the flush' }));
+
+    expect(calls()).toBeGreaterThan(before);
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('after the flush');
+  });
+
+  /**
+   * The byte cap exactly, which is the only place `<` and `<=` differ.
+   *
+   * A buffer sitting precisely on `maxPendingBytes` has room for nothing: the
+   * smallest possible record still costs its own newline. Reading that as room
+   * is not a lost record — `add` drops it either way — but it is the render
+   * this whole change exists to skip, done at the one moment the buffer is
+   * provably full. Approached at the boundary rather than near it, because
+   * near it is where an off-by-one hides.
+   */
+  test('a buffer sitting exactly on the byte cap has room for nothing', () => {
+    // The exact on-the-wire cost of the record below: its rendered bytes plus
+    // the newline the batcher adds. Measured rather than guessed, so the cap
+    // lands on the boundary and not one byte to either side.
+    const first = entry({ message: 'exactly filling' });
+    const exact = utf8Length(new JsonLinesFormatter().format(first)) + 1;
+
+    const { formatter, calls } = counting();
+    const { destination } = build({
+      maxPendingEntries: 100,
+      maxPendingBytes: exact,
+      formatter,
+    });
+
+    destination.write(first);
+    expect(calls()).toBe(1);
+
+    // pendingBytes === maxPendingBytes now. Nothing fits, so nothing renders.
+    destination.write(entry({ message: 'x' }));
+    expect(calls()).toBe(1);
+    expect(destination.unreportedLoss()).toEqual({ entries: 1, bytes: 0 });
+  });
+
+  /**
+   * The asymmetry in `hasRoom()`'s contract, from the side that matters.
+   *
+   * `false` must mean *no* record fits. A byte cap with room left in it still
+   * admits the record for rendering, and if it then turns out not to fit, it
+   * is dropped by `add` with its bytes counted exactly. Getting this backwards
+   * would silently discard records that had room, which is far worse than
+   * rendering one that did not.
+   */
+  test('a record is still rendered when only its own size will not fit', () => {
+    const { formatter, calls } = counting();
+    // Room for many entries, and a byte budget the second record overruns on
+    // its own. `batchBytes` is raised past the cap so nothing drains in
+    // between and empties the buffer under the test.
+    const { destination } = build({
+      maxPendingEntries: 100,
+      maxPendingBytes: 600,
+      batchBytes: 4096,
+      formatter,
+    });
+
+    destination.write(entry({ message: 'a'.repeat(300) }));
+    const afterFirst = calls();
+    expect(afterFirst).toBe(1);
+
+    // Buffer is under its byte cap, so this is admitted, rendered, and only
+    // then found not to fit.
+    destination.write(entry({ message: 'b'.repeat(1000) }));
+    expect(calls()).toBe(afterFirst + 1);
+
+    const loss = destination.unreportedLoss();
+    expect(loss.entries).toBe(1);
+    // Rendered, so its bytes are known exactly — this is the other side of the
+    // contract, and the reason `bytes` is a lower bound rather than a fiction.
+    expect(loss.bytes).toBeGreaterThan(1000);
+  });
+});
+
+/**
+ * Which entries a formatter is actually asked to render.
+ *
+ * `LogFormatter.format` has never been called once per logged entry — level
+ * filters and a fenced destination have always skipped it — and 0.3.0 widened
+ * that by skipping records the buffer is too full to accept. A formatter that
+ * carries state across calls therefore sees a sequence with holes in it.
+ *
+ * These pin that shape deliberately rather than leaving it to be discovered.
+ * They are not an endorsement of stateful formatters; they are what makes the
+ * documented requirement checkable.
+ */
+describe('FileDestination — what the formatter is asked to render', () => {
+  /** Stamps its own call number, which is exactly what the contract forbids
+   * relying on — used here as an instrument, not as a recommendation. */
+  function sequencing(): { formatter: LogFormatter; seen: string[] } {
+    const inner = new JsonLinesFormatter();
+    const seen: string[] = [];
+    return {
+      formatter: {
+        get framing() {
+          return inner.framing;
+        },
+        format(e: LogEntry): string {
+          seen.push(e.message);
+          return inner.format(e);
+        },
+      },
+      seen,
+    };
+  }
+
+  test('a level-filtered entry never reaches the formatter', () => {
+    const { formatter, seen } = sequencing();
+    const { destination } = build({ minimumLevel: 'warning', formatter });
+    const logger = new Logger();
+    logger.removeDestination('console');
+    logger.addDestination(destination);
+
+    logger.info('below the floor');
+    logger.warning('above it');
+
+    expect(seen).toEqual(['above it']);
+  });
+
+  test('a fenced destination renders nothing, and counts nothing', () => {
+    const { formatter, seen } = sequencing();
+    const { destination, writer } = build({ formatter });
+    const other = writer.attach();
+    other.open('/memory/logs/app.log', undefined, true);
+    other.clearLogs(1000);
+    destination.write(entry({ message: 'trips the fence' }));
+    destination.flush(1000);
+    expect(destination.isEnabled).toBe(false);
+    const rendered = seen.length;
+
+    destination.write(entry({ message: 'after the fence' }));
+
+    expect(seen).toHaveLength(rendered);
+    // Refused at the door, not dropped by the buffer: nothing accepted this
+    // record, so nothing owes a notice for it.
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
+  });
+
+  test('an overloaded buffer skips the formatter for what it will refuse', () => {
+    const { formatter, seen } = sequencing();
+    const { destination } = build({ maxPendingEntries: 2, formatter });
+
+    destination.write(entry({ message: 'one' }));
+    destination.write(entry({ message: 'two' }));
+    destination.write(entry({ message: 'three' }));
+    destination.write(entry({ message: 'four' }));
+
+    // The holes a stateful formatter would see, spelled out.
+    expect(seen).toEqual(['one', 'two']);
+    expect(destination.unreportedLoss().entries).toBe(2);
+  });
+});
