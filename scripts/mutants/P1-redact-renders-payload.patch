@@ -1,13 +1,13 @@
 diff --git a/src/privacy.ts b/src/privacy.ts
-index ba8db55..0b7ff2d 100644
+index b7bd18a..2fd2e26 100644
 --- a/src/privacy.ts
 +++ b/src/privacy.ts
-@@ -323,7 +323,7 @@ function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
-   if (visibility === 'public') return { kind: 'value', value: payload };
-   return {
-     kind: 'value',
--    value: privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER,
-+    value: payload,
-   };
+@@ -346,7 +346,7 @@ function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
+ 
+   if (settings.redactAll) return PRIVATE_PLACEHOLDER;
+   if (visibility === 'public') return payload;
+-  return privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER;
++  return payload;
  }
  
+ /**

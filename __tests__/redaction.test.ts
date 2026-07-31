@@ -28,6 +28,48 @@ afterEach(() => {
   else globalThis.__DEV__ = originalDev;
 });
 
+/**
+ * Falsy values that are values, not absences.
+ *
+ * `0`, `false` and `''` are the three things a "did it resolve?" check
+ * written as `if (!resolution)` silently deletes, and the deletion is
+ * invisible from the outside: the key is missing and the dropped count says
+ * one value was rejected, which is exactly what a genuinely rejected value
+ * looks like. A retry counter that only appears once it is non-zero is worse
+ * than no counter.
+ *
+ * The suite had no such case before 0.4.0 — every metadata test used a
+ * truthy value — so the bug would have been available to any future rewrite
+ * of the resolution path, which is precisely what that path was about to get.
+ */
+describe('values that are falsy but present', () => {
+  test('zero, false and the empty string survive as themselves', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { retries: 0, ok: false, note: '' });
+    expect(md(dest)).toEqual({ retries: 0, ok: false, note: '' });
+  });
+
+  test('the same three survive when marked public under a private default', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger
+      .privacyDefault('private')
+      .metadataKeyCatalog(['retries', 'ok', 'note']);
+    logger.info('m', { retries: pub(0), ok: pub(false), note: pub('') });
+    expect(md(dest)).toEqual({ retries: 0, ok: false, note: '' });
+  });
+
+  test('nothing is counted as dropped when all three pass', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { retries: 0, ok: false, note: '' });
+    // The count key is absent entirely rather than zero: a falsy value that
+    // was dropped would show up here, and this is what says none was.
+    expect(md(dest)).not.toHaveProperty('droppedMetadataCount');
+  });
+});
+
 describe('privacy default', () => {
   test("'public' (the OSS default) renders bare values", () => {
     setDev(false);

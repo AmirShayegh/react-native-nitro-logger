@@ -168,21 +168,35 @@ type MarkerInspection =
   | { readonly kind: 'private'; readonly payload: LogPrimitive }
   | { readonly kind: 'invalid' };
 
-/** Module-private by design — see the note at the top of this file. */
+/**
+ * Module-private by design — see the note at the top of this file.
+ *
+ * One probe per map rather than `has` followed by `get`. `undefined` from
+ * `get` means absent and can mean nothing else: `pub`/`priv` call `set` only
+ * after `isLogPrimitive` has passed, and `isLogPrimitive(undefined)` is
+ * false, so no registered marker holds `undefined`. The `has` was asking a
+ * question the `get` already answered.
+ *
+ * The re-validation below is NOT the same kind of redundancy and stays.
+ * Construction validated the payload; this validates it again at emit,
+ * which is the stated contract — the WeakMap is module-private but the
+ * check is what makes "validated at construction AND at emit" true rather
+ * than a claim about code nobody re-reads.
+ */
 function inspectMarker(value: unknown): MarkerInspection | null {
   if (value === null || typeof value !== 'object') return null;
   const candidate = value as object;
 
-  if (publicPayloads.has(candidate)) {
-    const payload = publicPayloads.get(candidate);
-    return isLogPrimitive(payload)
-      ? { kind: 'public', payload }
+  const publicPayload = publicPayloads.get(candidate);
+  if (publicPayload !== undefined) {
+    return isLogPrimitive(publicPayload)
+      ? { kind: 'public', payload: publicPayload }
       : { kind: 'invalid' };
   }
-  if (privatePayloads.has(candidate)) {
-    const payload = privatePayloads.get(candidate);
-    return isLogPrimitive(payload)
-      ? { kind: 'private', payload }
+  const privatePayload = privatePayloads.get(candidate);
+  if (privatePayload !== undefined) {
+    return isLogPrimitive(privatePayload)
+      ? { kind: 'private', payload: privatePayload }
       : { kind: 'invalid' };
   }
   if (invalidMarkers.has(candidate)) return { kind: 'invalid' };
@@ -277,11 +291,22 @@ function catalogRequired(settings: PrivacySettings): boolean {
 
 // ── Redaction ───────────────────────────────────────────────────────────────
 
-type Resolution =
-  | { readonly kind: 'value'; readonly value: LogPrimitive }
-  | { readonly kind: 'drop' };
+/**
+ * "This value does not go out", as a value rather than a wrapper.
+ *
+ * A unique Symbol, module-private, so it cannot equal anything a caller can
+ * put in metadata — which is what lets {@link resolveValue} return the
+ * payload itself instead of allocating a `{ kind, value }` object per key.
+ *
+ * The reason it is a Symbol and not `undefined` or `null` is the mistake it
+ * makes unavailable. A resolution tested with `if (!resolution)` would drop
+ * `0`, `false` and `''` — all legitimate, all things a logger is asked to
+ * record, and all silently missing from the output with the dropped-count
+ * dutifully incremented. `=== DROP` cannot express that bug.
+ */
+const DROP: unique symbol = Symbol('privacy.drop');
 
-const DROP: Resolution = { kind: 'drop' };
+type Resolution = LogPrimitive | typeof DROP;
 
 /** Record which source owns each of its keys, without reading any value. */
 function claimKeys(
@@ -319,12 +344,9 @@ function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
     return DROP;
   }
 
-  if (settings.redactAll) return { kind: 'value', value: PRIVATE_PLACEHOLDER };
-  if (visibility === 'public') return { kind: 'value', value: payload };
-  return {
-    kind: 'value',
-    value: privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER,
-  };
+  if (settings.redactAll) return PRIVATE_PLACEHOLDER;
+  if (visibility === 'public') return payload;
+  return privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER;
 }
 
 /**
@@ -394,12 +416,14 @@ export function redactMetadata(
       continue;
     }
 
+    // Identity against the sentinel, never truthiness: `0`, `false` and `''`
+    // are values this logger is asked to record, not absences.
     const resolution = resolveValue(raw, settings);
-    if (resolution.kind === 'drop') {
+    if (resolution === DROP) {
       dropped += 1;
       continue;
     }
-    result[key] = resolution.value;
+    result[key] = resolution;
   }
 
   if (dropped > 0) result[DROPPED_COUNT_KEY] = dropped;
