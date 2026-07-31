@@ -180,6 +180,7 @@ export class Logger {
     } else if (normalized === 'private') {
       this.privacyDefaultValue = 'private';
     }
+    this.#tighten();
     return this;
   }
 
@@ -187,6 +188,7 @@ export class Logger {
    * One-way: there is no call that undoes it. */
   redactAllMetadata(): this {
     this.redactAll = true;
+    this.#tighten();
     return this;
   }
 
@@ -232,15 +234,39 @@ export class Logger {
     }
 
     warnIfCatalogShrank(current, incoming, this.keyCatalog);
+    this.#tighten();
     return this;
   }
 
-  private privacySettings(): PrivacySettings {
-    return {
+  /**
+   * The settings object every delivered call hands to redaction.
+   *
+   * Rebuilt by {@link #tighten}, never lazily on read: a lazy cache has an
+   * invalidation flag, and an invalidation flag has a state where it is
+   * stale. Here the only way to change privacy state is to go through one of
+   * the three mutators, and each ends by calling `#tighten()`. A fourth
+   * mutator that forgot to would be shipping the previous, LOOSER
+   * configuration to every subsequent call — the one failure in this file
+   * that widens disclosure rather than narrowing it — so the funnel is the
+   * point and the caching is the side effect.
+   */
+  #privacySettingsCache: PrivacySettings = {
+    privacyDefault: 'public',
+    redactAll: false,
+    keyCatalog: undefined,
+  };
+
+  /** Re-derive the settings snapshot. Every privacy mutator ends here. */
+  #tighten(): void {
+    this.#privacySettingsCache = {
       privacyDefault: this.privacyDefaultValue,
       redactAll: this.redactAll,
       keyCatalog: this.keyCatalog,
     };
+  }
+
+  private privacySettings(): PrivacySettings {
+    return this.#privacySettingsCache;
   }
 
   // ── Fluent configuration ────────────────────────────────────────────────
@@ -583,7 +609,16 @@ export class Logger {
     // Eligibility BEFORE message evaluation: a lazy thunk must not run when
     // nothing will receive the entry. isEnabled/minimumLevel may be throwing
     // getters, so each read is isolated and charged to the stable label.
-    const eligible: Registration[] = [];
+    //
+    // The first eligible destination is held in a local and the array is
+    // allocated only if a second turns up, because one destination is the
+    // overwhelmingly common shape and it does not need a list to hold it.
+    // Deliberately NOT a scratch array reused across calls: a destination's
+    // `write` can re-enter this method — a destination logging its own
+    // failure, or the installed error handler — and a shared buffer would
+    // let the inner call overwrite the outer call's list mid-fan-out.
+    let onlyEligible: Registration | undefined;
+    let eligible: Registration[] | undefined;
     for (const registration of this.registrations) {
       const { destination, label } = registration;
       if (this.disabledLabels.has(label)) continue;
@@ -599,9 +634,15 @@ export class Logger {
         this.noteFailure(label);
         continue;
       }
-      eligible.push(registration);
+      if (onlyEligible === undefined) {
+        onlyEligible = registration;
+      } else if (eligible === undefined) {
+        eligible = [onlyEligible, registration];
+      } else {
+        eligible.push(registration);
+      }
     }
-    if (eligible.length === 0) return;
+    if (onlyEligible === undefined) return;
 
     let text: string;
     try {
@@ -630,13 +671,33 @@ export class Logger {
       subsystem,
     });
 
-    for (const { destination, label } of eligible) {
-      try {
-        destination.write(entry);
-        this.failureCounts.delete(label);
-      } catch {
-        this.noteFailure(label);
-      }
+    if (eligible === undefined) {
+      this.#deliver(onlyEligible, entry);
+    } else {
+      for (const registration of eligible) this.#deliver(registration, entry);
+    }
+  }
+
+  /**
+   * One destination, one entry, isolated.
+   *
+   * ES `#private` for the reason given on `#effectiveMinimumFor`: a
+   * TypeScript `private` method is an ordinary prototype method at runtime,
+   * and the plugin's closed list is about what the package wrote, not about
+   * what it meant to keep to itself.
+   *
+   * The `delete` is guarded on size because it is a Map operation per
+   * delivery in service of a count that is empty in every healthy process —
+   * the failure path is what maintains it, and `noteFailure` is where the
+   * entry comes from.
+   */
+  #deliver(registration: Registration, entry: LogEntry): void {
+    const { destination, label } = registration;
+    try {
+      destination.write(entry);
+      if (this.failureCounts.size > 0) this.failureCounts.delete(label);
+    } catch {
+      this.noteFailure(label);
     }
   }
 
