@@ -1998,12 +1998,17 @@ function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
  *     getLogger(); const holder = { logger: value }` is the factory case with
  *     one alias in front of it, and reading that `null` as evidence puts it
  *     straight back. So the binding decides: an initializer that is understood
- *     and is not a logger is evidence, an opaque one is not, and a binding
- *     with nothing behind it at all — a parameter, a `let` assigned
- *     elsewhere — is a value from outside this scope, which is a shrug. An
- *     unresolved global is the one identifier whose `null` still stands: it is
- *     the value's own name at module scope, and classifying bare names is what
- *     the heuristic is for.
+ *     and is not a logger is evidence, and an opaque one is not. Neither is a
+ *     boundary this analysis declines to cross: a parameter, an import, a
+ *     `let` assigned elsewhere. Each of those is a value from outside, which
+ *     is the same answer `deps.audit` gets and for the same reason.
+ *
+ *     An unresolved global is the one identifier whose `null` still stands,
+ *     and the difference is that it names no boundary at all. An import points
+ *     at a module the analysis chose not to follow; a bare global points at
+ *     nothing, so its spelling is the most anything can say about it, and
+ *     classifying bare names is what the heuristic is for. That is what keeps
+ *     `{ logger: analytics }` silent.
  *   - a **construction** was examined by `classifyConstruction` and found not
  *     to be a logger. `classifyReceiver` calls that evidence in as many words,
  *     and `loggerClassNames` depends on it continuing to mean something.
@@ -2046,10 +2051,14 @@ function classifyCandidate(context, value, callNode, seen) {
   if (seen.has(variable)) return undefined;
   seen.add(variable);
 
-  // An import was looked at: it is not this package's `Log`, and a module that
-  // exports something else is the same class of evidence as `analytics`.
+  // An import names a boundary this analysis does not cross, so it is a shrug
+  // for the same reason a parameter is. `import { audit } from './logger'`
+  // over a module that re-exports or wraps this package is ordinary, and "I
+  // did not look" is not "not a logger". A recognised package import, and an
+  // import whose name is logger-shaped, both classified positively above and
+  // never reach here.
   const def = singleDef(variable);
-  if (def && def.type === 'ImportBinding') return null;
+  if (def && def.type === 'ImportBinding') return undefined;
 
   // A parameter, a `let` assigned elsewhere, a catch binding: the variable
   // exists and there is nothing behind it to read. That is a shrug, not a

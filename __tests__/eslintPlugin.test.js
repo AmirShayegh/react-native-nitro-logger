@@ -167,7 +167,9 @@ describe('no-dynamic-message', () => {
       // so the outer `logger` spelling does not override it.
       'const value = analytics; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
       'const value = new Widget(); const holder = { logger: value }; holder.logger.info(`user ${id}`);',
-      `import { audit } from './x'; const holder = { logger: audit }; holder.logger.info(\`user \${id}\`);`,
+      // An import is unreadable, so like a parameter it hands the question
+      // back to the name — and neither name here says logger.
+      `import { thing } from './x'; const holder = { audit: thing }; holder.audit.info(\`user \${id}\`);`,
       // A parameter is unreadable, so it hands the question back to the name —
       // and here neither name says logger, so nothing is reported. This is the
       // companion to the invalid `{ logger: value }` case below: what changes
@@ -726,6 +728,16 @@ describe('no-dynamic-message', () => {
       },
       {
         code: 'function f(value) { const alias = value; const holder = { logger: alias }; holder.logger.info(`patient ${id}`); }',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A module boundary is a boundary too. `./logger` re-exporting or
+      // wrapping this package is the ordinary way a project centralises its
+      // logger, and this analysis does not follow the import — so treating the
+      // name it arrives under as proof of anything is the parameter mistake
+      // with a different boundary. A recognised package import never reaches
+      // that branch; it is already classified.
+      {
+        code: `import { audit } from './logger'; const holder = { logger: audit }; holder.logger.info(\`patient \${id}\`);`,
         errors: [{ messageId: 'dynamic' }],
       },
       // Aliases that name each other are dead code, but "cannot see through
