@@ -70,21 +70,6 @@ final class LogCollectTests: LogWriterTestCase {
     }
   }
 
-  /// `gzip -dc`, the way somebody handed a bundle would open it.
-  private func gunzip(_ url: URL) throws -> String {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["gzip", "-dc", url.path]
-    let out = Pipe()
-    process.standardOutput = out
-    process.standardError = Pipe()
-    try process.run()
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    XCTAssertEqual(process.terminationStatus, 0, "gzip refused the bundle")
-    return String(decoding: data, as: UTF8.self)
-  }
-
   // MARK: - The bundle is the log
 
   /// The whole point: concatenated gzip members decompress as one stream, so a

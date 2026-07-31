@@ -4,12 +4,14 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.zip.GZIPInputStream
 
 /**
  * [FileSinkAnswers] on everything the shared row table cannot ask.
@@ -51,6 +53,20 @@ class FileSinkAnswersTest {
     FileSinkAnswers(registry = registry, platform = PlatformIo.Jvm, owner = null)
 
   private fun logPath(name: String = "app.log") = File(directory, name).absolutePath
+
+  /**
+   * The bundle's payload, every member of it.
+   *
+   * A local copy of `LogCollectTest`'s helper rather than a shared one: it is
+   * three lines, and the two suites ask different things of it — that one drives
+   * the bundle format itself, this one only needs to know the bundle is not
+   * empty gzip. `GZIPInputStream` reads concatenated members as one stream,
+   * which is what makes the format work at all.
+   */
+  private fun gunzip(file: File): String =
+    GZIPInputStream(file.inputStream().buffered()).use {
+      String(it.readBytes(), Charsets.UTF_8)
+    }
 
   // MARK: the default directory
 
@@ -192,14 +208,22 @@ class FileSinkAnswersTest {
       for (hostile in listOf(
         Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 1e30, 1.5
       )) {
-        val result = sink.appendBatch("{\"m\":1}\n", hostile)
+        val result = sink.appendBatch("REFUSED-$hostile\n", hostile)
         assertFalse("entryCount $hostile was accepted", result.accepted)
         assertEquals(WireRejectReason.FAILED, result.rejectReason)
       }
 
       // And the batch really was refused, not merely reported as refused.
+      //
+      // Checked against the file, not against `queuedBytes` after a flush: an
+      // accepted batch is drained by that flush too, so a post-flush queue
+      // depth of zero is a state both the correct and the broken
+      // implementation reach. It said nothing, and this is what it was
+      // supposed to say.
       assertTrue(sink.flush(1000.0).durable)
-      assertEquals(0.0, sink.getStatus().queuedBytes, 0.0)
+      val written = File(sink.getLogFilePaths().single()).readText()
+      assertFalse("a refused batch reached the file", written.contains("REFUSED"))
+      assertEquals("nothing was accepted, so nothing should be on disk", "", written)
     } finally {
       sink.close(1000.0)
     }
@@ -246,21 +270,46 @@ class FileSinkAnswersTest {
       assertNull(accepted.rejectReason)
 
       assertTrue(sink.flush(1000.0).durable)
-      // The bytes are on disk, which is what makes the rest of this test about
-      // the handle rather than about an empty directory.
-      //
       // The canonical path, because that is what the registry resolved and
       // recorded: on macOS the JVM temp directory is under `/var`, which is a
       // symlink to `/private/var`. Comparing against the spelling this test
       // passed in would fail there and pass on the Linux runner, which is the
       // worse of the two outcomes.
-      assertEquals(listOf(File(logPath()).canonicalPath), sink.getLogFilePaths())
+      val log = File(File(logPath()).canonicalPath)
+      assertEquals(listOf(log.absolutePath), sink.getLogFilePaths())
+      // The record, not merely a file. `accepted` is a claim about bytes, and
+      // this is the bytes.
+      assertEquals("{\"m\":1}\n", log.readText())
 
       val collected = sink.collectLogs(1000.0, 1_000_000.0)
       assertTrue(collected.complete)
-      assertTrue(collected.byteCount > 0.0)
       assertEquals(1.0, collected.sourceFileCount, 0.0)
+      assertTrue(collected.path.isNotEmpty())
+      // The bundle is where it says it is, and it is what it says it is: a
+      // `byteCount` alone is satisfied by a gzip header over an empty file.
+      val bundle = File(collected.path)
+      assertTrue("collect returned a path with nothing at it", bundle.isFile)
+      assertEquals(bundle.length().toDouble(), collected.byteCount, 0.0)
+      // And it carries the log. A size that agrees with `byteCount` is still
+      // satisfied by a valid gzip over nothing, together with a fabricated
+      // `sourceFileCount` — which is exactly the bundle a support flow would
+      // upload and a reviewer would open to find empty.
+      assertEquals("{\"m\":1}\n", gunzip(bundle))
+
       assertTrue(sink.deleteSupportBundle(1000.0))
+      // The assertion that stops `return true` passing: the bundle is gone.
+      assertFalse(
+        "deleteSupportBundle reported success over a bundle still on disk",
+        bundle.exists()
+      )
+
+      // What is on disk to be purged, named rather than counted, because the
+      // number below means nothing without it. The `.lock` file is not an
+      // artifact and is deliberately not purged; the `.meta` sidecar is.
+      assertEquals(
+        listOf("app.log", "app.log.lock", "app.log.meta"),
+        directory.list()!!.sorted()
+      )
 
       // A live purge really deletes and really rebinds — the two facts the JS
       // destination reads separately before it resumes.
@@ -268,15 +317,87 @@ class FileSinkAnswersTest {
       assertTrue(cleared.durable)
       assertTrue(cleared.rebound)
       assertEquals(emptyList<String>(), cleared.failedPaths)
-      assertTrue(cleared.deletedCount > 0.0)
+      // Exactly the two artifacts listed above, not merely more than none:
+      // `> 0` is satisfied by any fabricated number, and a count that does not
+      // describe what was deleted is what a compliance caller reports upward.
+      //
+      // Two here and one in the iOS twin, which is not a drift: Android records
+      // the file's start time in an `app.log.meta` sidecar because its
+      // filesystem often cannot report a birth time, where iOS reads
+      // `.creationDate` and writes no sidecar at all. Both purge every artifact
+      // they have.
+      assertEquals(2.0, cleared.deletedCount, 0.0)
+      // `durable` means every artifact is gone. A fabricated count does not.
+      assertEquals("a durable purge left the caller's records on disk", "", log.readText())
 
-      // Zeroed after a purge, not stale: this is the status a live handle
-      // reports, and it comes from the handle rather than from the no-handle
-      // constant, which `maintain` on a live sink also has to.
-      assertEquals(WireSinkStatus(0.0, 0.0, 0.0, 0.0), sink.maintain(1000.0))
+      // And `rebound` means writable, not merely reopened. A sink that reported
+      // it without a usable file accepts every later record and drops it.
+      assertTrue(sink.appendBatch("{\"m\":2}\n", 1.0).accepted)
+      assertTrue(sink.flush(1000.0).durable)
+      assertEquals("{\"m\":2}\n", log.readText())
     } finally {
       sink.close(1000.0)
     }
+  }
+
+  @Test
+  fun `getStatus and maintain report the handle's own state`() {
+    // Both ops answer from the handle, and the assertion has to be able to tell
+    // that from a constant. A live sink over a healthy directory reports zeros,
+    // which is also what the no-handle answer is — so "a live sink reports
+    // zeros" is satisfied by a `maintain` that never consulted the handle at
+    // all. This degrades the sink on purpose so the two answers have something
+    // to be right about.
+    //
+    // `degraded` is a folded mask and "not zero" on it can be satisfied by a
+    // contributor this test never touched. The control sink is what rules that
+    // out: same code path, same kind of directory, no injected fault. Two
+    // separate directories because the shortfall is recorded when the directory
+    // is created, and a control that had already created it would leave nothing
+    // for the fault to fail at.
+    val clean = File(directory, "clean")
+    val faulty = File(directory, "faulty")
+
+    val control = answers()
+    control.open(File(clean, "app.log").absolutePath, LogRotationPolicy.of(), true)
+    val baseline = control.getStatus().degraded
+    control.close(1000.0)
+
+    val sink = FileSinkAnswers(
+      registry = registry,
+      // Refusing to tighten a mode is a degradation, not a failure: the
+      // directory is still created and the writer still opens. That is what
+      // makes it usable here — a fault that refused the open would leave no
+      // handle to ask.
+      platform = RefusesToRestrict(PlatformIo.Jvm),
+      owner = null
+    )
+    sink.open(File(faulty, "app.log").absolutePath, LogRotationPolicy.of(), true)
+    try {
+      val status = sink.getStatus()
+      assertNotEquals(
+        "the injected shortfall changed nothing, so this test distinguishes nothing",
+        baseline,
+        status.degraded
+      )
+      assertNotEquals(0.0, status.degraded)
+      // The point of the test: `maintain` reports the same handle's state, not
+      // a fresh zero.
+      assertEquals(status.degraded, sink.maintain(1000.0).degraded, 0.0)
+    } finally {
+      sink.close(1000.0)
+    }
+  }
+
+  /**
+   * [PlatformIo.Jvm] with owner-only modes refused.
+   *
+   * The Kotlin analogue of iOS's `injectDirectoryProtectionFaultForTesting`:
+   * this platform has no per-artifact data-protection class to fail, so the
+   * seam is the one the writer already takes its I/O through.
+   */
+  private class RefusesToRestrict(private val real: PlatformIo) : PlatformIo by real {
+    override fun restrictToOwner(file: File, isDirectory: Boolean): Boolean = false
   }
 
   @Test

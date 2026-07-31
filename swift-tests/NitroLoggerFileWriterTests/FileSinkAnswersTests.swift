@@ -180,14 +180,24 @@ final class FileSinkAnswersTests: LogWriterTestCase {
     // An unchecked cast of NaN or 1e30 traps, and a count that does not survive
     // the round trip cannot be trusted to describe the batch it arrived with.
     for hostile in [Double.nan, .infinity, -.infinity, 1e30, 1.5] {
-      let result = sink.appendBatch(batch: "{\"m\":1}\n", entryCount: hostile)
+      let result = sink.appendBatch(batch: "REFUSED-\(hostile)\n", entryCount: hostile)
       XCTAssertFalse(result.accepted, "entryCount \(hostile) was accepted")
       XCTAssertEqual(result.rejectReason, .failed)
     }
 
     // And the batch really was refused, not merely reported as refused.
+    //
+    // Checked against the file, not against `queuedBytes` after a flush: an
+    // accepted batch is drained by that flush too, so a post-flush queue depth
+    // of zero is a state both the correct and the broken implementation reach.
+    // It said nothing, and this is what it was supposed to say.
     XCTAssertTrue(sink.flush(deadlineMs: 1000).durable)
-    XCTAssertEqual(sink.getStatus().queuedBytes, 0)
+    // `try`, not `try?`: a read that failed would fall back to an empty string
+    // and satisfy both assertions below, which would make a log file that was
+    // never created read as proof that the batch was refused.
+    let written = try String(contentsOf: logURL, encoding: .utf8)
+    XCTAssertFalse(written.contains("REFUSED"), "a refused batch reached the file")
+    XCTAssertEqual(written, "", "nothing was accepted, so nothing should be on disk")
   }
 
   func testAnAbsentLineFramedFlagIsAbsentRatherThanTrue() throws {
@@ -215,6 +225,16 @@ final class FileSinkAnswersTests: LogWriterTestCase {
 
   // MARK: - With a live handle
 
+  /// Every op that has a side effect is checked by that side effect.
+  ///
+  /// An earlier draft asserted only the returned values, and a review pointed
+  /// out that several broken implementations reach the same ones: an
+  /// `appendBatch` that reports `accepted` without writing still yields a
+  /// non-empty gzip and one source file from the empty open log, a
+  /// `deleteSupportBundle` hardcoded to `true` is indistinguishable from one
+  /// that deleted, and a `clearLogs` that fabricated its count passes a
+  /// `deletedCount > 0`. So each one below is now asked of the filesystem
+  /// instead.
   func testALiveSinkDelegatesEveryOpToItsHandle() throws {
     let sink = answers()
     try sink.open(path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
@@ -225,15 +245,33 @@ final class FileSinkAnswersTests: LogWriterTestCase {
     XCTAssertNil(accepted.rejectReason)
 
     XCTAssertTrue(sink.flush(deadlineMs: 1000).durable)
-    // The bytes are on disk, which is what makes the rest of this test about
-    // the handle rather than about an empty directory.
+    // The record, not merely a file. `accepted` is a claim about bytes, and
+    // this is the bytes.
+    XCTAssertEqual(try String(contentsOf: logURL, encoding: .utf8), "{\"m\":1}\n")
     XCTAssertEqual(sink.getLogFilePaths(), [logURL.path])
 
     let collected = sink.collectLogs(deadlineMs: 1000, maxTotalBytes: 1_000_000)
     XCTAssertTrue(collected.complete)
-    XCTAssertGreaterThan(collected.byteCount, 0)
     XCTAssertEqual(collected.sourceFileCount, 1)
+    XCTAssertNotEqual(collected.path, "")
+    // The bundle is where it says it is, and it is what it says it is: a
+    // `byteCount` alone is satisfied by a gzip header over an empty file.
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: collected.path),
+      "collect returned a path with nothing at it")
+    let onDisk = try FileManager.default.attributesOfItem(atPath: collected.path)[.size] as? Int
+    XCTAssertEqual(Double(onDisk ?? -1), collected.byteCount)
+    // And it carries the log. A size that agrees with `byteCount` is still
+    // satisfied by a valid gzip over nothing, together with a fabricated
+    // `sourceFileCount` — which is exactly the bundle a support flow would
+    // upload and a reviewer would open to find empty.
+    XCTAssertEqual(try gunzip(URL(fileURLWithPath: collected.path)), "{\"m\":1}\n")
+
     XCTAssertTrue(sink.deleteSupportBundle(deadlineMs: 1000))
+    // The assertion that stops `return true` passing: the bundle is gone.
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: collected.path),
+      "deleteSupportBundle reported success over a bundle still on disk")
 
     // A live purge really deletes and really rebinds — the two facts the JS
     // destination reads separately before it resumes.
@@ -241,14 +279,62 @@ final class FileSinkAnswersTests: LogWriterTestCase {
     XCTAssertTrue(cleared.durable)
     XCTAssertTrue(cleared.rebound)
     XCTAssertEqual(cleared.failedPaths, [])
-    XCTAssertGreaterThan(cleared.deletedCount, 0)
-
-    // Zeroed after a purge, not stale: this is the status a live handle
-    // reports, and it comes from the handle rather than from the no-handle
-    // constant, which `maintain` on a live sink also has to.
+    // Exactly one, not merely more than none: there is exactly one artifact
+    // here, so `> 0` is satisfied by any fabricated number. A count that does
+    // not describe what was deleted is what a compliance caller reports upward.
+    XCTAssertEqual(cleared.deletedCount, 1)
+    // `durable` means every artifact is gone. A fabricated count does not.
     XCTAssertEqual(
-      sink.maintain(deadlineMs: 1000),
-      WireSinkStatus(queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0))
+      try String(contentsOf: logURL, encoding: .utf8), "",
+      "a durable purge left the caller's records on disk")
+
+    // And `rebound` means writable, not merely reopened. A sink that reported
+    // it without a usable file accepts every later record and drops it.
+    XCTAssertTrue(sink.appendBatch(batch: "{\"m\":2}\n", entryCount: 1).accepted)
+    XCTAssertTrue(sink.flush(deadlineMs: 1000).durable)
+    XCTAssertEqual(try String(contentsOf: logURL, encoding: .utf8), "{\"m\":2}\n")
+  }
+
+  /// `getStatus` and `maintain` read the handle, not the no-handle constant.
+  ///
+  /// Both return a zeroed status on a healthy idle sink, which is also what a
+  /// body that ignored the handle entirely would return — so a live sink in a
+  /// *quiet* state cannot tell the two apart. This one is not quiet: the
+  /// directory carries an injected protection shortfall, so the handle's own
+  /// status has a bit set that the no-handle constant does not have.
+  ///
+  /// The control is the point. Without it this asserts `degraded != 0` against
+  /// a mask that several unrelated routes can set — on macOS an ordinary temp
+  /// directory already fails backup exclusion — and would pass with the
+  /// injection discarded.
+  func testGetStatusAndMaintainReportTheHandlesOwnState() throws {
+    // Separate directories, and the fault injected before either is created:
+    // securing happens once, when the directory is made, so a fault arriving
+    // afterwards reaches nothing.
+    let clean = root.appendingPathComponent("clean")
+    let faulty = root.appendingPathComponent("faulty")
+    LogSecureFile.injectDirectoryProtectionFaultForTesting(.protection, under: faulty)
+
+    let control = answers()
+    try control.open(
+      path: clean.appendingPathComponent("app.log").path,
+      policy: LogRotationPolicy(), lineFramed: true)
+    let baseline = control.getStatus().degraded
+    _ = control.close(deadlineMs: 1000)
+
+    let sink = answers()
+    try sink.open(
+      path: faulty.appendingPathComponent("app.log").path,
+      policy: LogRotationPolicy(), lineFramed: true)
+    defer { _ = sink.close(deadlineMs: 1000) }
+
+    let status = sink.getStatus()
+    XCTAssertNotEqual(
+      status.degraded, baseline,
+      "the injected shortfall changed nothing, so this test distinguishes nothing")
+    XCTAssertNotEqual(status.degraded, 0)
+    // And `maintain` reads the same handle rather than the constant.
+    XCTAssertEqual(sink.maintain(deadlineMs: 1000).degraded, status.degraded)
   }
 
   func testReleaseHandleFreesTheRegistrySlotAndIsTerminal() throws {

@@ -5,6 +5,27 @@ import XCTest
 /// A temp directory, an isolated registry, and cleanup that survives the flags
 /// the fault tests set.
 class LogWriterTestCase: XCTestCase {
+  /// `gzip -dc`, the way somebody handed a bundle would open it.
+  ///
+  /// Here rather than in `LogCollectTests`, where it started, because
+  /// `FileSinkAnswersTests` needs the same thing: a bundle's *size* matching
+  /// what `collectLogs` reported is satisfied by a valid gzip over nothing, so
+  /// the only assertion that says a bundle carries the log is one that reads
+  /// the log back out of it.
+  func gunzip(_ url: URL) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["gzip", "-dc", url.path]
+    let out = Pipe()
+    process.standardOutput = out
+    process.standardError = Pipe()
+    try process.run()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    XCTAssertEqual(process.terminationStatus, 0, "gzip refused the bundle")
+    return String(decoding: data, as: UTF8.self)
+  }
+
   var root: URL!
   var registry: LogWriterRegistry!
   private var openHandles: [LogFileHandle] = []
