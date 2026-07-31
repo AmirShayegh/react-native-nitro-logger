@@ -29,13 +29,13 @@ is a deliberate act with a number attached rather than a refresh.
 
 ## How much of this is actually enforced
 
-<!-- test-counts: js=1115/26 swift=248/12 kotlin=242/11 -->
+<!-- test-counts: js=1115/26 swift=252/13 kotlin=244/12 -->
 
 | Target                              | Tests | Suites |
 | ----------------------------------- | ----- | ------ |
 | JavaScript / TypeScript (`jest`)    | 1115  | 26     |
-| iOS (`swift test`)                  | 248   | 12     |
-| Android (`testDebugUnitTest`)       | 242   | 11     |
+| iOS (`swift test`)                  | 252   | 13     |
+| Android (`testDebugUnitTest`)       | 244   | 12     |
 
 A count is a weak claim on its own — it says how much was run, not what was
 proven — and it is here for one specific thing: these are floors, not

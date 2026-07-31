@@ -41,8 +41,8 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=248
-    REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
+    MINIMUM=252
+    REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogPerfTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     # `--xunit-output` is the only machine-readable result SwiftPM emits, and
@@ -53,8 +53,8 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=242
-    REQUIRED_SUITES="BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
+    MINIMUM=244
+    REQUIRED_SUITES="AllocationHarnessTest BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)
     RUN_STATUS=$?

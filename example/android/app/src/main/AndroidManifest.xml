@@ -31,5 +31,15 @@
         android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
         android:windowSoftInputMode="adjustResize"
         android:exported="false" />
+      <!-- The Hermes bench mirror. Exported, unlike C13, because
+           scripts/bench-hermes-android.sh starts it with `am start` and the
+           shell cannot reach a non-exported activity; what that exposes is an
+           activity that times library code and prints numbers. -->
+      <activity
+        android:name=".BenchHarnessActivity"
+        android:label="Hermes bench"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="true" />
     </application>
 </manifest>
