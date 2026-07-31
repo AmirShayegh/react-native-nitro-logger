@@ -175,34 +175,120 @@ final class NativeConsoleWriterTests: XCTestCase {
 
   // MARK: - Batching
 
+  /// What a batch would have written, captured through the emitter seam.
+  private func record(
+    _ configure: (NativeConsoleWriter) -> Void
+  ) -> [(type: OSLogType, category: String, text: String)] {
+    var entries: [(type: OSLogType, category: String, text: String)] = []
+    let writer = NativeConsoleWriter { type, category, text in
+      entries.append((type, category, text))
+    }
+    configure(writer)
+    return entries
+  }
+
   /// `messages` is authoritative on count. A short `levels` is a caller bug,
   /// and dropping the messages it does have turns that bug into missing logs.
+  ///
+  /// This test used to call `logBatch` four times and assert nothing — it
+  /// passed whether every line was written, or none were.
   func testAShortLevelsArrayDoesNotCostMessages() {
-    let writer = NativeConsoleWriter()
-    writer.install(subsystem: "com.nitrologger.tests", category: "batching")
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "batching")
+      writer.logBatch(levels: [4], messages: ["first", "second", "third"])
+    }
 
-    // Reaching os_log means the assertion is that nothing traps or drops out;
-    // the unified log is not readable back from a unit test.
-    writer.logBatch(levels: [4], messages: ["first", "second", "third"])
-    writer.logBatch(levels: [], messages: ["orphan"])
-    writer.logBatch(levels: [.nan, .infinity], messages: ["a", "b"])
-    writer.logBatch(levels: [1, 2, 3], messages: [])
+    XCTAssertEqual(entries.map(\.text), ["first", "second", "third"])
+    // The supplied level applies to the message it came with; the rest fall
+    // back to `info`, which is the documented default rather than the last
+    // level seen.
+    XCTAssertEqual(entries.map(\.type), [.error, .info, .info])
+  }
+
+  func testAnEmptyLevelsArrayStillWritesEveryMessage() {
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "batching")
+      writer.logBatch(levels: [], messages: ["orphan"])
+    }
+
+    XCTAssertEqual(entries.map(\.text), ["orphan"])
+    XCTAssertEqual(entries.map(\.type), [.info])
+  }
+
+  func testHostileLevelsDoNotTrapOrCostMessages() {
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "batching")
+      writer.logBatch(levels: [.nan, .infinity], messages: ["a", "b"])
+    }
+
+    XCTAssertEqual(entries.map(\.text), ["a", "b"])
+    XCTAssertEqual(entries.map(\.type), [.default, .default])
+  }
+
+  func testAnEmptyBatchWritesNothing() {
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "batching")
+      writer.logBatch(levels: [1, 2, 3], messages: [])
+    }
+
+    XCTAssertTrue(entries.isEmpty)
   }
 
   /// Losing every line because a caller forgot `install` is worse than logging
   /// under a guessed category — this is the channel you reach for when
   /// something else has already gone wrong.
   func testLoggingBeforeInstallStillGoesSomewhere() {
-    let writer = NativeConsoleWriter()
-    writer.logBatch(levels: [2], messages: ["before install"])
-    writer.install(subsystem: "com.nitrologger.tests", category: "late")
-    writer.logBatch(levels: [2], messages: ["after install"])
+    let entries = record { writer in
+      writer.logBatch(levels: [2], messages: ["before install"])
+      writer.install(subsystem: "com.nitrologger.tests", category: "late")
+      writer.logBatch(levels: [2], messages: ["after install"])
+    }
+
+    XCTAssertEqual(entries.map(\.text), ["before install", "after install"])
+    // The first went somewhere findable rather than nowhere, and the second
+    // went where it was told.
+    XCTAssertEqual(
+      entries.map(\.category), [NativeConsoleWriter.fallbackCategory, "late"])
+  }
+
+  /// The positive control the three tests above need to mean anything.
+  ///
+  /// Without it, an emitter that always reported the fallback category would
+  /// satisfy every assertion about the pre-install case — the seam would be
+  /// reporting a constant and the tests would be watching it agree with
+  /// itself. This is the one that fails if the installed category never
+  /// reaches an entry.
+  func testTheInstalledCategoryBecomesTheTag() {
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "checkout")
+      writer.logBatch(levels: [2], messages: ["m"])
+    }
+
+    XCTAssertEqual(entries.map(\.category), ["checkout"])
+    XCTAssertNotEqual(entries.first?.category, NativeConsoleWriter.fallbackCategory)
   }
 
   /// An empty subsystem produces a logger that is legal and unfindable.
   func testEmptyInstallArgumentsFallBackToSomethingSearchable() {
-    let writer = NativeConsoleWriter()
-    writer.install(subsystem: "", category: "")
-    writer.logBatch(levels: [3], messages: ["fallback"])
+    let entries = record { writer in
+      writer.install(subsystem: "", category: "")
+      writer.logBatch(levels: [3], messages: ["fallback"])
+    }
+
+    XCTAssertEqual(entries.map(\.text), ["fallback"])
+    XCTAssertEqual(entries.map(\.category), [NativeConsoleWriter.fallbackCategory])
+  }
+
+  /// Every chunk of a split line is its own entry, at the same severity.
+  func testASplitLineBecomesSeveralEntriesAtOneSeverity() {
+    let long = String(repeating: "g", count: NativeConsoleWriter.chunkBytes * 3)
+    let entries = record { writer in
+      writer.install(subsystem: "com.nitrologger.tests", category: "chunks")
+      writer.logBatch(levels: [4], messages: [long])
+    }
+
+    XCTAssertEqual(entries.count, NativeConsoleWriter.chunks(of: long).count)
+    XCTAssertGreaterThan(entries.count, 1)
+    XCTAssertTrue(entries.allSatisfy { $0.type == .error })
   }
 }

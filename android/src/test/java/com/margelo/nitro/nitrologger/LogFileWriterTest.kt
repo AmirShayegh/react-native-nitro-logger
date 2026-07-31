@@ -11,6 +11,10 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.file.Files
@@ -35,8 +39,26 @@ class LogFileWriterTest {
    * time, which the filesystem stamps and no injection can move. A clock set
    * to a fixed constant in the past makes every file look like it was created
    * in the future.
+   *
+   * ## Why atomic
+   *
+   * The test thread advances it; the **writer thread** reads it, through the
+   * `clock` lambda, on every rotation check. A plain `var` is a data race
+   * across those two threads with no happens-before edge between them, so
+   * nothing obliges the writer to ever see an advance — the JIT is free to
+   * hoist the read out of its loop. For 235 short sequential tests that has
+   * never visibly bitten, which is exactly why it is worth fixing before
+   * `LogBurstTest` runs the executor hot for thousands of records.
+   *
+   * `AtomicLong` rather than `@Volatile`, because the natural way to write
+   * these tests is `+=`, and a volatile read-modify-write is not atomic. Today
+   * every advance happens on the test thread, where that would be survivable —
+   * but `a failed compression keeps the plaintext archive` already advances the
+   * clock a line away from an injected `compressor` lambda that runs on the
+   * writer thread, and the day one moves inside is not a day anyone will be
+   * looking for it.
    */
-  private var now = System.currentTimeMillis()
+  private val now = AtomicLong(System.currentTimeMillis())
 
   /**
    * Injected monotonic clock, separate from [now] on purpose.
@@ -44,14 +66,16 @@ class LogFileWriterTest {
    * Deadlines and backoff read this one; ages and archive stamps read [now].
    * Keeping them independent is what lets a test move the wall clock backwards
    * — the thing an NTP correction does — and assert that no deadline grew.
+   *
+   * Atomic for the same reason as [now], and read from the same thread.
    */
-  private var steady = 0L
+  private val steady = AtomicLong(0)
   private val opened = mutableListOf<LogFileWriter>()
 
   @Before
   fun setUp() {
-    now = System.currentTimeMillis()
-    steady = 0L
+    now.set(System.currentTimeMillis())
+    steady.set(0)
     directory = File.createTempFile("nitro-logger-test", "").let {
       it.delete()
       File(it.absolutePath + "-dir").apply { mkdirs() }
@@ -83,8 +107,8 @@ class LogFileWriterTest {
       platform = platform,
       rawWrite = rawWrite,
       compressor = compressor,
-      clock = { now },
-      monotonic = monotonic ?: { steady }
+      clock = { now.get() },
+      monotonic = monotonic ?: { steady.get() }
     ).also { opened.add(it) }
   }
 
@@ -305,7 +329,7 @@ class LogFileWriterTest {
     w.write("early\n")
     w.flush(1, 1000.0)
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("late\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -317,15 +341,32 @@ class LogFileWriterTest {
   @Test
   fun `archives are pruned to the count cap`() {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, maxArchivedFilesCount = 2.0))
+
+    // Sampled after every rotation rather than once at the end, and that is
+    // the whole point of the shape.
+    //
+    // The prune runs on each rotation, so a writer that keeps one *fewer*
+    // than the cap does not settle — it oscillates: prune to 1, rotate to 2,
+    // no prune (2 is not > 2), rotate to 3, prune to 1. A single count taken
+    // at the end therefore passes or fails on the parity of the loop, and ten
+    // rotations happen to land such a writer on 2. Verified: `take(cap - 1)`
+    // survives `assertEquals(2, ...)` after this loop.
+    //
+    // What is actually promised is that the count reaches the cap and stays
+    // there, which no oscillation satisfies.
+    val counts = mutableListOf<Int>()
     repeat(10) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      counts.add(directory.list()!!.count { LogFileWriter.isArchiveName(it, "app.log") })
     }
-    w.flush(1, 1000.0)
-    w.settleForTesting()
 
-    val archives = directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
-    assertTrue("expected at most 2 archives, saw ${archives.size}", archives.size <= 2)
+    // The first two rotations are still filling up to the cap; from the third
+    // on it binds, and every sample after that is the cap exactly.
+    assertEquals(listOf(1, 2), counts.take(2))
+    assertEquals(List(8) { 2 }, counts.drop(2))
   }
 
   @Test
@@ -345,9 +386,9 @@ class LogFileWriterTest {
     assertTrue(firstRound.isNotEmpty())
     // Age the archive past the cap by its modification time, which is what the
     // sweep actually reads.
-    firstRound.forEach { File(directory, it).setLastModified(now - 120_000) }
+    firstRound.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
-    now += 1_000
+    now.addAndGet(1_000)
     w.write("0123456789012345\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -365,7 +406,7 @@ class LogFileWriterTest {
     )
     repeat(3) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -378,13 +419,34 @@ class LogFileWriterTest {
   // A bigger archive beats a lost one.
   @Test
   fun `a failed compression keeps the plaintext archive and records it`() {
+    // The control first, and it is what makes the last line mean anything:
+    // `GZIP` is set from eight places in the compression path, so "the bit is
+    // up" is a claim about the whole path. The same policy with the real
+    // compressor has to leave it down, or the injected failure is not what
+    // this test is observing.
+    val control = writer(
+      name = "control.log",
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, compressArchives = true)
+    )
+    repeat(2) {
+      control.write("0123456789012345\n")
+      now.addAndGet(1_000)
+    }
+    control.flush(1, 1000.0)
+    control.settleForTesting()
+    assertEquals(
+      "compression succeeds here, so the assertion below distinguishes something",
+      0,
+      control.status(1).degraded and LogDegradation.GZIP
+    )
+
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, compressArchives = true),
       compressor = { _, _ -> false }
     )
     repeat(2) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -392,6 +454,247 @@ class LogFileWriterTest {
     val names = directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
     assertTrue("expected a surviving plaintext archive", names.any { !it.endsWith(".gz") })
     assertTrue(w.status(1).degraded and LogDegradation.GZIP != 0)
+  }
+
+  @Test
+  fun `open returns without waiting for the retention sweep`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    try {
+      releaseAfter(held, 3_000)
+      val began = System.nanoTime()
+      val w = LogFileWriter.open(
+        file = File(directory, "app.log"),
+        canonicalPath = File(directory, "app.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now.get() },
+        monotonic = { steady.get() },
+        openSweepGate = {
+          inSweep.countDown()
+          held.await()
+        }
+      ).also { opened.add(it) }
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      // The sweep is provably still running — it is sitting in the gate — and
+      // `open` has already returned. Before this change it waited.
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      assertTrue("open waited for the retention sweep", elapsedMs < 2_000)
+
+      // And the writer is usable while the sweep is still gated, which is the
+      // point of moving it: the trim that had to finish already has.
+      assertTrue(w.append(1, w.currentGeneration, "usable\n", 1).accepted)
+    } finally {
+      held.countDown()
+    }
+  }
+
+  /**
+   * What the async sweep is actually worth: the registry lock is free while it
+   * runs.
+   *
+   * Waiting for the sweep meant an unbounded, cross-thread wait on directory
+   * I/O taken **inside** the registry lock — so opening one file with a large
+   * backlog of archives to prune stalled every other file's acquire and
+   * release, including a close with a deadline it had promised to keep.
+   *
+   * The gated acquire runs on its **own thread**, and that is load-bearing
+   * rather than tidy. Measuring a second acquire after the first has returned
+   * proves nothing about the lock: a first acquire that waited would simply
+   * have finished waiting by then. The second acquire has to be attempted while
+   * the first is still inside `registry.acquire`, which needs two threads.
+   *
+   * What this does not prove: that the sweep *completes* before the first
+   * append lands. That follows from the executor being single-threaded, which
+   * is a construction argument rather than a tested one.
+   */
+  @Test
+  fun `a gated open sweep on one path does not block another path`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    val registry = LogWriterRegistry.isolated()
+    val slow = AtomicReference<LogFileHandle>()
+    val slowThread = Thread {
+      slow.set(
+        registry.acquire(
+          path = File(directory, "slow.log").absolutePath,
+          policy = LogRotationPolicy.of(),
+          lineFramed = true,
+          platform = PlatformIo.Jvm,
+          clock = { now.get() },
+          openSweepGate = {
+            inSweep.countDown()
+            held.await()
+          }
+        )
+      )
+    }
+    try {
+      slowThread.start()
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      // Insurance against the mutation: with the sweep awaited again, the
+      // thread above is stuck inside `acquire` holding the lock and would never
+      // reach the release below — the suite would hang instead of failing.
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      val other = registry.acquire(
+        path = File(directory, "other.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now.get() }
+      )
+      other.close(1000.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertTrue(
+        "a gated sweep on one file held the registry lock against another",
+        elapsedMs < 2_000
+      )
+    } finally {
+      held.countDown()
+      slowThread.join(10_000)
+      slow.get()?.let { runCatching { it.close(1000.0) } }
+    }
+  }
+
+  /**
+   * Moving the sweep off the acquiring thread changed an externally visible
+   * contract, so the new contract gets pinned rather than left implied.
+   *
+   * Open used to guarantee the sweep had *finished*. It now guarantees only
+   * that it is queued, which means a `getStatus()` taken right after opening
+   * can legitimately report the state from before the sweep ran — a caller
+   * that opens and immediately checks `degraded` may see a clean status and a
+   * degraded one a moment later, with nothing having gone wrong in between.
+   * That is worth a test because it is the kind of difference that otherwise
+   * gets discovered as a flake in somebody else's suite.
+   *
+   * The sweep is made to *fail* here, because a sweep that succeeds leaves no
+   * mark on the status and the two moments would be indistinguishable.
+   *
+   * What this does not prove: that the window is short. There is no bound on
+   * how long the queued sweep takes to reach the front — that is the cost the
+   * change deliberately accepts in exchange for not paying it on the caller's
+   * thread.
+   */
+  @Test
+  fun `status right after open can predate the sweep`() {
+    val held = CountDownLatch(1)
+    val inSweep = CountDownLatch(1)
+    try {
+      // Insurance against a revert to the inline sweep: that would block the
+      // open below on this test's own thread, and the gate would never open.
+      releaseAfter(held, 3_000)
+      val w = LogFileWriter.open(
+        file = File(directory, "app.log"),
+        canonicalPath = File(directory, "app.log").absolutePath,
+        policy = LogRotationPolicy.of(),
+        lineFramed = true,
+        platform = PlatformIo.Jvm,
+        clock = { now.get() },
+        monotonic = { steady.get() },
+        openSweepGate = {
+          inSweep.countDown()
+          held.await()
+        }
+      ).also { opened.add(it) }
+
+      assertTrue("the sweep never reached its gate", inSweep.await(10, TimeUnit.SECONDS))
+      assertEquals(
+        "the sweep is still sitting in its gate — it cannot have reported a failure yet",
+        0,
+        w.status(1).degraded and LogDegradation.PRUNE
+      )
+
+      // Break the sweep from outside the gate it is parked in, so the failure
+      // is provably one the sweep hit rather than anything the open did.
+      directory.setReadable(false, false)
+      assumeDirectoryRefusesListing()
+      held.countDown()
+      w.settleForTesting()
+
+      assertTrue(
+        "once the sweep runs, the listing it could not do is on the status",
+        w.status(1).degraded and LogDegradation.PRUNE != 0
+      )
+    } finally {
+      held.countDown()
+      directory.setReadable(true, false)
+    }
+  }
+
+  /**
+   * The writer thread lowers *its own* priority, and does it on itself.
+   *
+   * The signature has no thread parameter precisely because the mistake worth
+   * preventing is calling it from the wrong one: `Process.setThreadPriority`
+   * acts on the caller, so making the request while constructing the executor
+   * — which happens on whichever thread opened the sink, in production the
+   * JavaScript thread — would deprioritize the app and leave the log writer
+   * exactly where it was. Asserting the *name* of the thread it ran on is what
+   * catches that; asserting only that it was called does not.
+   *
+   * ## What this does not prove
+   *
+   * That anything happened. `PlatformIo.Jvm` is a no-op and this double only
+   * records, so what is pinned is that the request is made, from the right
+   * thread, exactly once. Whether the OS honours it is not observable from a
+   * JVM and is not observable on a device either — `getThreadPriority` reports
+   * what was set, not what the scheduler did with it.
+   */
+  @Test
+  fun `the writer thread lowers its own priority`() {
+    val recorder = RecordingPriority()
+    val w = LogFileWriter.open(
+      file = File(directory, "app.log"),
+      canonicalPath = File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(),
+      lineFramed = true,
+      platform = recorder,
+      clock = { now.get() },
+      monotonic = { steady.get() }
+    ).also { opened.add(it) }
+
+    assertTrue(w.append(1, w.currentGeneration, "x\n", 1).accepted)
+    w.settleForTesting()
+
+    assertEquals(
+      "the priority request was made on the wrong thread",
+      listOf("com.nitrologger.filewriter"),
+      recorder.threads()
+    )
+  }
+
+  /**
+   * Records where [deprioritizeCurrentThread] was called from, and does the
+   * rest of the work the tests already rely on.
+   *
+   * Delegation rather than a hand-written stub: a stub would have to
+   * reimplement every method, and the one it got subtly wrong would be a test
+   * failure that says nothing about priority.
+   */
+  private class RecordingPriority(
+    private val inner: PlatformIo = PlatformIo.Jvm
+  ) : PlatformIo by inner {
+    private val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    override fun deprioritizeCurrentThread() {
+      seen.add(Thread.currentThread().name)
+    }
+
+    fun threads(): List<String> = synchronized(seen) { seen.toList() }
+  }
+
+  /** Opens [latch] from a daemon thread after [millis]. */
+  private fun releaseAfter(latch: CountDownLatch, millis: Long) {
+    Thread {
+      Thread.sleep(millis)
+      latch.countDown()
+    }.apply { isDaemon = true }.start()
   }
 
   // An interrupted compression must not leave something that looks like a
@@ -426,8 +729,60 @@ class LogFileWriterTest {
       repeat(5) { w.write("0123456789\n") }
       w.flush(1, 1000.0)
       w.settleForTesting()
-      val attempts = w.rotationAttemptsForTesting
-      assertTrue("expected the backoff to bound retries, saw $attempts", attempts <= 2)
+
+      // Exactly one. An 11-byte record over an 8-byte threshold means the
+      // first write already wants to rotate; it fails, which opens the window,
+      // and `steady` never advances, so the window absorbs writes two through
+      // five. `<= 2` was satisfied by a writer that retried once more than it
+      // should — which is precisely the behaviour a backoff exists to prevent,
+      // so it was the one value the assertion had to exclude.
+      assertEquals(1, w.rotationAttemptsForTesting)
+    } finally {
+      directory.setWritable(true, true)
+    }
+  }
+
+  /**
+   * The window is a window, not a latch.
+   *
+   * Its sibling above proves a failed rotation stops retrying. On its own that
+   * is also satisfied by a writer that gives up on rotation permanently after
+   * one failure — which would leave a log file growing without bound past a
+   * transient fault, the opposite of what a backoff is for. What separates the
+   * two is whether attempts resume once the window expires, and only a test
+   * that moves the clock can ask.
+   *
+   * Swift has this test; Kotlin had the injected clock and no test using it
+   * for rotation. The asymmetry is the reason it is here.
+   */
+  @Test
+  fun `a rotation retries once the backoff window expires`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 8.0))
+    w.settleForTesting()
+
+    directory.setWritable(false, false)
+    try {
+      assumeDirectoryRefusesWrites()
+
+      w.write("0123456789\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      assertEquals(1, w.rotationAttemptsForTesting)
+
+      // Still inside the window: no further attempt, however many writes.
+      repeat(4) { w.write("0123456789\n") }
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      assertEquals(1, w.rotationAttemptsForTesting)
+
+      // Past it on the only clock the backoff reads. Nothing else changed —
+      // the fault is still in force and the file is still over its threshold.
+      steady.addAndGet(LogFileWriterConstants.ROTATION_BACKOFF_MS + 1)
+      w.write("0123456789\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+
+      assertEquals(2, w.rotationAttemptsForTesting)
     } finally {
       directory.setWritable(true, true)
     }
@@ -440,7 +795,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(4) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -461,6 +816,143 @@ class LogFileWriterTest {
     assertTrue(w.append(1, generation, "after\n", 1).accepted)
     w.flush(1, 1000.0)
     assertEquals("after\n", File(directory, "app.log").readText())
+  }
+
+  /**
+   * A purge that arrives after the close barrier still deletes.
+   *
+   * The call is a compliance purge, and the case is ordinary: a destination is
+   * disposed and the app then asks for the logs to be erased. Through 0.2.0
+   * Android deleted **nothing** here and reported `durable = false` — the
+   * executor was shut down, the submission was refused, and the refusal was
+   * caught by a blanket `catch (Exception)` that treated "I could not schedule
+   * the work" as "the deletion failed". iOS had always behaved as documented,
+   * because its block reaches the queue before the barrier rather than being
+   * refused by it, so the two platforms disagreed about the one call where
+   * disagreeing matters most.
+   *
+   * It runs inline now, once `awaitTermination` has established that no
+   * executor task can ever run again.
+   */
+  @Test
+  fun `a purge that lands after the close barrier still deletes`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
+    repeat(4) {
+      w.write("0123456789012345\n")
+      now.addAndGet(1_000)
+    }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+    assertTrue(directory.list()!!.isNotEmpty())
+
+    // The executor is shut down from here on, so the purge below cannot be
+    // scheduled at all.
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertTrue("a post-close purge deleted nothing", outcome.durable)
+    assertTrue("nothing was counted as deleted", outcome.deletedCount > 0)
+    assertTrue(outcome.failedPaths.isEmpty())
+    val survivors = directory.list()!!.filter { LogFileWriter.isArtifactName(it, "app.log") }
+    assertTrue("artifacts survived a purge that reported durable: $survivors", survivors.isEmpty())
+  }
+
+  /**
+   * The inline path must not start while the executor is still draining.
+   *
+   * `shutdown()` refuses new submissions but lets queued tasks finish, so
+   * "refused" does not mean "finished" — and a sweep racing a task that is
+   * still moving these files has two mutators and can report durable over an
+   * artifact about to be rewritten. `awaitTermination` returning false is the
+   * only thing standing between those two, and the honest answer when it does
+   * is that nothing was deleted.
+   */
+  @Test
+  fun `a purge that lands while the executor is still draining is not durable`() {
+    val w = writer()
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+
+    // Wedge the executor, then close: the barrier queues behind the stall and
+    // never runs, `close` gives up on its own budget, and `shutdown()` still
+    // happens on the way out. The executor is now shutting down but very much
+    // not terminated.
+    val release = w.stallForTesting()
+    try {
+      w.close(1, 50.0)
+
+      val (outcome, _) = w.clearLogs(50.0)
+
+      assertFalse("a purge claimed durability over a draining executor", outcome.durable)
+      assertEquals(listOf(File(directory, "app.log").absolutePath), outcome.failedPaths)
+      assertEquals(0, outcome.deletedCount)
+      assertTrue(
+        "the file was deleted by a purge that reported it was not",
+        File(directory, "app.log").exists()
+      )
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * The inline purge reports a failure; it does not throw one.
+   *
+   * The trap is a Kotlin/Java rule rather than anything about purging: an
+   * exception raised inside a `catch` block does **not** flow into a sibling
+   * `catch` of the same `try`. The inline path lives inside the
+   * `RejectedExecutionException` handler, so the blanket handler beside it
+   * cannot cover it, and a throwing `list()`, `delete()` or `syncDirectory`
+   * would escape `clearLogs` outright — while the identical failure on the
+   * executor path stays inside the task, leaves the outcome at its non-durable
+   * initial value, and returns normally.
+   *
+   * A purge that throws on one path and returns on the other is exactly the
+   * divergence this workstream exists to remove, so the inline call has its own
+   * `try`.
+   */
+  @Test
+  fun `an inline purge that fails reports it rather than throwing`() {
+    val hostile = object : PlatformIo by PlatformIo.Jvm {
+      override fun syncDirectory(directory: File): Boolean =
+        throw RuntimeException("the volume went away mid-purge")
+    }
+    val w = writer(platform = hostile)
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertFalse("a purge that could not finish claimed durability", outcome.durable)
+    assertEquals(listOf(File(directory, "app.log").absolutePath), outcome.failedPaths)
+  }
+
+  /**
+   * The inline purge deletes and stops there.
+   *
+   * Reopening after the close barrier would leak a stream for the life of the
+   * process and leave a fresh empty `app.log` where a purge had just promised
+   * nothing. Note this does **not** consult `terminated`: a close whose own
+   * barrier submission was rejected leaves that flag false over a dead
+   * executor, so the inline path passes `reopenIfClean = false` outright.
+   */
+  @Test
+  fun `an inline purge never reopens the log file`() {
+    val w = writer()
+    w.write("secret\n")
+    w.flush(1, 1000.0)
+    w.close(1, 1000.0)
+
+    val (outcome, _) = w.clearLogs(2000.0)
+
+    assertTrue(outcome.durable)
+    assertFalse("a post-close purge rebound a handle onto a dead writer", outcome.rebound)
+    assertFalse(
+      "the purge reopened the file it had just deleted",
+      File(directory, "app.log").exists()
+    )
   }
 
   // Writing pre-purge data into the fresh file would resurrect exactly what the
@@ -621,7 +1113,7 @@ class LogFileWriterTest {
     w.settleForTesting()
     assertFalse("a plain write must not bypass the backoff", logs.exists())
 
-    steady += LogFileWriterConstants.REOPEN_BACKOFF_MS
+    steady.addAndGet(LogFileWriterConstants.REOPEN_BACKOFF_MS)
     w.write("window elapsed\n")
     w.settleForTesting()
     assertTrue("once the window passes the write reopens", File(logs, "app.log").exists())
@@ -1040,6 +1532,20 @@ class LogFileWriterTest {
    */
   @Test
   fun `the writer reports rather than repairs a directory it cannot secure`() {
+    // With a control, because `PROTECTION` is a folded bit with eleven
+    // contributors — the directory, the log file, the sidecar, every archive
+    // and every staging file. "Some route set it" is not the claim; "the
+    // refused `restrictToOwner` set it" is, and only a writer on the
+    // unmodified platform can tell those apart.
+    val control = writer(name = "control.log")
+    control.write("x\n")
+    control.flush(1, 500.0)
+    assertEquals(
+      "nothing is wrong here, so the assertion below distinguishes something",
+      0,
+      control.status(1).degraded and LogDegradation.PROTECTION
+    )
+
     val w = writer(platform = object : PlatformIo by PlatformIo.Jvm {
       override fun restrictToOwner(file: File, isDirectory: Boolean) = false
     })
@@ -1163,7 +1669,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
 
     // The control, and the point: the file is old enough to rotate and stays
     // put, because nothing has written to it. Without this the assertion below
@@ -1192,9 +1698,9 @@ class LogFileWriterTest {
 
     val rotated = archives()
     assertTrue(rotated.isNotEmpty())
-    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+    rotated.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
-    now += 1_000
+    now.addAndGet(1_000)
     assertEquals("retention does not sweep itself either", rotated.size, archives().size)
 
     w.maintain(1, 1000.0)
@@ -1212,7 +1718,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.flush(1, 1000.0)
     w.settleForTesting()
 
@@ -1232,7 +1738,7 @@ class LogFileWriterTest {
     w.settleForTesting()
     assertEquals(0, w.status(1).degraded and LogDegradation.GZIP)
 
-    now += 61_000
+    now.addAndGet(61_000)
     val status = w.maintain(1, 1000.0)
 
     assertTrue(
@@ -1270,10 +1776,10 @@ class LogFileWriterTest {
 
     val rotated = archives()
     assertTrue(rotated.isNotEmpty())
-    rotated.forEach { File(directory, it).setLastModified(now - 120_000) }
+    rotated.forEach { File(directory, it).setLastModified(now.get() - 120_000) }
 
     w.close(1, 1000.0)
-    now += 1_000
+    now.addAndGet(1_000)
     w.maintain(1, 1000.0)
 
     assertEquals("an archive this writer no longer owns is not its to expire",
@@ -1314,7 +1820,7 @@ class LogFileWriterTest {
     )
     repeat(4) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1344,7 +1850,7 @@ class LogFileWriterTest {
     w.flush(1, 1000.0)
 
     assertEquals("hello\n", File(directory, "app.log").readText())
-    assertEquals(now.toString(), File(directory, "app.log.meta").readText().trim())
+    assertEquals(now.get().toString(), File(directory, "app.log.meta").readText().trim())
   }
 
   /// The sidecar is authoritative once written, and the filesystem is only ever
@@ -1358,11 +1864,11 @@ class LogFileWriterTest {
   fun `a filesystem that reports the mtime as creation time cannot defeat age rotation`() {
     val mtimeAsCreation = object : PlatformIo by PlatformIo.Jvm {
       // Always "just now", the way an mtime looks after a write.
-      override fun creationTimeMillis(file: File): Long? = now
+      override fun creationTimeMillis(file: File): Long? = now.get()
     }
 
     // A previous run recorded the real creation time an hour ago.
-    File(directory, "app.log.meta").writeText((now - 3_600_000).toString())
+    File(directory, "app.log.meta").writeText((now.get() - 3_600_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0),
@@ -1384,7 +1890,7 @@ class LogFileWriterTest {
   /// postpones rotation until wall time catches up.
   @Test
   fun `a sidecar dated in the future is rewritten rather than obeyed`() {
-    File(directory, "app.log.meta").writeText((now + 86_400_000).toString())
+    File(directory, "app.log.meta").writeText((now.get() + 86_400_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0)
@@ -1395,10 +1901,10 @@ class LogFileWriterTest {
     // to `now`: a plausible filesystem creation time is allowed to win the seed,
     // and on a one-second-granularity filesystem that is a little earlier.
     val rewritten = File(directory, "app.log.meta").readText().trim().toLong()
-    assertTrue("the sidecar is still in the future: $rewritten vs $now", rewritten <= now)
+    assertTrue("the sidecar is still in the future: $rewritten vs $now", rewritten <= now.get())
 
     // And with a sane start time, age rotation still works.
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("late\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1419,7 +1925,7 @@ class LogFileWriterTest {
     )
     w.settleForTesting()
 
-    now += 61_000
+    now.addAndGet(61_000)
     w.write("rotate me\n")
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1457,7 +1963,7 @@ class LogFileWriterTest {
 
     // A previous run left the file an hour old, so the first write rotates.
     val sidecar = File(directory, "app.log.meta")
-    sidecar.writeText((now - 3_600_000).toString())
+    sidecar.writeText((now.get() - 3_600_000).toString())
 
     val w = writer(
       policy = LogRotationPolicy.of(maxFileSizeBytes = 1e9, maxFileAgeSeconds = 60.0),
@@ -1476,13 +1982,13 @@ class LogFileWriterTest {
     assertFalse("the reopen was supposed to fail", w.hasLiveStreamForTesting)
     assertEquals(
       "the stale sidecar should not have been overwritten",
-      (now - 3_600_000).toString(),
+      (now.get() - 3_600_000).toString(),
       sidecar.readText().trim()
     )
 
     // Let the file open again, past the reopen backoff.
     refuseOpen = false
-    steady += 5_000
+    steady.addAndGet(5_000)
 
     repeat(4) { w.write("still young\n") }
     w.flush(1, 1000.0)
@@ -1578,7 +2084,7 @@ class LogFileWriterTest {
     val w = writer()
     val resume = w.stallForTesting()
     try {
-      now -= 3_600_000 // the wall clock steps back an hour, mid-flight
+      now.addAndGet(-3_600_000) // the wall clock steps back an hour, mid-flight
       val started = System.nanoTime()
       val outcome = w.flush(1, 200.0)
       val elapsedMs = (System.nanoTime() - started) / 1_000_000
@@ -1638,7 +2144,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(2) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1674,7 +2180,7 @@ class LogFileWriterTest {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0))
     repeat(6) {
       w.write("0123456789012345\n")
-      now += 1_000
+      now.addAndGet(1_000)
     }
     w.flush(1, 1000.0)
     w.settleForTesting()
@@ -1707,4 +2213,17 @@ object LogFileWriterConstants {
 
   /** Mirrors the writer's private `REOPEN_BACKOFF_MS`. */
   const val REOPEN_BACKOFF_MS = 1_000L
+
+  /**
+   * Mirrors the writer's private `ROTATION_BACKOFF_MS`.
+   *
+   * A hand-copied constant drifts, and it is worth being exact about which
+   * direction goes unnoticed. A test advances the clock by this plus one, so
+   * a production window that *grows* past the mirror leaves the window shut
+   * and the test red — caught. One that *shrinks* is still cleared by an
+   * over-long advance, so the test stays green having proved the weaker
+   * statement that the window reopens eventually. Both are worth having;
+   * only the first is guarded.
+   */
+  const val ROTATION_BACKOFF_MS = 5_000L
 }

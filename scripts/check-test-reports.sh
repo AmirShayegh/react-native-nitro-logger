@@ -41,8 +41,8 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=203
-    REQUIRED_SUITES="FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
+    MINIMUM=247
+    REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     # `--xunit-output` is the only machine-readable result SwiftPM emits, and
@@ -53,16 +53,16 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=185
-    REQUIRED_SUITES="BridgeNumberTest FileSinkLifecycleTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
+    MINIMUM=240
+    REQUIRED_SUITES="BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)
     RUN_STATUS=$?
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=825
-    REQUIRED_SUITES="apiReference batcher consoleDestination defaultFormatter eslintPlugin fileDestination integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination privacy redaction rejectionHandler sanitizeError scope subsystem"
+    MINIMUM=1108
+    REQUIRED_SUITES="adapterThinness apiReference batcher consoleDestination construction correlation defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError scope subsystem utf8"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     npx jest --ci --json --outputFile="$REPORTS/jest.json"
@@ -78,6 +78,51 @@ if [ ! -d "$REPORTS" ]; then
   echo "FAIL: the run produced no report directory at $REPORTS"
   exit 1
 fi
+
+# The shared no-handle table, pinned outside the three suites that read it.
+#
+# Each suite carries its own floor, which is what makes a new row fail that
+# target. This pin is for the failure those floors cannot see: all three lowered
+# together, or rows deleted from the table and the floors dropped to match in the
+# same commit, which looks locally consistent from inside any one of them.
+#
+# What it does NOT prove: that the rows say anything. A row whose answers were
+# emptied still counts. That is the suites' job — this only stops the table
+# shrinking quietly.
+python3 - <<'PY' || exit 1
+import json, pathlib, sys
+
+PINNED_ROWS = 9
+PINNED_MODES = ["neverOpened", "openedThenClosed"]
+
+table = json.loads(pathlib.Path("spec/file-sink-lifecycle.rows.json").read_text())
+rows, modes = table["rows"], table["modes"]
+
+problems = []
+if len(rows) < PINNED_ROWS:
+    problems.append(f'the table has {len(rows)} rows, below the pinned {PINNED_ROWS}')
+if modes != PINNED_MODES:
+    problems.append(f'the table declares modes {modes}, not {PINNED_MODES}')
+
+# A duplicated op raises the row count while testing nothing new, which is the
+# one way to satisfy every floor above and the three suites' dispatcher checks
+# at the same time.
+ops = [row.get("op") for row in rows]
+duplicated = sorted({op for op in ops if ops.count(op) > 1})
+if duplicated:
+    problems.append('these ops are listed more than once: ' + ', '.join(map(str, duplicated)))
+
+for row in rows:
+    missing = [m for m in modes if not isinstance(row.get(m), dict) or not row[m]]
+    if missing:
+        problems.append(f'row `{row.get("op")}` has no answer for: {", ".join(missing)}')
+
+for problem in problems:
+    print(f'FAIL: {problem}')
+sys.exit(1 if problems else 0)
+
+PY
+echo "ok:   the shared no-handle table still carries its pinned rows and modes"
 
 REPORTS="$REPORTS" MODE="$MODE" MINIMUM="$MINIMUM" REQUIRED_SUITES="$REQUIRED_SUITES" \
 python3 <<'PY'

@@ -123,4 +123,31 @@ class ReactInstanceEpochTest {
     assertTrue(ReactInstanceEpoch.isLive(second))
     assertEquals(listOf(first), swept)
   }
+
+  /**
+   * A structural assertion, and deliberately not a behavioural one.
+   *
+   * `NitroLoggerLifecycle.token` is written by `initialize` and read by
+   * `invalidate`, which are not guaranteed to run on the same thread, and
+   * `begin()`'s lock is released *before* the write — so nothing but the field's
+   * own volatility orders the two. A stale `null` read means the epoch never
+   * ends, the sweep never runs, and the reload leak returns silently.
+   *
+   * **This cannot be tested by observing behaviour.** The JMM *permits* the
+   * stale read; it does not require it, and on x86 with a JIT that has not
+   * hoisted the field a racing test publishes the value essentially every time.
+   * Such a test would be green against the buggy code, which is worse than no
+   * test — so this asserts the property the memory-model argument rests on, and
+   * claims nothing more. It does not prove that the two callbacks ever actually
+   * land on different threads; that premise comes from
+   * `TurboModuleManager.invalidate()`'s contract, not from here.
+   */
+  @Test
+  fun `the lifecycle token field is volatile`() {
+    val field = NitroLoggerLifecycle::class.java.getDeclaredField("token")
+    assertTrue(
+      "NitroLoggerLifecycle.token must stay @Volatile — see the field's KDoc",
+      java.lang.reflect.Modifier.isVolatile(field.modifiers)
+    )
+  }
 }

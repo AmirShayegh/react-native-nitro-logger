@@ -42,15 +42,27 @@ down to be useful ends up not being used at the layers that need it most.
 | `redactAllMetadata()` | `this` | Redact every value regardless of marker. Not reversible. |
 | `metadataKeyCatalog(keys)` | `this` | Approve key names. Calls intersect; one bad key approves none. **Mandatory under `'private'`** — see [PRIVACY.md](PRIVACY.md#metadata-keys). |
 | `consoleLogging(enabled)` | `this` | Toggle the built-in console destination. |
-| `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. |
+| `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. Re-adding the *same instance* re-arms it. |
+| `destinations()` | `readonly DestinationStatus[]` | What is registered, and which of them this logger has cut off. |
 | `removeDestination(label)` | `this` | Unregister and dispose. |
-| `flush(deadlineMs?)` | `void` | Ask every destination to flush. Returns nothing — see the note below. |
+| `flush(deadlineMs?)` | `void` | Ask every destination to flush, inside one total budget. Returns nothing — see the note below. |
 | `newCorrelationId()` | `string` | A fresh ID, generated rather than derived. |
 | `scoped(correlation?, subsystem?, metadata?)` | `ScopedLogger` | Omit `correlation` and one is generated. |
 
 `flush()` deliberately returns `void`. Whether bytes reached disk is a question
 only the file sink can answer, so ask it: `FileDestination.flush(deadlineMs)`
 returns a `BatchFlushOutcome` with `durable` on it.
+
+`deadlineMs` (default 2000) is the **total** for the whole call, not an
+allowance each destination gets. Destinations are flushed in registration order
+and each is handed what the ones before it left, so register the destination
+whose durability matters most — normally the file sink — first. A destination
+reached with the budget already spent is still asked, with `0`: that drains
+whatever needs no waiting, and skipping it would be a new way to lose records on
+the crash path. The bound is cooperative — a destination that ignores its
+deadline still blocks — and `Infinity` means the 30-second ceiling rather than
+forever. Time is measured against a monotonic clock, so a device clock
+correction between two destinations cannot stretch or end the budget.
 
 `metadataKeyCatalog` is tighten-only and implements that by **intersecting**:
 the second call keeps only the keys the first one also approved and can never
@@ -63,14 +75,67 @@ mistakes are otherwise silent under `'private'`, so a development build warns
 when a call leaves fewer keys approved than it found, or when the first call
 approves none — counts only, never the key names themselves.
 
-<!-- api: Logger -->
+A destination whose `write` throws five times in a row is auto-disabled: the
+logger stops calling it rather than paying for the throw on every entry. The
+only signal is a development-only console warning, which a shipped build never
+sees, so `destinations()` is how a running app finds out. It returns a frozen
+array of frozen `DestinationStatus` rows — `{ label, enabled }` and nothing
+else.
+
+`enabled` reports **one thing**: this logger's circuit breaker. It is
+deliberately not the destination's own `isEnabled`, because that getter is
+caller-supplied — a throwing one would break a diagnostics call and a lying one
+would report healthy for something this logger stopped writing to. Which means
+`enabled: true` is not a promise that records are arriving: a destination that
+reports `isEnabled: false` about itself is skipped by the write path and still
+appears here as `enabled`, and a fenced `FileDestination` is exactly that. From
+this logger's side nothing has gone wrong. The two are different questions, and
+this method answers the one you cannot find out any other way. The label is the
+one captured at registration, so a destination whose label getter started
+throwing since then still appears under the name this logger knows it by.
+
+Re-arming is `addDestination(theSameInstance)`: passing an instance that is
+already registered clears its failure count and its disabled mark and returns
+without touching the label getter again. That is the whole gesture — "I have
+fixed it, try again" — and before 0.3.0 it was the one call that did nothing.
+There is deliberately no `enableDestination(label)`, because reviving by name
+would let code that does not hold the destination re-arm it, and holding the
+instance is the evidence that the caller is the one who fixed it.
+
+<!-- api: Logger, DestinationStatus -->
 
 ### `ScopedLogger`
 
 Carries a correlation ID, an optional subsystem, and optional default metadata
 into every call. Same six level methods as `Logger`, minus the `subsystem`
 argument, since a scope already has one. `scoped()` nests, and a nested scope
-inherits what it does not override.
+inherits what it does not override — **including the correlation ID**.
+
+| Method | Returns | What it does |
+| --- | --- | --- |
+| `verbose(message, metadata?)` · `debug(…)` · `info(…)` · `warning(…)` · `error(…)` · `todo(…)` | `void` | Emit at that level. Unchanged. |
+| `log(message, options?)` | `void` | The general form. `ScopedLogOptions` is `{ level?, metadata? }`. |
+| `scoped(correlation?, subsystem?, metadata?)` | `ScopedLogger` | Nests. Inherits the correlation unless you pass one. |
+
+**`log` changed shape in 0.3.0.** It was `log(message, level?, metadata?)` —
+three positionals in an order nobody could recall, and different from
+`Logger.log(message, options?)` for no reason beyond how each grew. It now
+takes options, so both spellings agree. The compiler names every line to
+change, and a JavaScript caller that misses one gets the default level rather
+than a level read silently out of an object.
+
+`ScopedLogOptions` has **no `subsystem` and no `correlation`**, deliberately. A
+scope owns both — that is what a scope is — and a call that could override them
+would let one line quietly leave the unit of work every other line belongs to.
+Use `Logger.log` for a genuinely different subsystem, or nest a `scoped()` for
+a different correlation.
+
+That is the opposite of `Logger.scoped()`, which generates a fresh one when you
+omit it, and both are right for the same reason: a correlation ID names a unit
+of work. `Logger.scoped()` starts one. A scope nested inside it is that same
+unit of work seen closer up, so a new ID there would sever the trail at exactly
+the point someone reading the logs is trying to follow it. Pass one explicitly
+to start a genuinely separate unit from inside an existing scope.
 
 Its default metadata goes through the same redaction path as call-site
 metadata, and the ESLint rules read both.
@@ -82,7 +147,7 @@ the runtime cannot redact, and the rules check them in either spelling. That
 was not true before 0.1.2, when only `scoped()` was recognised and the
 constructor reported nothing.
 
-<!-- api: ScopedLogger -->
+<!-- api: ScopedLogger, ScopedLogOptions -->
 
 ### `LogOptions`, `LazyMessage`, `LogLevel`, `LogEntry`
 
@@ -165,9 +230,9 @@ The durable one. Rotation, gzip, retention, crash-tail recovery, bounded
 buffering, and a deadline-bounded purge.
 
 ```ts
-import { FileDestination, createFileSink, JsonLinesFormatter } from 'react-native-nitro-logger';
+import { createFileDestination, JsonLinesFormatter } from 'react-native-nitro-logger';
 
-const logFile = new FileDestination(createFileSink(), {
+const logFile = createFileDestination({
   formatter: new JsonLinesFormatter(),
   rotation: {
     maxFileSizeBytes: 10 * 1024 * 1024,
@@ -185,11 +250,22 @@ const logFile = new FileDestination(createFileSink(), {
 | `flush(deadlineMs?)` | `BatchFlushOutcome` | `durable` says whether it reached disk. |
 | `maintain(deadlineMs?)` | `number` | Rotation and the retention sweep, on demand. Returns the same mask as `degradation()`, read once the bounded wait is over. |
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
+| `reopen(deadlineMs?)` | `boolean` | The way back from a fence. See below. |
 | `collectForSupport({ maxTotalBytes, deadlineMs? })` | `CollectOutcome` | One gzip bundle of the whole log, for a support upload. See below. |
+| `deleteSupportBundle(deadlineMs?)` | `boolean` | Deletes that bundle once it is uploaded. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
 | `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip, protection and exclusivity each have a bit. |
 | `dispose()` | `void` | Releases the native handle. |
+
+Every `deadlineMs` here bounds a wait on the JavaScript thread, and every one of
+them is capped at **30 seconds** — `Infinity` means that cap, not forever, on
+both sides of the bridge. `flush` applies the cap in JavaScript before it starts
+draining; `maintain`, `purge` and `collectForSupport` hand the number to the
+native writer, which applies the same one. The waits are measured against a
+monotonic clock, so a device clock correction landing mid-call cannot stretch
+them. What none of them bound is a filesystem that never answers: the deadline
+governs how long this code waits, not how long a single blocking syscall takes.
 
 `PurgeOutcome` reports `durable` (every pre-purge artifact is gone) separately
 from `rebound` (the destination is writable again), because a complete deletion
@@ -205,6 +281,36 @@ usually is not.
 **`purge()` after `dispose()` returns `durable: false`.** A disposed
 destination cannot see the files, so it cannot honestly claim they are gone.
 
+**`reopen(deadlineMs?)` is the way back from a fence**, and it returns whether
+the destination can write when the call returns. A fence is deliberately
+permanent until something asks for a retry: a destination fenced by *another*
+handle's purge, or by a purge that deleted durably and then could not reopen,
+stays disabled, and before 0.3.0 there was nothing to ask. Constructing a
+replacement is a poor substitute rather than an impossible one. On the same
+canonical path a second handle is eligible to share the writer when its
+rotation policy and framing match, and differing ones are a config conflict —
+though matching them is no promise of success either, since an acquisition can
+still fail on a previous writer that is still closing, on the filesystem, or on
+the lock. Whichever way it goes, the fenced destination is still alive, holding
+its retain on the writer and its registration with whatever logger it was given
+to, until someone disposes it.
+
+It closes this handle and opens a fresh one with the same path, rotation and
+framing it was constructed with. A disposed destination returns `false` and
+stays disposed, because dispose is a release and not a pause. An unfenced one
+returns `true` having touched nothing, since closing a live handle to prove it
+could be reopened would throw away the buffer and the file position. A failed
+open leaves it fenced, which is the only safe direction for this to fail in; a
+failed *close* does not, because there was nothing drainable behind a fence and
+the open is what decides. `deadlineMs` bounds the close, the only half that
+waits.
+
+`true` says a handle was acquired — not that the file behind it holds what the
+old one did. After another handle's purge it is a fresh, empty file, which is
+the purge working. The new file also does not open with a loss notice about the
+old one: the fence clears what was owed on the way in, because a count of
+deliberately deleted records describes the deletion.
+
 **`collectForSupport({ maxTotalBytes, deadlineMs? })`** packs the log files into one gzip bundle beside them and returns a
 `CollectOutcome`. `gunzip` on that file gives you the whole log as
 chronological JSON Lines — gzip is a multi-member format, so archives that are
@@ -212,17 +318,72 @@ already compressed are copied in byte for byte and the active file is
 compressed in beside them, on the writer's own queue and after a flush.
 
 ```ts
-import { FileDestination as FileDestination3, createFileSink as createFileSink3 } from 'react-native-nitro-logger';
+import { createFileDestination as createFileDestination3 } from 'react-native-nitro-logger';
 
-const supportable = new FileDestination3(createFileSink3());
+const supportable = createFileDestination3();
 const bundle = supportable.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
 
 if (bundle.complete && bundle.path !== '') {
-  // Upload `bundle.path`, then let the next purge or collect replace it.
+  // Upload `bundle.path`, then delete it — see below.
 } else if (bundle.complete) {
   // Nothing to send: this device has no logs.
 }
 ```
+
+**`deleteSupportBundle(deadlineMs?)` is the third step**, and the flow is
+**collect → upload → delete**. Skipping it leaves a gzipped copy of the whole
+log on the device until a `purge()` or the next collect replaces it — outside
+the retention budget `rotation` configures, and deliberately skipped by the
+native orphan sweep, which keeps a finished bundle precisely because somebody
+may still be uploading it. On a device holding regulated data that copy is the
+one artifact retention never reclaims, so a support flow that does not call this
+has to decide it is content to leave it there.
+
+```ts
+import { createFileDestination as createFileDestination4 } from 'react-native-nitro-logger';
+
+const uploader = createFileDestination4();
+const collected = uploader.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+
+if (collected.complete && collected.path !== '') {
+  // await upload(collected.path);
+  if (!uploader.deleteSupportBundle()) {
+    // Still there. Safe to call again — deleting a bundle that is already gone
+    // is `true`, not an error.
+  }
+}
+```
+
+It deletes the bundle and its staging leftovers, never a log file; this is not a
+smaller `purge()`. `true` means no bundle artifact remained when the call ran,
+**including vacuously** for a destination that never opened. That describes an
+instant and promises nothing about the next one: a collect started afterwards
+writes a new bundle, and sequencing the two is the caller's job.
+
+`false` is the whole of the rest, and deliberately not a list of causes: the
+deletion was refused, timed out, threw, or could not be *durably* confirmed
+gone. It does not assert that anything survived — a refusal establishes nothing
+about the directory — so read it as "assume a copy may still be there" and retry
+through a live, current destination.
+
+A fenced or disposed destination refuses, and `getLogFilePaths()` still
+answering after `dispose()` is **not** a precedent for doing otherwise: reading
+a directory this destination no longer owns is harmless, and deleting from one
+is not. Once the handle is gone there is no writer generation left to check, so
+another destination may own that path by now and be part-way through publishing
+into it — the `.support.gz` removed would be *its* bundle, whose path it has
+already handed to a caller. A fence says the same thing one step earlier.
+
+So **delete before disposing**, or through a fresh destination on the same path.
+Either gives a live handle on a current generation, which is what makes the
+deletion safe rather than merely willing. The generation is re-checked natively
+at the last instant before the unlinks, so a purge landing mid-call is caught
+too.
+
+A delete whose deadline expires is abandoned rather than left queued. Without
+that, a call that returned "I deleted nothing" could reach the front of the
+writer's queue seconds later and unlink a bundle a *subsequent* collect had just
+published and handed back the path of.
 
 `CollectForSupportOptions` is that argument object: `maxTotalBytes`, and an
 optional `deadlineMs` that defaults to 10s and bounds each of the two waits —
@@ -259,9 +420,94 @@ a gzipped copy of the log behind would not be a deletion. It is excluded from
 Nothing is uploaded and nothing is encrypted by this library. `docs/PRIVACY.md`
 records why both are the app's call.
 
-`FileDestinationOptions`, beyond the common `label`/`minimumLevel`/`formatter`:
-`path`, `rotation`, `maxEntryBytes`, `batchBytes`, `flushIntervalMs`,
-`maxPendingEntries`, `maxPendingBytes`, `watermarkBytes`.
+**The support flow is three steps, not two.**
+
+```ts
+import { createFileDestination } from 'react-native-nitro-logger';
+
+declare function uploadToSupport(path: string): Promise<void>;
+declare function scheduleSupportBundleRetry(): void;
+
+async function sendDiagnostics(file: ReturnType<typeof createFileDestination>) {
+  // 1. collect — a gzipped copy of the log, beside the log files.
+  const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+
+  try {
+    // 2. upload — yours. Nothing here transmits or encrypts. Only a complete
+    //    bundle is worth sending; an incomplete collect still has step 3.
+    if (bundle.complete && bundle.path !== '') {
+      await uploadToSupport(bundle.path);
+    }
+  } finally {
+    // 3. delete — in `finally`, because the failure paths are exactly the ones
+    //    that leave bytes behind. An incomplete collect can leave staging
+    //    artifacts, and a throwing upload skips everything after it.
+    if (!file.deleteSupportBundle()) {
+      // Assume a copy may still be there. Retrying is the response; ignoring
+      // it silently is how a gzipped log outlives the flow that made it.
+      scheduleSupportBundleRetry();
+    }
+  }
+}
+```
+
+Step 3 is not tidiness, and the `finally` is the part worth copying. Retention
+deliberately keeps a *finished* bundle, because the sweep cannot know whether an
+upload is still reading it — so a bundle nobody deletes sits outside the rotation
+budget the app configured, indefinitely, as a gzipped copy of the whole log. On a
+device holding regulated data that is the one artifact retention never comes back
+for.
+
+Which is why the paths that skip step 3 matter more than the happy one. A
+throwing upload and an early return on an incomplete collect are exactly the
+cases that leave bytes on disk: a collect that did not finish can still have
+written the `.part` and `.member` staging files, which hold log content, and
+`deleteSupportBundle` is what removes those too.
+
+Two ordering rules, both of which return `false` rather than guessing:
+
+- **Delete before `dispose()`.** A released handle no longer knows whether the
+  bundle at that path is still its own — another destination may have opened the
+  same directory and be mid-publish — so a disposed destination refuses.
+- **Sequence collect and delete yourself.** `true` means no bundle artifact
+  remained at the instant of the call. A collect started afterwards writes a new
+  one.
+
+`false` is deliberately not a list of causes — refused, timed out, threw, or
+absence could not be *durably* confirmed. Read it as "assume a copy may still be
+there" and retry rather than branching on why.
+
+**`FileDestinationOptions`, and what happens if you pass nothing.**
+
+Every option has a working default, and the defaults are worth reading rather
+than inferring — two of them decide behaviour people expect to be automatic.
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `label` | `'file'` | Identifies the destination in loss notices. |
+| `formatter` | `new JsonLinesFormatter()` | Line-framed, so crash-tail trimming is on. |
+| `path` | `<sink default dir>/app.log` | `noBackupFilesDir` on Android, `Library/Logs` on iOS. |
+| `minimumLevel` | none | Falls through to the logger's. |
+| `rotation` | **none** | No rotation, no retention, no size cap. See below. |
+| `maxEntryBytes` | 64 KiB | One entry over this is truncated, not dropped. |
+| `batchBytes` | 4 KiB | Soft target for one native `appendBatch`. |
+| `flushIntervalMs` | 100 ms | The timer that pushes a partial batch. |
+| `maxPendingEntries` | 1000 | Buffer ceiling by count; over it, records are dropped and counted. |
+| `maxPendingBytes` | 512 KiB | The same ceiling by size. |
+| `watermarkBytes` | 256 KiB | Backpressure point, below the ceiling. |
+
+**`rotation` defaulting to none is the one to notice.** Omit it and the file
+grows without bound: no size threshold, no archive count, no
+`maxTotalLogBytes`. That is deliberate — a library that silently started
+deleting an app's log data would be making a retention decision that belongs to
+the app — but it means a long-lived app that never configures rotation has a
+file that only `purge()` ever shortens. The Quick start passes a rotation block
+for that reason.
+
+The second is `maxEntryBytes`: an entry above it is **truncated to fit**, not
+discarded, and formatters that implement `formatWithin` are asked to do the
+truncation so the result is still valid for the format. A dropped entry is a
+different event with a different count.
 
 <!-- api: FileDestination, FileDestinationOptions, PurgeOutcome, CollectForSupportOptions, CollectOutcome -->
 
@@ -451,12 +697,11 @@ This is the timer that runs `FileDestination.maintain()` for you.
 
 ```ts
 import {
-  FileDestination as FileDestination2,
-  createFileSink as createFileSink2,
+  createFileDestination as createFileDestination2,
   scheduleMaintenance,
 } from 'react-native-nitro-logger';
 
-const maintained = new FileDestination2(createFileSink2());
+const maintained = createFileDestination2();
 const stopMaintenance = scheduleMaintenance({
   destination: maintained,
   intervalMs: 10 * 60 * 1000,
@@ -502,14 +747,42 @@ it: `maxFrames` and `bundleNames`, defaulting to the two constants below.
 
 ## Native sinks
 
-`createFileSink()` and `createNativeConsoleSink()` construct the Nitro hybrid
-objects. Call them once and hand the result to a destination; the destination
-owns the handle from then on and releases it on `dispose()`.
+`createFileDestination(options?)` and `createNativeConsoleDestination(options?)`
+are how you get a destination on the real native sink, and are what the samples
+above use. Each constructs the Nitro hybrid object and hands it to the
+destination, which owns the handle from then on and releases it on `dispose()`.
+Both throw rather than degrade: a missing native module, a failed open, or a
+config conflict with a writer already open on that path. A file destination
+that silently writes nowhere is worse than one that refuses to be built.
 
-`FileSink` and `NativeConsoleSink` are the Nitro interfaces. `FileSinkLike` and
-`NativeConsoleSinkLike` are structural equivalents, which is what lets tests
-drive a destination without a native runtime — and what lets you substitute
-your own implementation.
+The constructors stay public because a `FileSinkLike` double is how a
+destination is tested, and substituting your own implementation is a legitimate
+thing to want.
+
+`createFileSink()` and `createNativeConsoleSink()` build the raw sinks on their
+own. **They moved to `react-native-nitro-logger/unstable` in 0.3.0** and are no
+longer root exports — importing them from the root is now a build error naming
+the two lines to change. The separate entry point is a warning about
+stability, and it does not make
+them safe: a raw `clearLogs()` bumps the writer generation, which makes *every*
+`FileDestination` on that file stale — including ones the caller does not know
+about. Nothing notifies them. Each finds out when it next tries to write, has
+the append rejected as a stale generation, fences itself and loses that record;
+from then on it reports `isEnabled: false` until something calls `reopen()`.
+Purge through the destination when you have one.
+
+On **React Native 0.78 only**, importing from `/unstable` also needs
+`resolver.unstable_enablePackageExports: true` in `metro.config.js`: Metro 0.81
+ships with subpath exports off, and 0.82 — React Native 0.79 and up — turns
+them on. The root entry point is unaffected at every version. The
+[README](../README.md#unstable-needs-one-line-of-metro-config-on-react-native-078)
+has the measurements.
+
+`FileSink` and `NativeConsoleSink` are the Nitro interfaces, and moved to
+`/unstable` with the two factories. `FileSinkLike` and `NativeConsoleSinkLike`
+are structural equivalents that stay at the root — they are what lets tests drive a
+destination without a native runtime, and what you implement to substitute your
+own.
 
 `RotationConfig` requires `maxFileSizeBytes`, `maxArchivedFilesCount` and
 `compressArchives` — all three, since a rotation policy that left any of them
@@ -545,7 +818,7 @@ next process lock a fresh file and write alongside the first. It holds no log
 bytes. A filesystem that cannot lock raises the `exclusivity` bit and logging
 continues — refusing to log would be the worse answer.
 
-<!-- api: createFileSink, createNativeConsoleSink, FileSink, NativeConsoleSink, FileSinkLike, NativeConsoleSinkLike, RotationConfig, SinkStatus -->
+<!-- api: createFileDestination, createNativeConsoleDestination, createFileSink, createNativeConsoleSink, FileSink, NativeConsoleSink, FileSinkLike, NativeConsoleSinkLike, RotationConfig, SinkStatus -->
 
 ### Native call results
 
@@ -578,6 +851,38 @@ it, `BatchFlushOutcome` is what a flush reports, `LossCounts` is what went
 missing, and `FenceReason` (`'staleGeneration' | 'closed'`) says why it stopped
 accepting writes.
 
+`BatcherOptions.renderNotice` is **required**, and stays that way. A default
+would have to pick a format, and the only one available here is JSON Lines —
+which, written into a destination whose formatter is anything else, produces a
+file that no longer parses as what it claims to be. The notice is a record in
+the log, so only the owner knows how to spell one.
+
+`maxBatchBytes` (default 256 KiB) is the ceiling on a single handoff to the
+sink, distinct from `batchBytes` (default 4 KiB), which is the size at which a
+drain is *triggered*. The first bounds how much crosses the bridge in one call;
+the second decides when to make the call. A buffer that has grown past the
+trigger — because the sink was busy, or a burst outran it — is handed over in
+several bounded batches rather than one enormous one.
+
+`LossCounts.entries` is exact for what the pipeline accepted; it does not count
+a record handed to a fenced or disposed destination, which the `isEnabled`
+guard turns away before anything accepts responsibility for it.
+`LossCounts.bytes` is a **lower bound**: from 0.3.0 it counts the bytes of
+records that were rendered and then dropped, and a record turned away before
+rendering contributes `0`. That is the deliberate price of not formatting
+records the buffer has already refused — under sustained overload the count of
+lost entries stays right while their total size under-reports. Alert on
+`entries`.
+
+Being formatted is not being written, in either direction. Entries reach
+`LogFormatter.format` and still never reach the file — the buffer fills, the
+sink rejects the batch, the handle is fenced mid-flight — and entries are
+dropped by a level filter without arriving there at all. From 0.3.0 a full
+buffer skips the call too. **A formatter must not carry state that later
+records depend on**: one stamping a sequence number is numbering its own calls,
+not the file's lines, and those have never been the same sequence. Derive what
+a record says from the entry it is given.
+
 <!-- api: Batcher, BatchTarget, BatcherOptions, BatchFlushOutcome, LossCounts, FenceReason -->
 
 ### `utf8Length(text)`
@@ -589,6 +894,67 @@ agree with the sink about how large a payload is. Surrogate pairs count as the
 four bytes they encode to, not as the two code units JavaScript stores.
 
 <!-- api: utf8Length -->
+
+### `describeDegradation(mask)` and the `DEGRADED_*` bits
+
+`FileDestination.degradation()` returns a bitmask, which is the right thing to
+send across a bridge and an awkward thing to hold: `if (mask & 4)` is
+unreadable at the call site and unverifiable in review. `DEGRADED_ROTATION`,
+`DEGRADED_GZIP`, `DEGRADED_PRUNE`, `DEGRADED_SIDECAR`, `DEGRADED_PROTECTION`
+and `DEGRADED_EXCLUSIVITY` are those bits by name, matching the table above.
+
+`describeDegradation(mask)` turns one into a frozen array of the names set —
+`[]` for a healthy `0`, `['prune', 'exclusivity']` for `0x24`. Bits this build
+has no name for are ignored rather than reported: a newer native paired with an
+older JavaScript bundle can set one, and inventing `'bit6'` would put a string
+in a log line that means nothing to whoever reads it. Compare against the raw
+mask if you need to know that something unnamed is set.
+
+The output is payload-free by construction — six fixed literals, and no path,
+`errno` or filename can reach it — which is the same reason the natives report
+a mask instead of a message.
+
+```ts
+import {
+  Log as Logger6,
+  createFileDestination as createFileDestination6,
+  describeDegradation,
+} from 'react-native-nitro-logger';
+
+const watched = createFileDestination6();
+const problems = describeDegradation(watched.degradation());
+if (problems.length > 0) {
+  Logger6.warning('logging degraded', { degraded: problems.join(',') }, 'diagnostics');
+}
+```
+
+<!-- api: describeDegradation, DEGRADED_ROTATION, DEGRADED_GZIP, DEGRADED_PRUNE, DEGRADED_SIDECAR, DEGRADED_PROTECTION, DEGRADED_EXCLUSIVITY -->
+
+### `levelAtLeast(level, minimum)`, `LEVEL_ORDER` and `PRIVATE_PLACEHOLDER`
+
+The three things a custom `LogDestination` cannot implement without. A
+destination that filters by severity has to compare two `LogLevel`s, which are
+strings — `'warning' >= 'error'` is a lexicographic answer to a question nobody
+asked. `LEVEL_ORDER` maps each level to the numeric severity that also crosses
+the bridge, and `levelAtLeast(level, minimum)` is the comparison itself.
+`PRIVATE_PLACEHOLDER` is the exact string (`<private>`) that redaction
+substitutes for a value, exported so a destination can recognise it — to count
+redactions, or render them differently — without transcribing the literal and
+drifting from it.
+
+It does **not** tell you a field was redacted. By the time an entry reaches a
+destination the placeholder is an ordinary string, indistinguishable from one a
+caller set to that same text on purpose, and nothing in `LogEntry` records which
+it was. That is a property of the design rather than an oversight: the payload
+is gone, not hidden, so there is nothing left to carry the provenance.
+
+Deliberately **not** exported: `LEVEL_TAG` and `LEVEL_NAME`. Those are the
+fixed-width tags and uppercase names the formatters emit for byte-parity with
+SwiftLogger. They are a wire format that happens to live in the same file, not
+API, and exporting them would invite a consumer to depend on bytes this package
+has promised to a different project.
+
+<!-- api: levelAtLeast, LEVEL_ORDER, PRIVATE_PLACEHOLDER -->
 
 ---
 
@@ -608,11 +974,21 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `CollectForSupportOptions`
 - `CollectOutcome`
 - `ConsoleDestination`
+- `createFileDestination`
 - `createFileSink`
+- `createNativeConsoleDestination`
 - `createNativeConsoleSink`
 - `DEFAULT_BUNDLE_NAMES`
 - `DEFAULT_MAX_FRAMES`
 - `DefaultFormatter`
+- `DEGRADED_EXCLUSIVITY`
+- `DEGRADED_GZIP`
+- `DEGRADED_PROTECTION`
+- `DEGRADED_PRUNE`
+- `DEGRADED_ROTATION`
+- `DEGRADED_SIDECAR`
+- `describeDegradation`
+- `DestinationStatus`
 - `DROPPED_COUNT_KEY`
 - `ERROR_METADATA_KEYS`
 - `ErrorHandlerOptions`
@@ -631,6 +1007,8 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `JsonLinesFormatterOptions`
 - `JsonTimestampStyle`
 - `LazyMessage`
+- `LEVEL_ORDER`
+- `levelAtLeast`
 - `Log`
 - `LogDestination`
 - `LogEntry`
@@ -653,6 +1031,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NON_ERROR_THROWN`
 - `priv`
 - `PrivacyDefault`
+- `PRIVATE_PLACEHOLDER`
 - `PrivateValue`
 - `pub`
 - `PublicValue`
@@ -673,6 +1052,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `scheduleMaintenance`
 - `ScheduleMaintenanceOptions`
 - `ScopedLogger`
+- `ScopedLogOptions`
 - `SinkStatus`
 - `UNCAUGHT_ERROR_MESSAGE`
 - `UNHANDLED_REJECTION_MESSAGE`

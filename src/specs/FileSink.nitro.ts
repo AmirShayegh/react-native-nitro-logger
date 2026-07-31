@@ -9,17 +9,17 @@ import type { HybridObject } from 'react-native-nitro-modules';
  */
 export interface RotationConfig {
   /** Soft threshold; overshoot bounded by one batch. */
-  maxFileSizeBytes: number;
+  readonly maxFileSizeBytes: number;
   /** Archives to retain by count; 0 keeps none. */
-  maxArchivedFilesCount: number;
+  readonly maxArchivedFilesCount: number;
   /** Rotate the current file once this old, regardless of size. */
-  maxFileAgeSeconds?: number;
+  readonly maxFileAgeSeconds?: number;
   /** Gzip archives as they rotate out. */
-  compressArchives: boolean;
+  readonly compressArchives: boolean;
   /** Delete archives older than this even if under the count cap. */
-  maxArchiveAgeSeconds?: number;
+  readonly maxArchiveAgeSeconds?: number;
   /** Bound on current file + all archives combined. */
-  maxTotalLogBytes?: number;
+  readonly maxTotalLogBytes?: number;
 }
 
 /** Why an appendBatch was not accepted. */
@@ -36,39 +36,39 @@ export type RejectReason = 'full' | 'staleGeneration' | 'closed' | 'failed';
  * durably flushed.
  */
 export interface SinkStatus {
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
   /** Payload-free degradation bitmask: rotation|gzip|prune|sidecar|protection|exclusivity. */
-  degraded: number;
+  readonly degraded: number;
 }
 
 export interface AppendResult {
-  accepted: boolean;
+  readonly accepted: boolean;
   /** Present only when accepted is false. */
-  rejectReason?: RejectReason;
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
-  degraded: number;
+  readonly rejectReason?: RejectReason;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
+  readonly degraded: number;
 }
 
 export interface FlushOutcome {
   /** True when every previously accepted byte reached storage and fsync. */
-  durable: boolean;
-  timedOut: boolean;
-  pendingBytes: number;
-  queuedBytes: number;
-  lostBytes: number;
-  lostEntries: number;
-  degraded: number;
+  readonly durable: boolean;
+  readonly timedOut: boolean;
+  readonly pendingBytes: number;
+  readonly queuedBytes: number;
+  readonly lostBytes: number;
+  readonly lostEntries: number;
+  readonly degraded: number;
 }
 
 export interface ClearOutcome {
-  deletedCount: number;
-  failedPaths: string[];
+  readonly deletedCount: number;
+  readonly failedPaths: readonly string[];
   /** False when any artifact survived or the deadline elapsed. */
-  durable: boolean;
+  readonly durable: boolean;
   /**
    * Whether the writer came back with a usable file afterwards.
    *
@@ -83,7 +83,7 @@ export interface ClearOutcome {
    * is genuinely complete — which is what a compliance caller asked — but the
    * destination must stay fenced until an explicit retry gets a live file back.
    */
-  rebound: boolean;
+  readonly rebound: boolean;
 }
 
 /**
@@ -103,11 +103,11 @@ export interface CollectOutcome {
    * write-a-file-here primitive is not what a support flow needs and is a
    * much larger thing to have to defend.
    */
-  path: string;
+  readonly path: string;
   /** Size of the bundle on disk. Zero when `path` is empty. */
-  byteCount: number;
+  readonly byteCount: number;
   /** How many log files went in. */
-  sourceFileCount: number;
+  readonly sourceFileCount: number;
   /**
    * Some log files were left out.
    *
@@ -117,7 +117,7 @@ export interface CollectOutcome {
    * `getLogFilePaths().length`, not by a reason string that would have to
    * name a path.
    */
-  truncated: boolean;
+  readonly truncated: boolean;
   /**
    * The collect ran to the end of what it set out to do.
    *
@@ -126,7 +126,7 @@ export interface CollectOutcome {
    * was nothing to collect, which is a different answer from a failure and
    * one a support flow should not report as an error.
    */
-  complete: boolean;
+  readonly complete: boolean;
 }
 
 /**
@@ -154,6 +154,14 @@ export interface FileSink extends HybridObject<{
    * intentional one, and trimming would destroy good data. Absent — the
    * default for a custom formatter that does not declare `framing: 'line'` —
    * the file is left exactly as the crash left it and recovery is reduced.
+   *
+   * Returns once the file is open and any torn trailing record has been
+   * trimmed. The retention sweep is *queued*, not awaited: a `getStatus()`
+   * taken immediately afterwards can still report the state from before the
+   * sweep ran, so a clean `degraded` here does not mean retention succeeded.
+   * The sweep runs unbounded directory I/O — listing, pruning by age, by count
+   * and by total size — and waiting for it would make every open block on a
+   * backlog the caller has no way to bound.
    */
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
 
@@ -242,6 +250,39 @@ export interface FileSink extends HybridObject<{
    * would be no purge at all.
    */
   collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
+
+  /**
+   * Deletes the bundle `collectLogs` produced, and its staging leftovers.
+   *
+   * The third step of a support flow: collect, upload, delete. Without it the
+   * bundle stays on the device until a purge or the next collect replaces it —
+   * a gzipped copy of the whole log, outside the retention budget the app
+   * configured, and deliberately skipped by the orphan sweep because a
+   * FINISHED bundle is one somebody may still be uploading.
+   *
+   * Exactly the three support names and never a log file. This is not a purge
+   * and must not become a smaller, quieter one; `clearLogs` deletes these as
+   * well, along with everything else.
+   *
+   * `true` means no bundle artifact remained when this ran, including
+   * vacuously for a sink that never opened and has no directory to look in.
+   * That is a statement about an instant, not a promise about the next one: a
+   * collect starting afterwards — or one already in flight when this landed —
+   * legitimately writes a new bundle, and the caller sequences the two.
+   *
+   * `false` is the whole of the rest, and deliberately not a list of causes:
+   * the deletion was refused, timed out, or could not be *durably* confirmed
+   * gone. It does not assert that anything survived — a refusal establishes
+   * nothing about the directory — so the bundle should be assumed still there.
+   *
+   * Queue-bound on the writer while a handle is live, so it cannot land inside
+   * a collect's rename. A closed sink still deletes — closing releases a
+   * writer, it does not delete files, and an upload finishing after the
+   * destination went away is exactly when this gets called — but with no queue
+   * to reach, that path is best-effort in the way `getLogFilePaths` already is
+   * for a closed sink.
+   */
+  deleteSupportBundle(deadlineMs: number): boolean;
 
   /**
    * Registry-serialized purge of the COMPLETE artifact set (current file,

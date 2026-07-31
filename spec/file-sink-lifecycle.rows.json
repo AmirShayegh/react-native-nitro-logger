@@ -1,0 +1,188 @@
+{
+  "$comment": [
+    "The no-handle answer table, shared by all three test targets.",
+    "",
+    "Every row is a question asked of a file sink that has NO live handle, which",
+    "is the whole of FileSinkLifecycle's no-handle contract. The two modes differ",
+    "on exactly one bit -- whether files may exist -- and every answer below is",
+    "derived from it. Four of these rows once disagreed across the three",
+    "implementations, and none of the disagreements was reachable through",
+    "FileDestination, which short-circuits first. That is why they survived, and",
+    "why the answers now live in one file instead of three suites.",
+    "",
+    "Loaded by:",
+    "  __tests__/fileSinkLifecycleRows.test.ts        (require)",
+    "  swift-tests/.../FileSinkLifecycleRowsTests.swift  (#filePath walk-up)",
+    "  android/src/test/.../FileSinkLifecycleRowsTest.kt (repoRoot system property)",
+    "",
+    "Values are strings on purpose. Three languages have three opinions about",
+    "how a number, a boolean and an absent field compare; a string does not.",
+    "Each loader renders the real answer's fields to strings and compares those,",
+    "so a row reads the same in all three and a failure prints the same in all",
+    "three.",
+    "",
+    "## Adding a row or a field",
+    "",
+    "Adding either makes all three suites RED until each implements it. That is",
+    "the point of the file: an unmatched op is a failure and never a skip, and a",
+    "field a dispatcher produces but the table does not name is also a failure,",
+    "so the table cannot silently under-assert. See each loader's guard block.",
+    "",
+    "## What this does NOT prove",
+    "",
+    "That the shipped adapters answer this way. Until the FileSinkAnswers",
+    "extraction lands, the native dispatchers derive their answers from",
+    "FileSinkLifecycle the way HybridFileSink/HybridFileSink.kt do, rather than",
+    "executing those files -- which no unit test on either platform can reach.",
+    "The table pins the contract; it does not yet pin the adapter."
+  ],
+  "modes": ["neverOpened", "openedThenClosed"],
+  "modeMeaning": {
+    "neverOpened": "no handle, and nothing can exist yet: vacuous success is honest",
+    "openedThenClosed": "no handle, and files may exist: vacuous success is a lie"
+  },
+  "rows": [
+    {
+      "op": "appendBatch",
+      "why": "Refused as closed either way. The status fields are zeroed rather than the last ones the handle reported -- there is no handle to ask, and a stale queuedBytes reads as backlog that no flush can ever drain.",
+      "neverOpened": {
+        "accepted": "false",
+        "rejectReason": "closed",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      },
+      "openedThenClosed": {
+        "accepted": "false",
+        "rejectReason": "closed",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      }
+    },
+    {
+      "op": "getStatus",
+      "why": "Zeroed, both modes. Loss counters belong to a handle; reporting the closed handle's would charge this sink for entries it no longer owns, and reporting them repeatedly would charge it twice.",
+      "neverOpened": {
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      },
+      "openedThenClosed": {
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      }
+    },
+    {
+      "op": "maintain",
+      "why": "Same zeroed status, and the sweep must not run. Maintenance belongs to whoever holds the writer now; a closed sink that still prunes deletes another handle's archives.",
+      "neverOpened": {
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      },
+      "openedThenClosed": {
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      }
+    },
+    {
+      "op": "collectLogs",
+      "why": "complete=true is the row that matters, and it is true in both modes. A support flow that read a no-handle collect as a failure would show an error to a user whose app simply has no logs yet.",
+      "neverOpened": {
+        "path": "",
+        "byteCount": "0",
+        "sourceFileCount": "0",
+        "complete": "true",
+        "truncated": "false"
+      },
+      "openedThenClosed": {
+        "path": "",
+        "byteCount": "0",
+        "sourceFileCount": "0",
+        "complete": "true",
+        "truncated": "false"
+      }
+    },
+    {
+      "op": "flush",
+      "why": "The first row that splits on the bit. Nothing was ever accepted by a sink that never opened, so there is nothing to vouch for and durable is honest. A closed sink cannot vouch for bytes it handed to a writer it no longer holds.",
+      "neverOpened": {
+        "durable": "true",
+        "timedOut": "false",
+        "pendingBytes": "0",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      },
+      "openedThenClosed": {
+        "durable": "false",
+        "timedOut": "false",
+        "pendingBytes": "0",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      }
+    },
+    {
+      "op": "close",
+      "why": "Idempotent, and a repeat close answers what the first one did. A second close that reported durable=true over the first one's false would let a caller retry its way to a success that never happened.",
+      "neverOpened": {
+        "durable": "true",
+        "timedOut": "false",
+        "pendingBytes": "0",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      },
+      "openedThenClosed": {
+        "durable": "false",
+        "timedOut": "false",
+        "pendingBytes": "0",
+        "queuedBytes": "0",
+        "lostBytes": "0",
+        "lostEntries": "0",
+        "degraded": "0"
+      }
+    },
+    {
+      "op": "clearLogs",
+      "why": "Nothing was attempted, so nothing failed: a failedPath here reports a deletion failure for a file no one tried to delete. durable splits on the bit -- this is the compliance answer, and claiming it over surviving files is the whole reason the bit exists.",
+      "neverOpened": {
+        "deletedCount": "0",
+        "failedPathCount": "0",
+        "durable": "true",
+        "rebound": "false"
+      },
+      "openedThenClosed": {
+        "deletedCount": "0",
+        "failedPathCount": "0",
+        "durable": "false",
+        "rebound": "false"
+      }
+    },
+    {
+      "op": "deleteSupportBundle",
+      "why": "Reads the same bit as clearLogs, and deliberately not artifactSource(): a sink that opened and closed knows where its bundle would be but cannot confirm it is gone, and true there deletes the caller's obligation to retry.",
+      "neverOpened": { "deleted": "true" },
+      "openedThenClosed": { "deleted": "false" }
+    },
+    {
+      "op": "getLogFilePaths",
+      "why": "Closing releases a handle; it does not delete files, and the paths have to keep coming back. An empty list from a closed sink tells a support-upload flow there is nothing to collect over logs still sitting on the device.",
+      "neverOpened": { "pathCount": "0" },
+      "openedThenClosed": { "pathCount": "1" }
+    }
+  ]
+}

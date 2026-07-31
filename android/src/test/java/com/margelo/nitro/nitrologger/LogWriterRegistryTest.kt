@@ -13,6 +13,8 @@ import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -36,12 +38,16 @@ class LogWriterRegistryTest {
    * compares it against the creation time the filesystem stamps: a clock fixed
    * in the past makes every file look like it was created in the future, and
    * nothing ever ages.
+   *
+   * Atomic for the reason `LogFileWriterTest`'s twin is: the test thread
+   * advances it and the writer thread reads it, with no happens-before edge
+   * between them.
    */
-  private var now = System.currentTimeMillis()
+  private val now = AtomicLong(System.currentTimeMillis())
 
   @Before
   fun setUp() {
-    now = System.currentTimeMillis()
+    now.set(System.currentTimeMillis())
     directory = File.createTempFile("nitro-registry-test", "").let {
       it.delete()
       File(it.absolutePath + "-dir").apply { mkdirs() }
@@ -67,14 +73,16 @@ class LogWriterRegistryTest {
     policy: LogRotationPolicy = LogRotationPolicy.of(),
     lineFramed: Boolean = true,
     owner: Long? = null,
-    rawWrite: LogFileWriter.RawWrite? = null
+    rawWrite: LogFileWriter.RawWrite? = null,
+    compressor: LogFileWriter.Compressor? = null
   ): LogFileHandle = registry.acquire(
     path = path,
     policy = policy,
     lineFramed = lineFramed,
     platform = PlatformIo.Jvm,
     rawWrite = rawWrite,
-    clock = { now },
+    compressor = compressor,
+    clock = { now.get() },
     owner = owner
   ).also { handles.add(it) }
 
@@ -236,6 +244,47 @@ class LogWriterRegistryTest {
     assertFalse(outcome.rebound)
   }
 
+  // `failedPaths` means "still there, as far as this call can tell", and a
+  // refusal deleted nothing — so the log file qualifies. iOS returned an empty
+  // array here through 0.2.0 while its own writer-level refusals named the path;
+  // this is the anchor for the side that was already right.
+  @Test
+  fun `a refused purge names the file it did not delete`() {
+    val handle = acquire(File(directory, "app.log").absolutePath)
+    // The writer's own answer, not the string this test passed in: acquisition
+    // resolves the path through realpath, and on macOS the temp directory
+    // arrives under `/var` and comes back under `/private/var`.
+    val resolved = handle.filePath
+    handle.close(1000.0)
+
+    val outcome = handle.clearLogs(1000.0)
+    assertFalse(outcome.durable)
+    assertEquals(0, outcome.deletedCount)
+    assertEquals(listOf(resolved), outcome.failedPaths)
+  }
+
+  // The claim has to come back even when the barrier dies. `closeCurrentStream`
+  // catches Exception, not Throwable, so an Error escaping it used to strand
+  // `closing[path]` for the life of the process — every later open on that path
+  // refused, with the disk perfectly healthy.
+  @Test
+  fun `a close whose barrier throws still frees the path`() {
+    val path = File(directory, "app.log").absolutePath
+    val first = acquire(path)
+    first.writerForTesting.closeFaultForTesting = { throw AssertionError("barrier fault") }
+
+    first.close(1000.0)
+
+    assertEquals(
+      "the Error must not have taken the path's claim with it",
+      0,
+      registry.closingCountForTesting
+    )
+    val second = acquire(path)
+    assertNotSame(first, second)
+    assertTrue(second.appendBatch("fresh\n", 1).accepted)
+  }
+
   // The close budget is one budget, not one per wait.
   @Test
   fun `close spends a single budget across every wait it does`() {
@@ -333,7 +382,7 @@ class LogWriterRegistryTest {
     keeper.flush(1000.0)
 
     released.close(1000.0)
-    now += 61_000
+    now.addAndGet(61_000)
 
     // The control: the file is old enough to rotate, and a live handle would
     // rotate it — the assertion below is about who is asking, not about whether
@@ -697,5 +746,121 @@ class LogWriterRegistryTest {
 
     assertEquals(1, registry.liveWriterCountForTesting)
     assertTrue(unowned.appendBatch("still here\n", 1).accepted)
+  }
+
+  // MARK: - Collect, at the handle
+
+  /**
+   * The per-handle flag: a second collect on the SAME handle is refused locally,
+   * without touching the writer.
+   *
+   * The observable is time, not the outcome. Both a refusal here and a refusal
+   * at the writer's own gate return the same `NOTHING`; what separates them is
+   * that this one costs nothing. Without the flag the second call would flush,
+   * then sit on the writer's gate for the whole five seconds it was given before
+   * reporting the same thing.
+   */
+  @Test
+  fun `a second collect on one handle is refused`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val handle = acquire(
+      File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0),
+      compressor = LogFileWriter.Compressor { source, destination ->
+        inCompressor.countDown()
+        held.await()
+        source.copyTo(destination, overwrite = true)
+        true
+      }
+    )
+    assertTrue(handle.appendBatch("precious\n", 1).accepted)
+    handle.flush(1000.0)
+
+    val first = AtomicReference<LogCollectOutcome>()
+    val firstThread = Thread { first.set(handle.collectLogs(10_000.0, 10_000_000.0)) }
+    try {
+      firstThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      // Insurance against the mutation: if the bound under test were removed the
+      // test thread would block before reaching its own countDown, and the suite
+      // would hang instead of failing. Fires long after a passing run is done.
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      val second = handle.collectLogs(5000.0, 10_000_000.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertFalse(second.complete)
+      assertEquals("", second.path)
+      assertTrue(
+        "the second collect on this handle spent its deadline discovering it had lost",
+        elapsedMs < 1_000
+      )
+    } finally {
+      held.countDown()
+    }
+
+    firstThread.join(10_000)
+    assertTrue(first.get().complete)
+  }
+
+  /**
+   * The deliberate asymmetry: [LogFileHandle.close] waits out a purge and does
+   * **not** wait out a collect.
+   *
+   * A purge is waited for because tearing the writer down mid-deletion leaves
+   * the fresh file missing. A collect only reads logs and writes its own
+   * scratch, and being abandoned is already a first-class, tested outcome — so a
+   * third wait on close's budget would buy nothing and cost teardown latency,
+   * which on the JS side is a dispose that blocks the runtime.
+   *
+   * What this does not prove: that close never waits at all. A *bounded* wait
+   * added to close would still satisfy this; only an unbounded one shows up, and
+   * it shows up as a hung run rather than a red one.
+   */
+  @Test
+  fun `a collect in flight does not delay the handle close`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val handle = acquire(
+      File(directory, "app.log").absolutePath,
+      policy = LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0),
+      compressor = LogFileWriter.Compressor { source, destination ->
+        inCompressor.countDown()
+        held.await()
+        source.copyTo(destination, overwrite = true)
+        true
+      }
+    )
+    assertTrue(handle.appendBatch("precious\n", 1).accepted)
+    handle.flush(1000.0)
+
+    val collectThread = Thread { handle.collectLogs(10_000.0, 10_000_000.0) }
+    try {
+      collectThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      releaseAfter(held, 3_000)
+
+      val began = System.nanoTime()
+      handle.close(50.0)
+      val elapsedMs = (System.nanoTime() - began) / 1_000_000
+
+      assertTrue(
+        "close waited out a collect it deliberately does not wait for",
+        elapsedMs < 2_000
+      )
+    } finally {
+      held.countDown()
+    }
+    collectThread.join(10_000)
+  }
+
+  /** Opens [latch] from a daemon thread after [millis]. */
+  private fun releaseAfter(latch: CountDownLatch, millis: Long) {
+    Thread {
+      Thread.sleep(millis)
+      latch.countDown()
+    }.apply { isDaemon = true }.start()
   }
 }

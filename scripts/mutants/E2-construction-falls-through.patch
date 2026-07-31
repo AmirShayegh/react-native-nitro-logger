@@ -1,0 +1,13 @@
+diff --git a/eslint-plugin/shared.js b/eslint-plugin/shared.js
+index da767bc..c034fea 100644
+--- a/eslint-plugin/shared.js
++++ b/eslint-plugin/shared.js
+@@ -1622,7 +1622,7 @@ function classifyReceiver(context, node, seen = new Set()) {
+         // provenance: what comes out of an opaque factory may behave like the
+         // singleton, but nothing here establishes that it IS the singleton,
+         // and correlation provenance must not assume it.
+-        if (unwrap(init)?.type === 'NewExpression') return null;
++
+       }
+ 
+       // A parameter, or a binding we cannot pin down. The name is a hint,

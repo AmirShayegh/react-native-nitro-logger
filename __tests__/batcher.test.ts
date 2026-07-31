@@ -469,8 +469,17 @@ describe('Batcher — fencing', () => {
     batcher.add('a');
     batcher.flush(1000);
 
+    const before = batcher.unreported();
     batcher.add('b');
     expect(batcher.bufferedBytes()).toBe(0);
+
+    // Both halves of the title, and the second is the one an empty buffer
+    // cannot show: a record thrown away without being counted leaves
+    // `bufferedBytes` at zero exactly as a counted one does. What separates
+    // silent loss from reported loss is this delta, so it is what to assert.
+    const after = batcher.unreported();
+    expect(after.entries - before.entries).toBe(1);
+    expect(after.bytes - before.bytes).toBe(2); // 'b' and its newline
   });
 });
 
@@ -873,5 +882,335 @@ describe('Batcher — conservation', () => {
 
   test.each([1, 7, 42, 1337, 90210])('holds under fault seed %i', (seed) => {
     conserves(seed);
+  });
+});
+
+/**
+ * `add(record, bytes)` and `add(record)` must be the same call.
+ *
+ * The second argument is an optimisation: the caller that rendered a record
+ * has already measured it, and letting the batcher measure it again is a
+ * second full pass over every record that reaches the file. An optimisation
+ * that changes an answer is a bug, so every assertion here is a differential
+ * one — the same input driven both ways, compared on what the batcher does
+ * rather than on what it was told.
+ *
+ * ## What these do NOT prove
+ *
+ * **That it is faster.** Nothing here times anything. The claim being defended
+ * is only that taking the shortcut cannot change the outcome; whether the
+ * shortcut is worth taking is a judgement about how often `write` runs, not
+ * something a test can settle.
+ */
+describe('Batcher.add — a caller-supplied byte count', () => {
+  /** Everything observable about a batcher after the same records went in. */
+  function drive(
+    texts: readonly string[],
+    supply: (text: string) => number | undefined
+  ) {
+    const { batcher, sink, writer } = build({ batchBytes: 1024 });
+    for (const text of texts) batcher.add(text, supply(text));
+    const buffered = batcher.bufferedBytes();
+    batcher.flush(1000);
+    return {
+      buffered,
+      lines: writer.lines(),
+      unreported: batcher.unreported(),
+      appended: sink.appendCalls.map((call) => call.entryCount),
+    };
+  }
+
+  const CORPUS = [
+    'plain ascii record',
+    '',
+    'a',
+    'naïve café résumé',
+    '日本語のログ',
+    '🙂 emoji at the front',
+    'emoji at the back 🙂',
+    'a🙂b',
+    // A lone high surrogate: three bytes, and the character after it still
+    // counts. This is the input a naive counter gets wrong.
+    'torn \ud83d tail',
+    '\ude42 lone low',
+    `${'x'.repeat(2000)}🙂`,
+  ];
+
+  test('supplying the count changes nothing about the outcome', () => {
+    const measured = drive(CORPUS, (text) => utf8Length(text));
+    const unmeasured = drive(CORPUS, () => undefined);
+    expect(measured).toEqual(unmeasured);
+  });
+
+  test('a count that cannot be a length at all is recomputed', () => {
+    // Note what this does NOT say: that a wrong count is caught. `add(r, 1)`
+    // for a ten-byte record is trusted, and has to be — detecting it would
+    // mean measuring, which is the whole thing being avoided. What the guard
+    // rejects is a value that is not a length in the first place, so nonsense
+    // cannot propagate into the pending total from a mis-typed call site.
+    const honest = drive(CORPUS, () => undefined);
+    for (const impossible of [
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 2,
+    ]) {
+      expect(drive(CORPUS, () => impossible)).toEqual(honest);
+    }
+  });
+
+  test('a count of zero is honoured, because zero is a real length', () => {
+    // The guard rejects what is not a usable count. Zero IS one — an empty
+    // record is a newline — so it must not be swept up with the nonsense
+    // above and silently recomputed.
+    const { batcher } = build({ batchBytes: 1024 });
+    batcher.add('', 0);
+    expect(batcher.bufferedBytes()).toBe(1);
+  });
+
+  test('a dropped record is still counted with the supplied size', () => {
+    const { batcher } = build({ maxPendingBytes: 8, batchBytes: 1024 });
+    const text = '🙂🙂🙂🙂'; // 16 bytes, over the pending cap
+    batcher.add(text, utf8Length(text));
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 17 });
+
+    const other = build({ maxPendingBytes: 8, batchBytes: 1024 });
+    other.batcher.add(text);
+    expect(other.batcher.unreported()).toEqual(batcher.unreported());
+  });
+});
+
+/**
+ * What a nonsense option does, and what an absent one does.
+ *
+ * Every numeric option goes through one guard that takes anything not a
+ * finite positive number and substitutes the default. Nothing exercised it,
+ * which mattered most in one direction: a cap of `0` — from a config file, a
+ * division, a `parseInt` of an empty string — would otherwise be honoured, and
+ * a batcher whose pending cap is zero accepts no records at all. Logging would
+ * stop, silently, and the loss counters would be the only sign.
+ */
+describe('Batcher — option validation', () => {
+  /** A batcher with a working buffer accepts a record; a broken one does not. */
+  function accepts(overrides: Partial<BatcherOptions>): boolean {
+    const { batcher } = build({ batchBytes: 1024, ...overrides });
+    batcher.add(record(10));
+    return batcher.bufferedBytes() > 0;
+  }
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('a %s pending-entry cap falls back to the default', (_name, value) => {
+    // Infinity is in here for a different reason from the rest: it is not a
+    // usable cap either, and accepting it would remove the bound entirely
+    // rather than disable the buffer.
+    expect(accepts({ maxPendingEntries: value })).toBe(true);
+  });
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+  ])('a %s pending-byte cap falls back to the default', (_name, value) => {
+    expect(accepts({ maxPendingBytes: value })).toBe(true);
+  });
+
+  test('a fractional cap is floored rather than rejected', () => {
+    // 2.9 is a usable count, unlike the values above — it is just not an
+    // integer. Flooring keeps the caller's intent; falling back to 1000 would
+    // discard a bound they asked for.
+    const { batcher } = build({ maxPendingEntries: 2.9, batchBytes: 100_000 });
+    batcher.add(record(1));
+    batcher.add(record(1));
+    batcher.add(record(1));
+
+    // The third is refused, so the cap was 2 and not 3.
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 2 });
+  });
+
+  test('the defaults are the documented ones', () => {
+    const { batcher, sink } = build({
+      batchBytes: undefined,
+      flushIntervalMs: undefined,
+      watermarkBytes: undefined,
+    });
+
+    // 4096 is the documented batch threshold. 40 records of 101 bytes is
+    // 4040 — under it — and the forty-first crosses.
+    for (let i = 0; i < 40; i += 1) batcher.add(record(100));
+    expect(sink.appendCalls).toHaveLength(0);
+    batcher.add(record(100));
+    expect(sink.appendCalls).toHaveLength(1);
+  });
+});
+
+/**
+ * Sink counters are monotonic per handle, and this is what happens when one
+ * says otherwise.
+ *
+ * The sink is across a bridge. A counter that goes backwards, arrives
+ * negative, or arrives as `NaN` is a bug somewhere this code cannot see, and
+ * the batcher's job is to stay arithmetically sane rather than to trust it —
+ * a delta driven negative would cancel a real loss and a notice that was owed
+ * would never be written.
+ */
+describe('Batcher — hostile sink counters', () => {
+  test('a counter that goes backwards does not shrink a loss already seen', () => {
+    const { batcher, sink, writer } = build({ batchBytes: 1024 });
+    writer.injectLoss(sink.id, 5, 500);
+    batcher.observeStatus(sink.getStatus());
+    expect(batcher.unreported()).toEqual({ entries: 5, bytes: 500 });
+
+    // The sink now claims it only ever lost one. Nothing acknowledged the five
+    // — no notice has been written — so this is a live loss being revised
+    // downwards, and the maximum-seen rule is what refuses the revision.
+    //
+    // Deliberately observed while the loss is still owed rather than after a
+    // notice settles it: once it is acknowledged, `delta()`'s own `Math.max(0,
+    // …)` floors the result at zero either way, and a test written that way
+    // cannot tell the two rules apart — which is how the first draft of this
+    // one passed against a plain assignment.
+    sink.hostileStatus = { lostEntries: 1, lostBytes: 100 };
+    batcher.observeStatus(sink.getStatus());
+
+    expect(batcher.unreported()).toEqual({ entries: 5, bytes: 500 });
+  });
+
+  test('NaN and negative counters are read as zero, not propagated', () => {
+    const { batcher, sink } = build({ batchBytes: 1024 });
+    sink.hostileStatus = {
+      lostEntries: Number.NaN,
+      lostBytes: -50,
+      degraded: Number.NaN,
+    };
+
+    batcher.add(record(10));
+    batcher.flush(1000);
+
+    // A NaN that reached the counters would make every later comparison false
+    // and every reported number NaN — including the one an app alerts on.
+    expect(batcher.unreported()).toEqual({ entries: 0, bytes: 0 });
+    expect(batcher.degradation()).toBe(0);
+  });
+});
+
+/**
+ * Every threshold in this class, met exactly.
+ *
+ * The tests above approach each cap from a comfortable distance — 84 against
+ * 64, 300 against 256 — which proves the comparison exists and says nothing
+ * about which side of it the boundary value falls on. `>=` and `>` differ on
+ * one input each, and that input is not exotic: a caller sizing records to a
+ * documented limit, or a sink whose queue lands precisely on the watermark,
+ * produces it on an ordinary day. Each case below is paired with its
+ * neighbour so the assertion pins a boundary rather than a direction.
+ */
+describe('Batcher — thresholds met exactly', () => {
+  test('the buffer fills to its entry cap and refuses the next record', () => {
+    const { batcher } = build({ maxPendingEntries: 3, batchBytes: 1_000_000 });
+
+    batcher.add('a');
+    batcher.add('b');
+    batcher.add('c');
+    expect(batcher.bufferedBytes()).toBe(6); // 3 × (1 + newline)
+    expect(batcher.unreported().entries).toBe(0);
+
+    batcher.add('d');
+    expect(batcher.bufferedBytes()).toBe(6);
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 2 });
+  });
+
+  test('the byte cap is exclusive, so a record filling it exactly is kept', () => {
+    // The twin of the entry cap and deliberately the other comparison: an
+    // entry cap counts what is already there, a byte cap counts what would be
+    // there afterwards. Filling a buffer to its stated size is not overflowing
+    // it, and dropping that record would make the documented capacity a lie.
+    const { batcher } = build({ maxPendingBytes: 21, batchBytes: 1_000_000 });
+
+    batcher.add(record(20)); // exactly 21 bytes with its newline
+    expect(batcher.bufferedBytes()).toBe(21);
+    expect(batcher.unreported().entries).toBe(0);
+
+    batcher.add('x'); // 2 more would be 23
+    expect(batcher.bufferedBytes()).toBe(21);
+    expect(batcher.unreported().entries).toBe(1);
+  });
+
+  test('a buffer landing exactly on batchBytes pushes without waiting', () => {
+    const { batcher, sink } = build({ batchBytes: 21 });
+
+    batcher.add(record(20)); // 21 bytes: the threshold, met not passed
+    expect(sink.appendCalls).toHaveLength(1);
+  });
+
+  test('and one byte short of it waits for the timer', () => {
+    const { batcher, sink } = build({ batchBytes: 22 });
+
+    batcher.add(record(20)); // 21 bytes
+    expect(sink.appendCalls).toHaveLength(0);
+    expect(batcher.bufferedBytes()).toBe(21);
+  });
+
+  test('hasRoom turns false at the entry cap, not one past it', () => {
+    const { batcher } = build({ maxPendingEntries: 2, batchBytes: 1_000_000 });
+
+    batcher.add('a');
+    expect(batcher.hasRoom()).toBe(true);
+
+    batcher.add('b'); // now at the cap
+    expect(batcher.hasRoom()).toBe(false);
+  });
+
+  test('hasRoom turns false once the buffer is at the byte cap', () => {
+    // The buffer has to actually reach the cap for this to say anything: a
+    // record refused by `add` leaves the buffer *below* the cap, where `<`
+    // and `<=` agree and the assertion is worth nothing. So the last record
+    // here is one `add` accepts, sized to land on the cap exactly.
+    const { batcher } = build({ maxPendingBytes: 21, batchBytes: 1_000_000 });
+
+    batcher.add(record(18)); // 19 of 21
+    expect(batcher.hasRoom()).toBe(true);
+
+    batcher.add('x'); // 2 more: exactly 21, accepted
+    expect(batcher.bufferedBytes()).toBe(21);
+    // A record costs at least its newline, so a buffer sitting on its byte cap
+    // has room for nothing — the one input where this differs from `<=`.
+    expect(batcher.hasRoom()).toBe(false);
+  });
+
+  test('the queue pauses at the watermark rather than one byte past it', () => {
+    const { batcher, sink, writer } = build({
+      batchBytes: 8,
+      watermarkBytes: 21,
+    });
+    writer.capacityBytes = 1000;
+
+    batcher.add(record(20)); // one 21-byte batch: the queue lands on 21
+    expect(writer.queuedBytes).toBe(21);
+    expect(sink.appendCalls).toHaveLength(1);
+
+    // Paused at exactly the watermark: the next record buffers instead of
+    // pushing, though it is well over `batchBytes` on its own.
+    batcher.add(record(20));
+    expect(sink.appendCalls).toHaveLength(1);
+    expect(batcher.bufferedBytes()).toBe(21);
+  });
+
+  test('and one byte above the queue it keeps pushing', () => {
+    const { batcher, sink, writer } = build({
+      batchBytes: 8,
+      watermarkBytes: 22,
+    });
+    writer.capacityBytes = 1000;
+
+    batcher.add(record(20));
+    expect(writer.queuedBytes).toBe(21); // one short of the watermark
+
+    batcher.add(record(20));
+    expect(sink.appendCalls).toHaveLength(2);
   });
 });

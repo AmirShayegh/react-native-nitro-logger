@@ -31,6 +31,31 @@ public final class LogWriterRegistry {
   ///
   /// Counted rather than a set: it costs nothing and stops a stray double
   /// release from clearing a marker another close still needs.
+  ///
+  /// ## An entry here can be permanent, and that is the chosen behaviour
+  ///
+  /// The marker is dropped by the close that set it, from the `defer` in
+  /// `LogWriter.close`'s barrier. On this platform that `defer` is structural
+  /// insurance rather than a fix — nothing in that block throws — but the
+  /// Kotlin twin reached the same guarantee through a `finally` that closed a
+  /// real hole: an `Error` escaping there stranded the path on perfectly
+  /// healthy storage.
+  ///
+  /// What remains is a writer that never finishes draining, because the disk
+  /// it is writing to stopped answering. That path then refuses every later
+  /// acquire with `stillClosing` for the life of the process, and no timer
+  /// clears it. **This is deliberate.** While that writer exists it still holds
+  /// the descriptor and the OS-level exclusive lock, so the alternative is not
+  /// "recover" — it is "open a second writer onto a file the first has not let
+  /// go of", which is the collision this map exists to prevent. A marker that
+  /// is correct and unhelpful beats one that is wrong.
+  ///
+  /// Reclaiming it needs a second source of truth for "will this writer ever
+  /// finish" — a writer-owned predicate that answers *stopped forever*, not
+  /// *slow* — and `dropClaimLocked`'s doc explains why inventing one lightly is
+  /// worse than the wait. A timeout is not that predicate: an acquire timing
+  /// out says only that five seconds passed. Revisit if field reports show
+  /// `stillClosing` outliving the storage problem that caused it.
   private var closing: [String: Int] = [:]
   private var nextHandleID: UInt64 = 1
 
@@ -66,6 +91,14 @@ public final class LogWriterRegistry {
     /// `monotonic`, and forwarding it here is the only way a test can reach it:
     /// writers are only ever built through this call.
     steady: LogWriter.Steady? = nil,
+    /// Wall clock for age rotation and archive retention — see `LogWriter.Clock`.
+    /// Forwarded here for the same reason `steady` is: writers are only ever
+    /// built through this call, so this is the only place a test can reach it.
+    clock: LogWriter.Clock? = nil,
+    /// Holds the open sweep on the queue — see `LogWriter.init`. Forwarded here
+    /// for the same reason `steady` and `clock` are: writers are only ever built
+    /// through this call.
+    openSweepGate: (() -> Void)? = nil,
     /// Reports the canonical path, once, the instant resolution produces it.
     ///
     /// For the caller that has to answer "where are the artifacts" after this
@@ -139,6 +172,8 @@ public final class LogWriterRegistry {
         rawWrite: rawWrite,
         compressor: compressor,
         steady: steady,
+        clock: clock,
+        openSweepGate: openSweepGate,
         directoryShortfall: resolved.shortfall
       )
       writers[resolved.canonicalPath] = writer
@@ -296,6 +331,14 @@ public final class LogFileHandle {
   /// Set for the duration of `clearLogs`, so `close` can tell "a deletion is in
   /// flight" from "the handle is idle" without holding the lock across it.
   private var purging = false
+  /// One collect at a time on THIS handle, mirroring `purging`.
+  ///
+  /// The writer's `collectLock` already refuses a second collect on the same
+  /// writer, so this is not what makes the operation safe — it is what makes the
+  /// refusal cheap and local. A second collect on one handle is answered here
+  /// without touching the writer, without a flush, and without spending any of
+  /// its deadline discovering it lost.
+  private var collecting = false
 
   init(id: UInt64, writer: LogWriter, registry: LogWriterRegistry) {
     self.id = id
@@ -377,8 +420,31 @@ public final class LogFileHandle {
   /// Gated on liveness like every other entry point. A released handle
   /// collecting would read files a live handle is still rotating, and would
   /// write its bundle into that handle's directory.
+  ///
+  /// **`close` deliberately does not wait this out**, unlike `purging`. Closing
+  /// waits out a purge because tearing the writer down mid-deletion leaves the
+  /// fresh file missing. A collect only reads logs and writes its own scratch,
+  /// and being abandoned is already a first-class, tested outcome — so a third
+  /// wait on `close`'s budget would buy nothing and cost teardown latency.
   public func collectLogs(deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
-    guard liveGeneration() != nil else { return .nothing }
+    condition.lock()
+    guard state == .active, !collecting else {
+      condition.unlock()
+      return .nothing
+    }
+    collecting = true
+    condition.unlock()
+
+    defer {
+      condition.lock()
+      collecting = false
+      // Broadcast even though nothing waits on this today: `condition` is the
+      // one place a waiter for any of this handle's state would sleep, and a
+      // flag cleared without a wake is the shape that strands the first one
+      // somebody adds.
+      condition.broadcast()
+      condition.unlock()
+    }
     return writer.collectLogs(
       handleID: id, deadlineMs: deadlineMs, maxTotalBytes: maxTotalBytes)
   }
@@ -398,6 +464,21 @@ public final class LogFileHandle {
   public func logFilePaths() -> [String] {
     guard liveGeneration() != nil else { return [] }
     return writer.logFilePaths()
+  }
+
+  /// Deletes the support bundle — see `LogWriter.deleteSupportBundle`.
+  ///
+  /// Gated on liveness like every other entry point, and `false` when the gate
+  /// refuses. But liveness is only half of it: `liveGeneration()` says this
+  /// handle is active, not that it is current, so the generation travels down
+  /// to the writer and is checked against the current one on the queue — the
+  /// same two-part gate `appendBatch` applies, and for a sharper reason. A
+  /// stale append adds a record to somebody else's file; a stale delete removes
+  /// somebody else's bundle.
+  public func deleteSupportBundle(deadlineMs: Double) -> Bool {
+    guard let handleGeneration = liveGeneration() else { return false }
+    return writer.deleteSupportBundle(
+      handleGeneration: handleGeneration, deadlineMs: deadlineMs)
   }
 
   /// Deletes every artifact, then rebinds this handle **only if the purge was
@@ -423,7 +504,16 @@ public final class LogFileHandle {
     // would race the rebind below with nothing to arbitrate the two.
     guard state == .active, !purging else {
       condition.unlock()
-      return LogClearOutcome(deletedCount: 0, failedPaths: [], durable: false)
+      // Name the file. `failedPaths` means "artifacts this call did not remove
+      // and which, as far as it can tell, are still there" — and on a refusal
+      // nothing was deleted, so the log file certainly is. The writer's own
+      // refusals already answer this way (`LogFileWriter.clearLogs` on purge-lock
+      // contention and on a blown deadline), so an empty array here made the two
+      // levels of the same class disagree about the same fact; Android named the
+      // path at both. Bridge-observable: a `ClearOutcome.failedPaths` that was
+      // empty now carries one path on this branch.
+      return LogClearOutcome(
+        deletedCount: 0, failedPaths: [writer.fileURL.path], durable: false)
     }
     purging = true
     condition.unlock()

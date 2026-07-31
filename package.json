@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-logger",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Structured, privacy-tiered logging for React Native — TS core with a native Nitro file/os_log sink",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",
@@ -17,6 +17,18 @@
         "default": "./lib/module/index.js"
       },
       "default": "./lib/module/index.js"
+    },
+    "./unstable": {
+      "react-native-nitro-logger-source": "./src/unstable.ts",
+      "require": {
+        "types": "./lib/typescript/commonjs/src/unstable.d.ts",
+        "default": "./lib/commonjs/unstable.js"
+      },
+      "import": {
+        "types": "./lib/typescript/module/src/unstable.d.ts",
+        "default": "./lib/module/unstable.js"
+      },
+      "default": "./lib/module/unstable.js"
     },
     "./eslint-plugin": "./eslint-plugin/index.js",
     "./package.json": "./package.json"
@@ -57,22 +69,31 @@
   },
   "scripts": {
     "test": "jest",
+    "test:coverage": "jest --coverage && ./scripts/check-coverage-groups.sh",
     "example": "yarn workspace react-native-nitro-logger-example",
     "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build lib",
     "prepare": "bob build",
     "nitrogen": "nitrogen",
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
-    "check-docs": "./scripts/check-doc-samples.sh",
+    "check-docs": "./scripts/check-doc-samples.sh --target src",
+    "check-docs-lib": "./scripts/check-doc-samples.sh --target lib",
+    "check-harness": "./scripts/check-harness-samples.sh --target src",
+    "check-harness-lib": "./scripts/check-harness-samples.sh --target lib",
     "check-eslint-consumer": "./scripts/check-eslint-consumer.sh",
     "check-android-instrumented": "./scripts/check-android-instrumented.sh",
     "check-test-reports": "./scripts/check-test-reports.sh",
+    "check-mutants": "./scripts/check-mutants.sh",
     "check-package-exports": "./scripts/check-package-exports.sh",
+    "check-metro-resolution": "./scripts/check-metro-resolution.sh",
     "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",
     "check-doc-links": "./scripts/check-doc-links.sh",
+    "check-parity-counts": "./scripts/check-parity-counts.sh",
     "changeset": "changeset",
     "check-podspec-tag": "./scripts/check-podspec-tag.sh",
-    "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish"
+    "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish",
+    "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag",
+    "check-coverage-groups": "./scripts/check-coverage-groups.sh"
   },
   "keywords": [
     "react-native",

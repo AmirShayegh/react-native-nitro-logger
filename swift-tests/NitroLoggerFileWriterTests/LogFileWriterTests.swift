@@ -479,4 +479,73 @@ final class LogFileWriterTests: LogWriterTestCase {
     _ = handle.flush(deadlineMs: .nan)
     XCTAssertTrue(handle.flush(deadlineMs: .infinity).durable, "and is clamped, not cast")
   }
+
+  // MARK: - Scheduling
+
+  /// Log writes run below the interface, and the calls that block a caller do
+  /// not.
+  ///
+  /// The split is the whole point. An append has already returned to its caller
+  /// by the time its block runs, so nothing is waiting and it can yield to the
+  /// UI — a log write must never be why a frame is late. A `flush` or a `close`
+  /// is the opposite: the JavaScript thread is sitting on it with a deadline,
+  /// and demoting it would make the app less responsive rather than more.
+  ///
+  /// Read from inside the block through the `rawWrite` seam, because the
+  /// question is what the work *ran at*, not what was requested. That
+  /// distinction is not pedantic here: a `DispatchQueue` created with a QoS
+  /// treats it as a ceiling and silently discards `async(qos:)`, so the obvious
+  /// implementation — give the queue `.utility` and boost the barriers —
+  /// produces a writer where the barriers are quietly demoted instead. This
+  /// test fails against that implementation, which is why it reads the running
+  /// QoS rather than asserting on the queue.
+  ///
+  /// ## What this does not prove
+  ///
+  /// That the scheduler did anything differently. QoS is a request; nothing in
+  /// userspace can observe what the kernel made of it. It also does not prove a
+  /// barrier is *fast* — a barrier still queues behind appends that are already
+  /// in front of it, and those now run at utility.
+  func testWritesRunBelowTheCallsThatBlockACaller() throws {
+    let appendQoS = QoSProbe()
+    let handle = try makeHandle(rawWrite: { fd, buffer, count in
+      appendQoS.record()
+      return Darwin.write(fd, buffer, count)
+    })
+
+    _ = handle.appendBatch("x\n", entryCount: 1)
+    handle.writerForTesting.settleForTesting()
+    XCTAssertEqual(
+      appendQoS.observed(), QOS_CLASS_UTILITY,
+      "an append that nobody is waiting for should not run at the caller's priority")
+
+    // The other half, and the reason this is one test: the demotion above is
+    // only safe because the queue has no QoS of its own. A queue built with
+    // one treats it as a ceiling — `async(qos:)` on such a queue is silently
+    // discarded — so assigning `.utility` to the queue would demote the six
+    // deadline-bound barriers along with the appends. `.unspecified` is what
+    // keeps `flush`, `close`, `maintain`, `collectLogs`, `clearLogs` and
+    // `logFilePaths` running at whatever their blocked caller is running at.
+    XCTAssertEqual(
+      handle.writerForTesting.queueQoSForTesting, .unspecified,
+      "a QoS on the queue would become a ceiling over every deadline-bound barrier")
+  }
+
+  /// Records the QoS class the block that touched it was running at.
+  private final class QoSProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: qos_class_t?
+
+    func record() {
+      lock.lock()
+      if seen == nil { seen = qos_class_self() }
+      lock.unlock()
+    }
+
+    func observed() -> qos_class_t? {
+      lock.lock()
+      defer { lock.unlock() }
+      return seen
+    }
+  }
 }

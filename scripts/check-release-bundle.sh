@@ -36,6 +36,41 @@ SENTINELS=(
   '__NITRO_LOGGER_ERROR_REVEAL__'
 )
 
+# The list above and the literals in `src/` are two copies of the same fact,
+# and a gate that greps for the wrong needle passes for the wrong reason: it
+# looks in the bundle for a string nothing assigns any more, finds it absent,
+# and reports the branch stripped. So the copies are reconciled here, in both
+# directions, before either is used.
+#
+#   - a literal in `src/` that is not in the array  -> a new reveal branch
+#     nobody added to this gate, shipping unchecked
+#   - an array entry with no literal in `src/`      -> this gate is grepping
+#     for a string that no longer exists
+#
+# `__tests__/revealSentinels.test.js` asserts the other half of the coupling —
+# that the accessors return these same literals at runtime — so a rename has to
+# move all three or fail somewhere.
+DISCOVERED="$(grep -rhoE '__NITRO_LOGGER_[A-Z_]+_REVEAL__' "$ROOT/src" | sort -u)"
+EXPECTED="$(printf '%s\n' "${SENTINELS[@]}" | sort -u)"
+
+if [ -z "$DISCOVERED" ]; then
+  echo "FAIL: found no reveal sentinels in src/ at all — either they were"
+  echo "      renamed out of the __NITRO_LOGGER_*_REVEAL__ shape this gate"
+  echo "      matches, or the reveal branches are gone and this gate is stale"
+  exit 1
+fi
+
+if [ "$DISCOVERED" != "$EXPECTED" ]; then
+  echo "FAIL: the sentinel list in this script disagrees with src/"
+  echo "--- in src/ but not in SENTINELS (a reveal branch nobody gates):"
+  comm -23 <(printf '%s\n' "$DISCOVERED") <(printf '%s\n' "$EXPECTED") | sed 's/^/      /'
+  echo "--- in SENTINELS but not in src/ (this gate greps for nothing):"
+  comm -13 <(printf '%s\n' "$DISCOVERED") <(printf '%s\n' "$EXPECTED") | sed 's/^/      /'
+  exit 1
+fi
+
+echo "ok:   ${#SENTINELS[@]} sentinels reconciled against src/"
+
 if [ "$REBUILD" -eq 1 ]; then
   rm -f "$BUNDLE"
 fi

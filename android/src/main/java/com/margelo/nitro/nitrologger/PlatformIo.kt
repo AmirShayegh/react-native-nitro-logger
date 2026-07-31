@@ -94,6 +94,45 @@ interface PlatformIo {
   fun creationTimeMillis(file: File): Long?
 
   /**
+   * Renames [from] onto [to], **replacing [to] atomically** if it exists.
+   *
+   * `File.renameTo` is not this. Its contract explicitly declines to say
+   * whether an existing destination is replaced, or whether the operation is
+   * atomic, or whether it works at all — behaviour it leaves to the platform.
+   * The support-bundle publish needs all three: a reader of the bundle path
+   * must see either the old bundle or the new one and never neither.
+   *
+   * The other half of the contract matters just as much: **a failure must leave
+   * [to] untouched.** That is what lets a collect that cannot publish leave the
+   * previous bundle in place, instead of deleting it first and then discovering
+   * it has nothing to put there.
+   *
+   * Returns false if the rename did not happen, in which case both files are
+   * where they were.
+   */
+  fun renameReplacing(from: File, to: File): Boolean
+
+  /**
+   * Drops the **calling** thread a notch below default scheduling priority.
+   *
+   * Called from inside the writer thread's own runnable, not from whoever
+   * created it: `Process.setThreadPriority(int)` acts on the current thread, so
+   * calling it at construction would deprioritize the JavaScript thread that
+   * happened to open the sink. That is the mistake this signature is shaped to
+   * make hard — there is no thread parameter to get wrong.
+   *
+   * Deliberately **not** `THREAD_PRIORITY_BACKGROUND`. Android puts any thread
+   * at priority 10 or above into a throttled background cgroup that gets
+   * single-digit CPU percentages while anything foreground is running, and the
+   * thread this is applied to is the one a crash-path `flush` blocks on with a
+   * deadline it promised to keep. One notch below default keeps the thread in
+   * the foreground cgroup: log writes yield to the UI, and never to nothing.
+   *
+   * A no-op off-device, so unit-test timing is exactly what it was.
+   */
+  fun deprioritizeCurrentThread()
+
+  /**
    * The unit-test implementation. **Not for Android**: it is the only place in
    * this package that touches `java.nio.file`, which does not exist below API
    * 26.
@@ -123,6 +162,16 @@ interface PlatformIo {
 
     override fun creationTimeMillis(file: File): Long? = Nio.creationTimeMillis(file)
 
+    override fun renameReplacing(from: File, to: File): Boolean = Nio.renameReplacing(from, to)
+
+    /**
+     * Nothing. A JVM has no equivalent that is worth reaching for —
+     * `Thread.setPriority` is advisory to the point of being ignored on the
+     * platforms these tests run on — and a real change here would perturb the
+     * timing that several tests in this suite measure.
+     */
+    override fun deprioritizeCurrentThread() = Unit
+
     /**
      * Every `java.nio.file` reference in the package, in one object that
      * nothing on Android ever calls.
@@ -149,6 +198,41 @@ interface PlatformIo {
         java.nio.file.Files.isSymbolicLink(file.toPath())
       } catch (_: Throwable) {
         true
+      }
+
+      /**
+       * `Files.move` with `ATOMIC_MOVE`, which on a POSIX filesystem is one
+       * `rename(2)` — the same syscall [AndroidPlatformIo] makes directly.
+       *
+       * `ATOMIC_MOVE` rather than `REPLACE_EXISTING`, even though replacing is
+       * what this is for. `Files.move` documents that when `ATOMIC_MOVE` is
+       * given every other option is ignored, so the two cannot be combined —
+       * and of the two it is `ATOMIC_MOVE` that actually delivers the contract
+       * on [PlatformIo.renameReplacing]. `REPLACE_EXISTING` alone permits a
+       * non-atomic copy-and-delete, which is the very shape this seam exists to
+       * rule out; the replacement comes free, because that is what `rename(2)`
+       * does with an existing destination.
+       *
+       * A filesystem that cannot promise atomicity throws
+       * `AtomicMoveNotSupportedException` and this returns false. Failing
+       * closed is the point: this implementation is what the unit tests measure
+       * the contract against, so it must not quietly satisfy them with weaker
+       * semantics than the device gets.
+       *
+       * `Exception`, not `Throwable`, unlike its neighbours here. Those return
+       * a "cannot tell" value where swallowing is the whole point; this one
+       * reports a *decision*, and an `Error` — a linkage failure, an OOM — is
+       * not a rename that declined. It propagates.
+       */
+      fun renameReplacing(from: File, to: File): Boolean = try {
+        java.nio.file.Files.move(
+          from.toPath(),
+          to.toPath(),
+          java.nio.file.StandardCopyOption.ATOMIC_MOVE
+        )
+        true
+      } catch (_: Exception) {
+        false
       }
 
       fun creationTimeMillis(file: File): Long? = try {

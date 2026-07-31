@@ -63,6 +63,38 @@ jobs:
       - name: Typecheck the documentation samples
         run: yarn check-docs
 
+      # The consumer apps the min-rn jobs write out are TypeScript inside a
+      # shell heredoc, so `lint` and `typecheck` above cannot see them. 0.3.0
+      # moved `createFileSink` to a subpath export, both templates kept
+      # importing it from the root, and the first thing that noticed was
+      # min-rn-android failing after 7m34s of emulator time. Two seconds here
+      # instead.
+      - name: Typecheck the min-rn harness apps
+        run: yarn check-harness
+
+      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 19 shell
+      # scripts that hold most of this repository's gates are unparsed until
+      # something runs them — and several only run inside the emulator and
+      # simulator jobs, so an unterminated heredoc or a stray `fi` costs
+      # minutes to discover. `bash -n` parses without executing. The floor is
+      # there because a glob that matched nothing would otherwise pass.
+      - name: Syntax-check the shell scripts
+        run: |
+          count=0
+          for f in scripts/*.sh; do bash -n "$f"; count=$((count + 1)); done
+          if [ "$count" -lt 19 ]; then
+            echo "FAIL: parsed only $count scripts; the glob is not matching"
+            exit 1
+          fi
+          echo "ok: $count shell scripts parse"
+
+      # The counts `docs/PARITY.md` states, against the floors CI enforces.
+      # Needs no test run, which is why it sits here rather than in the three
+      # matrix jobs: it checks the document against the gate, and the gate
+      # checks itself against a real report.
+      - name: Check the parity counts
+        run: yarn check-parity-counts
+
       # The git tag the podspec points at must be the tag the release creates.
       # Through 0.1.2 it interpolated a bare "0.1.2" while Changesets tags
       # `react-native-nitro-logger@0.1.2`, so a CocoaPods consumer installing
@@ -86,6 +118,26 @@ jobs:
       # that is meant to exist has to report. See scripts/check-test-reports.sh.
       - name: Run the TypeScript suite
         run: yarn check-test-reports js
+
+      # A green suite says the tests agree with the code, not that they would
+      # notice if it changed. This reintroduces sixteen real defects and
+      # requires the named test to fail for each. ~30s, and it runs here
+      # rather than as its own job because it needs exactly this setup.
+      - name: Prove the pinned defects are still caught
+        run: ./scripts/check-mutants.sh
+
+      # And the third question: not "do the tests agree", not "would they
+      # notice", but "is there anything they never look at". Ratchets two
+      # points below what the suite measures, per directory as well as
+      # globally, because a global number lets one well-covered area pay for
+      # an untested one. Runs the suite a second time — a couple of seconds,
+      # and worth not folding into the run above, whose job is the count.
+      #
+      # `yarn test:coverage` is two things: the thresholds, and
+      # check-coverage-groups.sh behind them. The second is what stops the
+      # first from quietly changing meaning — see its header.
+      - name: Check coverage has not drained out of a directory
+        run: yarn test:coverage
 
   # The vendored iOS writer, under XCTest rather than on a simulator.
   #
@@ -259,6 +311,33 @@ jobs:
 
       - name: Build package
         run: yarn prepare
+
+      # The documentation samples again, this time resolved the way `exports`
+      # sends a consumer: through `lib/typescript/**` rather than through
+      # `src/index.tsx`. The `lint` job checks the source surface, which is the
+      # right place for it — a renamed export should break the docs in the
+      # commit that renames it. What it cannot see is a type that the source
+      # exports and the declaration build drops, which typechecks there and
+      # fails for every reader.
+      - name: Typecheck the documentation against the published surface
+        run: yarn check-docs-lib
+
+      # And the harness apps against that same surface, for the same reason —
+      # more sharply here, because these apps really do install the packed
+      # tarball, so `lib/typescript/**` is not a stand-in for what they resolve.
+      # It is what they resolve.
+      - name: Typecheck the min-rn harness apps against the published surface
+        run: yarn check-harness-lib
+
+      # Which entry points a stock app at the MINIMUM React Native can bundle.
+      # `check-package-exports` above runs Node's resolver and tsc, both of
+      # which honour `exports` unconditionally, so every entry point passes
+      # there — while Metro 0.81, which react-native 0.78 pins, ships with
+      # subpath exports off and cannot resolve `/unstable` at all. This builds
+      # real bundles against the stock template config to pin that, and to pin
+      # that the documented one-line workaround still works.
+      - name: Check the export map resolves at the minimum React Native
+        run: yarn check-metro-resolution
 
       # Every `__DEV__` in the built library is a place redaction can be turned
       # off. The set is meant to be small and unchanging; this fails if it grows

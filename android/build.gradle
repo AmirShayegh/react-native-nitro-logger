@@ -132,6 +132,27 @@ android {
       // needs neither a device nor Robolectric. This flag only covers the
       // stray android.* symbol reached through a shared constant.
       returnDefaultValues = true
+
+      all {
+        // Where `spec/file-sink-lifecycle.rows.json` is, for the suite that
+        // reads it. A JVM unit test's working directory is whatever the Gradle
+        // worker chose and is not the repository, so the path has to be handed
+        // in. Derived from `projectDir` rather than `rootProject`, because this
+        // module is the root project when the library builds standalone and a
+        // subproject when the example app builds it.
+        systemProperty "nitroLogger.repoRoot", projectDir.parentFile.absolutePath
+
+        // And the table is a real input, not just a path. Without this the task
+        // is UP-TO-DATE after the table changes — its sources and classpath did
+        // not move — so editing a row and re-running reports a pass from the
+        // previous table. Found by red-proofing the row table: Jest and
+        // SwiftPM both went red on a new row and Gradle did not, because it
+        // never ran. A shared contract that one of its three consumers can
+        // silently decline to re-read is not shared.
+        inputs.file(new File(projectDir.parentFile, "spec/file-sink-lifecycle.rows.json"))
+          .withPropertyName("fileSinkLifecycleRows")
+          .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+      }
     }
   }
 }
@@ -141,6 +162,13 @@ dependencies {
   implementation project(":react-native-nitro-modules")
 
   testImplementation "junit:junit:4.13.2"
+
+  // For reading `spec/file-sink-lifecycle.rows.json`. Test-only, so it appears
+  // in no published metadata. Deliberately not `org.json`: that package exists
+  // as a stub inside `android.jar`, and which of the two wins on a unit-test
+  // classpath is an ordering detail — the stub's methods throw, so losing the
+  // coin toss turns the shared table into a suite that cannot load it.
+  testImplementation "com.google.code.gson:gson:2.11.0"
 
   // Deliberately not Robolectric. Robolectric shadows `android.system.Os`, so a
   // suite written against it would replace zero coverage of `AndroidPlatformIo`

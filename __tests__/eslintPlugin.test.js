@@ -134,6 +134,74 @@ describe('no-dynamic-message', () => {
       // Not a logger — out of scope, must not produce noise.
       'analytics.info(`user ${id}`);',
       'notALogger.debug(dynamic);',
+      // A container field that resolves to something which is NOT a logger
+      // stays silent. The container walk added in 0.3.0 answers "what does
+      // this property hold", and `analytics` is an answer, not a shrug.
+      'const deps = { audit: analytics }; deps.audit.info(`user ${id}`);',
+      // And that holds even when the field is spelled like a logger. This is
+      // the case that decides the ORDER of the two analyses: the property
+      // name is a hint and the literal is evidence, so a hint consulted first
+      // would report ordinary analytics code on the strength of a field name,
+      // with the line that disproves it directly above.
+      'const deps = { logger: analytics }; deps.logger.info(`user ${id}`);',
+      'const deps = { logger: analytics }; deps.logger.info.call(null, `user ${id}`);',
+      // Reading the literal is also more precise, not merely safer. Classified
+      // from the name this is `ambiguous` and the third argument is checked as
+      // a Logger subsystem; read from the literal it is a ScopedLogger, which
+      // has no third parameter — so reporting one would warn about an argument
+      // the runtime never looks at.
+      `${IMPORT_LOG} const holder = { logger: Log.scoped('c') }; holder.logger.info('m', {}, sub);`,
+      // A construction is a DECIDED non-logger — `classifyConstruction` looked
+      // and said so — which is what keeps `loggerClassNames` able to narrow.
+      'const deps = { logger: new Widget() }; deps.logger.info(`user ${id}`);',
+      // An opaque value in a field spelled like anything else stays silent,
+      // exactly as it did before the walk existed: neither the value nor the
+      // name says logger.
+      'const deps = { audit: getLogger() }; deps.audit.info(`user ${id}`);',
+      // A container inside a container is the same question one level in, so
+      // the walk recurses rather than reading `inner.audit` off its own
+      // spelling. Here the inner literal settles it: not a logger, silent.
+      'const inner = { audit: analytics }; const holder = { logger: inner.audit }; holder.logger.info(`user ${id}`);',
+      // An alias in front of the value changes nothing about it. These are
+      // the decided ones: the initializer was understood and is not a logger,
+      // so the outer `logger` spelling does not override it.
+      'const value = analytics; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
+      'const value = new Widget(); const holder = { logger: value }; holder.logger.info(`user ${id}`);',
+      // An import is unreadable, so like a parameter it hands the question
+      // back to the name — and neither name here says logger.
+      `import { thing } from './x'; const holder = { audit: thing }; holder.audit.info(\`user \${id}\`);`,
+      // A parameter is unreadable, so it hands the question back to the name —
+      // and here neither name says logger, so nothing is reported. This is the
+      // companion to the invalid `{ logger: value }` case below: what changes
+      // the answer is the field's spelling, not the parameter's.
+      'function f(value) { const holder = { audit: value }; holder.audit.info(`user ${id}`); }',
+      // The same value reachable twice is still that value. `seen` is a
+      // recursion stack, so the second candidate gets its own copy and its own
+      // real classification — shared, the first would mark the variable and
+      // the second would come back "opaque", widening a settled non-logger to
+      // `ambiguous` and reporting ordinary code.
+      'const v = analytics; const holder = { logger: v }; holder.logger = v; holder.logger.info(`user ${id}`);',
+      'const inner = { audit: analytics }; const holder = { logger: inner.audit }; holder.logger = inner.audit; holder.logger.info(`user ${id}`);',
+      // Including through the nested walk: the inner container is readable and
+      // says `analytics`, and one alias does not launder that.
+      'const inner = { audit: analytics }; const value = inner.audit; const holder = { logger: value }; holder.logger.info(`user ${id}`);',
+      // ...and travels outward only when it says logger. `deps.analytics` in
+      // a field spelled `audit` leaves nothing anywhere that says logger.
+      'const holder = { audit: deps.analytics }; holder.audit.info(`user ${id}`);',
+      // Containers that name each other resolve to nothing and, crucially,
+      // terminate. Neither field is spelled like a logger, so nothing is
+      // reported — the assertion that matters is that this test finishes.
+      'const a = { x: b.y }; const b = { y: a.x }; a.x.info(`user ${id}`);',
+      // KNOWN LIMITATION, pinned: `this.<field>` is not followed even when
+      // the field initializer is in the same class. Resolving it means
+      // matching a class field against the instance a method runs on, which
+      // is the interprocedural analysis deliberately cut off the method path
+      // — see `receiverPropertyCandidates`. `this.logger` is still CHECKED,
+      // by the name hint, which is why the fixture below uses a field named
+      // something else. Restoring this is a decision someone makes on
+      // purpose.
+      `${IMPORT_LOG} class C { audit = Log; m() { this.audit.info(\`patient \${id}\`); } }`,
+      `${IMPORT_LOG} class C { constructor() { this.audit = Log; } m() { this.audit.info(\`patient \${id}\`); } }`,
     ],
     invalid: [
       {
@@ -572,6 +640,146 @@ describe('no-dynamic-message', () => {
         code: 'const handlers = { emit: Log.info }; handlers.emit(patientName);',
         errors: [{ messageId: 'dynamic' }],
       },
+      // And a RECEIVER held in a container is still that receiver. Until
+      // 0.3.0 a member-expression receiver was classified from the property
+      // name alone, so a container field spelled anything other than
+      // `logger`/`log`/`Log` took the call site outside all four rules — on
+      // the strength of its spelling, with the object literal that settles
+      // the question two lines up.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log.scoped('c', 'net') }; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Through `.call`, which normalizes to the same shape and takes the
+      // same walk.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info.call(null, patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Reading the container must not SILENCE what the name already caught.
+      // `getLogger()` is a candidate the walk can see and cannot classify —
+      // the factory boundary this plugin stops at, and the shape a real
+      // logger most often arrives in. Answering "read, and not a logger"
+      // there would take a checked call site outside all four rules, which is
+      // the dangerous direction: a false negative in a privacy rule looks
+      // exactly like compliance. So an undecided candidate hands the question
+      // back to the name.
+      {
+        code: 'const deps = { logger: getLogger() }; deps.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const deps = { logger: flag ? a : b }; deps.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Nesting, in both directions. Reading `inner.audit` from its own
+      // property name would rebuild the defect one level deeper: the name
+      // `audit` says "not a logger", that answer would look decisive, and the
+      // outer `logger` hint would be discarded — silencing a call the file
+      // fully proves is `Log`. So a member candidate takes the walk too.
+      {
+        code: `${IMPORT_LOG} const inner = { audit: Log }; const holder = { logger: inner.audit }; holder.logger.info(\`patient \${id}\`);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // And when the inner container is not in this file at all, `deps.audit`
+      // is a shrug rather than a denial, so the outer name still decides.
+      {
+        code: 'const holder = { logger: deps.audit }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // An alias does not launder an opaque value either, and this is the
+      // direction that matters: `classifyReceiver` follows the binding, fails
+      // to see through `getLogger()`, and falls through to the NAME — so the
+      // `null` it returns for `value` is a statement about the spelling of a
+      // local variable, not about what it holds. Reading it as evidence puts
+      // the factory case back with one alias in front of it, which is a false
+      // negative in a privacy rule, which looks exactly like compliance.
+      {
+        code: 'const value = getLogger(); const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const value = flag ? a : b; const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Through a chain of them, and through an alias of a container property
+      // that cannot be read.
+      {
+        code: 'const a = getLogger(); const b = a; const holder = { logger: b }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'const value = deps.audit; const holder = { logger: value }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A parameter is the function boundary this plugin stops at, which makes
+      // it a value from outside this scope — `deps.audit` with a different
+      // spelling, and answered the same way. `f(Log)` is the case: real, in
+      // the privacy path, and CHECKED before the container walk existed. The
+      // walk is allowed to be more precise than the name; it is not allowed to
+      // silence what the name caught.
+      {
+        code: 'function f(value) { const holder = { logger: value }; holder.logger.info(`patient ${id}`); }',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: 'function f(value) { const alias = value; const holder = { logger: alias }; holder.logger.info(`patient ${id}`); }',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A module boundary is a boundary too. `./logger` re-exporting or
+      // wrapping this package is the ordinary way a project centralises its
+      // logger, and this analysis does not follow the import — so treating the
+      // name it arrives under as proof of anything is the parameter mistake
+      // with a different boundary. A recognised package import never reaches
+      // that branch; it is already classified.
+      {
+        code: `import { audit } from './logger'; const holder = { logger: audit }; holder.logger.info(\`patient \${id}\`);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Aliases that name each other are dead code, but "cannot see through
+      // this" is the safe thing to say about them, so the outer name decides
+      // and the call is checked. The assertion that matters is that the
+      // resolution terminates at all.
+      {
+        code: 'const a = b; const b = a; const holder = { logger: a }; holder.logger.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // The other half of that: an unreadable container whose property IS
+      // spelled like a logger is the only evidence there is, so it is used —
+      // even though the field holding it is spelled like something else. A
+      // shrug hands the question back to the outer name; a name that says
+      // "logger" is an answer and travels outward.
+      {
+        code: 'const holder = { audit: deps.logger }; holder.audit.info(`patient ${id}`);',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Several candidates, one of them unreadable: it cannot be ruled out as
+      // a logger, so the rules apply.
+      {
+        code: 'const deps = { logger: analytics }; function later() { deps.logger.info(`patient ${id}`); } deps.logger = getLogger(); later();',
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Assigned rather than in the literal, and through `Object.assign` —
+      // the same three spellings the method path already followed, because
+      // this reuses that machinery rather than reimplementing it.
+      {
+        code: `${IMPORT_LOG} const holder = {}; holder.audit = Log; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      {
+        code: `${IMPORT_LOG} const holder = {}; Object.assign(holder, { audit: Log }); holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Two possible receivers, one of them a logger: which runs is
+      // unknowable, so the rules apply rather than falling silent.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: analytics }; function later() { holder.audit.info(patientName); } holder.audit = Log; later();`,
+        errors: [{ messageId: 'dynamic' }],
+      },
       {
         code: '(Log.info.bind(Log))(patientName);',
         errors: [{ messageId: 'dynamic' }],
@@ -696,6 +904,15 @@ describe('no-computed-metadata-key', () => {
         "const s = Log.scoped('c'); s.info('m', { state: 'x' });",
         "Log.scoped('c', 'sub', { user: 'u1' });",
         "Log.log('m', { metadata: { state: 'x' } });",
+        // A resolved `ScopedLogger` never reads `scopeMetadata` off its
+        // caller: `log` takes `ScopedLogOptions` and supplies the scope's own
+        // defaults itself, so this property is dropped on the floor. Reporting
+        // it would be a privacy warning about data that cannot reach a log,
+        // which is how a rule gets switched off. The `Log.log` and
+        // `unknownLogger.log` twins in the invalid block are what keep this
+        // from being a hole rather than a distinction.
+        "const s = Log.scoped('c'); s.log('m', { scopeMetadata: { [patientId]: 'x' } });",
+        "Log.scoped('c').log('m', { scopeMetadata: { patient } });",
         "Log.info('m', undefined, 'network');",
         // A const object the rule can follow is as reviewable as an inline one.
         `${IMPORT_LOG} const md = { state: 'x' }; Log.info('m', md);`,
@@ -732,6 +949,13 @@ describe('no-computed-metadata-key', () => {
         },
         {
           code: "const s = Log.scoped('c'); s.info('m', { [k]: 'x' });",
+          errors: [{ messageId: 'computed' }],
+        },
+        // The 0.3.0 container walk, pinned here too: a call site it used to
+        // miss was outside all four rules at once, so each of them keeps a
+        // fixture rather than trusting that one shared code path covers it.
+        {
+          code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info('m', { [patientId]: 'x' });`,
           errors: [{ messageId: 'computed' }],
         },
         {
@@ -813,12 +1037,12 @@ describe('no-computed-metadata-key', () => {
         // A ScopedLogger named `logger` must not be read as the Logger, or
         // its third argument goes unexamined.
         {
-          code: "const logger = Log.scoped('c'); logger.log('m', 'info', { [patientId]: 'x' });",
+          code: "const logger = Log.scoped('c'); logger.log('m', { level: 'info', metadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         // An unresolved receiver could be either shape, so both are checked.
         {
-          code: "logger.log('m', 'info', { [patientId]: 'x' });",
+          code: "logger.log('m', { level: 'info', metadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         // Catalog enforcement mirrors the runtime's approved-key list.
@@ -902,6 +1126,15 @@ describe('no-computed-metadata-key', () => {
         },
         {
           code: "Log.logMessage('m', { scopeMetadata: { [patientId]: 'x' } });",
+          errors: [{ messageId: 'computed' }],
+        },
+        // A receiver nobody could resolve is checked as both shapes, because
+        // the Logger reading is live and this rule fails loud.
+        // A receiver nobody could resolve is checked as both shapes: the
+        // Logger reading is live, and this rule fails loud. Note the object
+        // literal does not settle it — since 0.3.0 both `log`s take one.
+        {
+          code: "logger.log('m', { scopeMetadata: { [patientId]: 'x' } });",
           errors: [{ messageId: 'computed' }],
         },
         {
@@ -1020,6 +1253,17 @@ describe('no-derived-correlation', () => {
         // Provenance, not spelling: a same-named local function is the leak.
         {
           code: 'function newCorrelationId() { return patient.mrn; } Log.scoped(newCorrelationId());',
+          errors: [{ messageId: 'derived' }],
+        },
+        // Nor is a logger held in a container, and this is the half of the
+        // 0.3.0 container walk worth pinning. `holder.audit.info(…)` is now
+        // CHECKED by all four rules — see the message rule's fixtures — and
+        // `holder.audit` is still not the singleton, so an ID minted through
+        // it is derived. Widening what is checked is safe; widening what is
+        // trusted would launder any object's method into an approved
+        // generator, which is what this rule's own header warns about.
+        {
+          code: `${IMPORT_LOG} const holder = { audit: Log }; Log.scoped(holder.audit.newCorrelationId());`,
           errors: [{ messageId: 'derived' }],
         },
         // A Logger imported from somewhere else is not the Logger. This is
@@ -1160,7 +1404,7 @@ describe('literal-subsystem', () => {
       // ScopedLogger has no subsystem argument; the second argument is
       // metadata and must not be flagged.
       "const s = Log.scoped('c'); s.info('m', { state: 'x' });",
-      "const s = Log.scoped('c'); s.log('m', 'info', { state: 'x' });",
+      "const s = Log.scoped('c'); s.log('m', { level: 'info', metadata: { state: 'x' } });",
       // Free functions. Every check in this rule starts from a receiver, and
       // these have none, so `installErrorHandler({ subsystem })` was invisible
       // to the entire plugin — on a name that rides every uncaught-error entry
@@ -1212,6 +1456,21 @@ describe('literal-subsystem', () => {
         errors: [{ messageId: 'dynamic' }],
       },
       { code: 'Log.resetSubsystem(name);', errors: [{ messageId: 'dynamic' }] },
+      // The 0.3.0 container walk — see the message rule's fixtures for what
+      // it is and the correlation rule's for what it deliberately does not
+      // widen.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info('m', {}, dynamicName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A logger-spelled field holding the real Logger still takes a third
+      // argument, which is the other half of the scoped fixture in the valid
+      // list: the walk decides which shape the call has, and it is right in
+      // both directions rather than merely quiet in one.
+      {
+        code: `${IMPORT_LOG} const holder = { logger: Log }; holder.logger.info('m', {}, dynamicName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
       // Computed method access must read as dot access.
       {
         code: "Log['subsystem'](patientName, 'debug');",
@@ -1562,6 +1821,7 @@ describe('plugin configs', () => {
     const NOT_EMITTING = new Set([
       'addDestination', // takes a destination, no message
       'consoleLogging', // boolean toggle
+      'destinations', // reports labels back, takes nothing
       'flush', // deadline only
       'metadataKeyCatalog', // key names, checked at runtime instead
       'minimumLevel', // level only
@@ -1609,8 +1869,16 @@ describe('plugin configs', () => {
    * options; wrong in the other and a whole method's options object goes
    * unchecked, which is exactly what `logMessage` did in the spread branch of
    * `no-derived-correlation`. `METADATA_OPTION_FIELDS` says which fields of
-   * that object reach redaction, and a field added to `LogOptions` and not
-   * here is caller data nothing lints.
+   * that object reach redaction, and a field added to the options shape and
+   * not here is caller data nothing lints.
+   *
+   * **Both option interfaces, not just the public one.** `scopeMetadata` moved
+   * off `LogOptions` into the unexported `InternalLogOptions` in 0.3.0, and
+   * reading only the public interface here would have quietly demanded the
+   * plugin stop checking it. Nothing about the runtime changed: `logMessage`
+   * reads that field off whatever object it is handed, so a JavaScript caller
+   * can still put a patient name there, and the rule is now the *only* thing
+   * that would say so. What the plugin models is what the runtime reads.
    *
    * Read from the TypeScript AST rather than restated, so the assertion is
    * against the source and not against a second copy of the same guess.
@@ -1641,7 +1909,8 @@ describe('plugin configs', () => {
     for (const statement of file.statements) {
       if (
         ts.isInterfaceDeclaration(statement) &&
-        statement.name.text === 'LogOptions'
+        (statement.name.text === 'LogOptions' ||
+          statement.name.text === 'InternalLogOptions')
       ) {
         for (const member of statement.members) {
           if (!ts.isPropertySignature(member) || !member.type) continue;
@@ -1671,6 +1940,11 @@ describe('plugin configs', () => {
     // otherwise satisfy every comparison below.
     expect(optionFields.size).toBeGreaterThan(3);
     expect(optionsMethods.size).toBeGreaterThan(0);
+    // And guards the union specifically: were `InternalLogOptions` renamed or
+    // folded away, the loop above would read one interface, find no
+    // `scopeMetadata`, and demand a *smaller* model rather than failing.
+    expect(optionFields.has('scopeMetadata')).toBe(true);
+    expect(optionFields.has('metadata')).toBe(true);
 
     expect([...optionsMethods].sort()).toEqual([...OPTIONS_METHODS].sort());
 
@@ -2482,5 +2756,113 @@ describe('every constructible logger is classified', () => {
     // Exact, not truthy: 'ambiguous' is truthy and would mean the class was
     // recognized by NAME only, with its provenance never established.
     expect(['logger', 'scoped']).toContain(classification);
+  });
+});
+
+/**
+ * A logger that arrives from a factory, which is how most apps get one.
+ *
+ * `classifyReceiver` resolved a binding's initializer and returned whatever
+ * that produced — including `null`. So a binding whose initializer it could
+ * not see through was classified as "not a logger", and every rule went
+ * silent at every call on it.
+ *
+ * The spelling that hits hardest is the ordinary one:
+ *
+ *     const Log = useLogger();
+ *     Log.info(`patient ${patient.mrn} admitted`);
+ *
+ * Canonical name, real logger, PHI in a template literal, and not one
+ * diagnostic — because a hook is a call this analysis cannot follow. The
+ * file's own rule 1 says a receiver that merely might be a logger is
+ * `'ambiguous'` rather than discarded, and this was the place that did not
+ * honour it.
+ *
+ * The widening is deliberately to `'ambiguous'` and not `'logger'`, and
+ * deliberately does not apply to a construction: `new Widget()` is a `null`
+ * that was *decided*, which is what keeps `loggerClassNames` meaningful.
+ */
+describe('a logger bound from an opaque factory is still checked', () => {
+  const lint = (code, rules) =>
+    new Linter()
+      .verify(code, {
+        plugins: { n: plugin },
+        languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
+        rules,
+      })
+      .map((m) => m.messageId);
+
+  const DYNAMIC = { 'n/no-dynamic-message': 'error' };
+
+  test('the canonical name rebound through a hook no longer silences the rules', () => {
+    expect(
+      lint('const Log = useLogger();\nLog.info(`user ${id}`);', DYNAMIC)
+    ).toEqual(['dynamic']);
+  });
+
+  test.each([
+    ['a factory call', 'const log = makeLogger();'],
+    ['an awaited factory', 'const log = await getLogger();'],
+    ['a conditional', 'const log = flag ? a : b;'],
+    ['a property read', 'const log = deps.logger;'],
+  ])('%s bound to a logger name is checked', (_name, decl) => {
+    expect(lint(`${decl}\nlog.info(\`user \${id}\`);`, DYNAMIC)).toEqual([
+      'dynamic',
+    ]);
+  });
+
+  test('all four rules come back, not just the one', () => {
+    expect(
+      lint(
+        'const Log = useLogger();\n' +
+          'Log.info(`user ${id}`);\n' +
+          'Log.info("m", { [key]: 1 });\n' +
+          'Log.scoped(patient.id);\n' +
+          'Log.info("m", undefined, subsystemFor(x));',
+        {
+          'n/no-dynamic-message': 'error',
+          'n/no-computed-metadata-key': 'error',
+          'n/no-derived-correlation': 'error',
+          'n/literal-subsystem': 'error',
+        }
+      ).sort()
+      // Two `dynamic`s, and they come from different rules: `literal-subsystem`
+      // names its message that as well as `no-dynamic-message` does. Four
+      // reports from four rules, which is the claim.
+    ).toEqual(['computed', 'derived', 'dynamic', 'dynamic']);
+  });
+
+  /**
+   * The deliberate silences, observed passing before AND after the widening.
+   *
+   * A silence pin that was never exercised proves only that the rule is off,
+   * so each of these is a case the widening could plausibly have swept in and
+   * must not have.
+   */
+  test.each([
+    ['a name nothing documents as a logger', 'const widget = getWidget();'],
+    ['a rejected construction', 'const log = new Widget();'],
+  ])('%s stays silent', (_name, decl) => {
+    const receiver = decl.includes('widget') ? 'widget' : 'log';
+    expect(
+      lint(`${decl}\n${receiver}.info(\`user \${id}\`);`, DYNAMIC)
+    ).toEqual([]);
+  });
+
+  test('narrowing loggerClassNames still silences a construction', () => {
+    // The escape hatch and the widening do not collide, because a `null` from
+    // `classifyConstruction` is a decision rather than a shrug. Without that
+    // distinction this reports, and a documented option stops working.
+    expect(
+      lint(
+        "import { Logger } from 'tslog';\nconst log = new Logger();\nlog.info(`user ${id}`);",
+        {
+          'n/no-dynamic-message': [
+            'error',
+            { loggerClassNames: ['AppLogger'] },
+          ],
+        }
+      )
+    ).toEqual([]);
   });
 });

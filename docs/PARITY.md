@@ -16,6 +16,39 @@ Nothing here is aspirational. Every "identical" row is covered by a golden;
 every difference is either enforced by a test or unreachable through the
 public API, and the table says which.
 
+**What holds that revision in place is documentation, not a gate, and that is
+worth saying plainly.** The goldens are checked in as a generated TypeScript
+module, and CI asserts this package still matches them — so a change *here*
+that breaks byte-parity fails. What no job can check is that the corpus still
+corresponds to `670e183`, because SwiftLogger is not a dependency of this
+package and nothing in CI holds a checkout of it. If SwiftLogger's formatter
+changes, this suite stays green and the claim silently becomes a claim about a
+past revision. The revision is therefore recorded in three places — here, the
+generated module's own header, and `scripts/README.md` — so that regenerating
+is a deliberate act with a number attached rather than a refresh.
+
+## How much of this is actually enforced
+
+<!-- test-counts: js=1108/26 swift=247/12 kotlin=240/11 -->
+
+| Target                              | Tests | Suites |
+| ----------------------------------- | ----- | ------ |
+| JavaScript / TypeScript (`jest`)    | 1108  | 26     |
+| iOS (`swift test`)                  | 247   | 12     |
+| Android (`testDebugUnitTest`)       | 240   | 11     |
+
+A count is a weak claim on its own — it says how much was run, not what was
+proven — and it is here for one specific thing: these are floors, not
+observations. `scripts/check-test-reports.sh` fails if any target reports
+fewer, so a suite that stops being discovered cannot be mistaken for a suite
+that passes. That failure mode is not hypothetical for a repository with three
+test runners: a renamed Gradle task, a Swift target dropped from `Package.swift`
+or a Jest `testPathIgnorePatterns` typo each produce a green run over nothing.
+
+The numbers above and the floors in that script are checked against each other
+by `scripts/check-parity-counts.sh`, so this table cannot quietly go stale —
+which is the only thing that would make it worse than no table at all.
+
 ## JSON record
 
 Field order is fixed on both sides so output diffs cleanly.
@@ -226,6 +259,7 @@ part of either platform's coverage that is not free.
 | Backup exclusion | an attribute the writer sets on each artifact, so it follows the files to whatever `path` you choose | structural: the *default* directory is `noBackupFilesDir`, which Auto Backup skips. Nothing is set on the artifacts | **the Android guarantee covers the default path and stops there.** Supply your own `path` and backup eligibility becomes a property of the directory you chose and the app's `data_extraction_rules` — some are excluded already, `filesDir` is not. The writer has no per-artifact attribute to set either way |
 | Link count / directory sync | `fstat` and `fsync` directly | behind `PlatformIo`, so the writer imports nothing from `android.*` | the Android writer is JVM-testable; `PlatformIo.Jvm` reports "cannot say" for link count, so that path is driven by a fake |
 | Deadlines | `DispatchTime` everywhere a wait or backoff is measured: the writer's queue waits, reopen/rotation backoffs, the purge lock, and the registry's close-drain waits (a `pthread_cond_timedwait_relative_np` condition, since `NSCondition` can only wait against a `Date`) | injected monotonic clock (`System.nanoTime`) | same guarantee, reached differently. Through 0.1.2 the registry's three waits were realtime — an NTP step during teardown could stretch a 200 ms close budget to the 30 s ceiling |
+| A purge landing after the close barrier | the sweep is already on the serial queue, so it lands *behind* the terminate barrier and runs after it: deletes every artifact, reports `durable` for the deletion, and never reopens | the executor is shut down, so the submission is refused — and the deletion then runs inline on the calling thread, once `awaitTermination` has established that no task can ever run again. Never reopens either, and deliberately does not consult `terminated`: a close whose own barrier submission was rejected leaves that flag false over a dead executor | the same answer on both — every artifact deleted, `durable` describing the deletion, `rebound` always false. **Through 0.2.0 Android deleted nothing here and reported `durable: false`**, contradicting its own comment two screens up: a blanket `catch (Exception)` read "I could not schedule the work" as "the deletion failed", so disposing a destination and then asking for a compliance purge silently erased nothing. Pinned by three Kotlin tests and an iOS parity anchor |
 | Sink lifecycle | `FileSinkLifecycle` (`ios/FileSinkLifecycle.swift`), which carries the transition table | `FileSinkLifecycle.kt`, the same states and transitions | **intended to be identical, and pinned by matching transition-table suites** — not identical *by construction*: these are two hand-written implementations of one table and can drift, which is what the paired suites exist to catch. A row added to one belongs in the other. Through 0.1.2 the rules lived in the two adapters instead, with no test on either, and they disagreed: with no live handle, `flush` and `close` reported `durable: true` on iOS and `false` on Android, in **both** the never-opened and the closed-after-open state. Now both answer `true` only where the claim is vacuous |
 | Releasing a sink nobody closed | `deinit`, which is deterministic: the descriptor and the registry slot come back whether or not JavaScript ran | no per-object equivalent — `finalize()` exists but cannot run — so the release comes from outside the object, when the React instance that opened it is destroyed (see below) | on Android `close()` or `dispose()` is still the right thing to call: the instance sweep covers a runtime dying, not a sink you dropped while it lives |
 | Console chunk size | 900 bytes per `os_log` entry | 3800 bytes per logcat entry | the platform limits genuinely differ; the behaviour around them — `(i/n)` markers, 8-chunk ceiling, a truncation notice that fits inside its own entry — is identical |

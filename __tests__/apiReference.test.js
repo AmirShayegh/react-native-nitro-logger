@@ -1,5 +1,5 @@
 const { readFileSync } = require('fs');
-const { join } = require('path');
+const { join, sep } = require('path');
 const ts = require('typescript');
 
 /**
@@ -76,8 +76,23 @@ const ts = require('typescript');
  * something, and that nothing is described that is gone.
  */
 
-const SOURCE = join(__dirname, '..', 'src', 'index.tsx');
+/**
+ * Every barrel a consumer can import from, keyed by the specifier they write.
+ *
+ * Two of them since 0.3.0: the root, and `react-native-nitro-logger/unstable`,
+ * which holds the raw Nitro sinks. Both are public surface, so both are held
+ * to the same standard — a name reachable from an export map entry and absent
+ * from the reference is undocumented no matter which entry point it came
+ * through. Adding a third means adding it here; the export map and this list
+ * are checked against each other below, so forgetting is a failure rather than
+ * a gap.
+ */
+const SOURCES = {
+  '.': join(__dirname, '..', 'src', 'index.tsx'),
+  './unstable': join(__dirname, '..', 'src', 'unstable.ts'),
+};
 const REFERENCE = join(__dirname, '..', 'docs', 'API.md');
+const MANIFEST = join(__dirname, '..', 'package.json');
 
 /**
  * Exports deliberately left out of the reference, each with its reason.
@@ -121,14 +136,14 @@ const UNDOCUMENTED = new Map();
  * to be loud — it is the one case where the reference could be silently
  * incomplete.
  */
-function parseExports() {
-  const source = readFileSync(SOURCE, 'utf8');
+function parseExports(path) {
+  const source = readFileSync(path, 'utf8');
   const file = ts.createSourceFile(
-    SOURCE,
+    path,
     source,
     ts.ScriptTarget.Latest,
     /* setParentNodes */ true,
-    ts.ScriptKind.TSX
+    path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
   );
 
   const names = [];
@@ -369,7 +384,16 @@ function searchableOf(text) {
 
 describe('docs/API.md', () => {
   const reference = readFileSync(REFERENCE, 'utf8');
-  const { names: exported, unresolvable } = parseExports();
+  // Unioned across the barrels: a name re-exported from both — as the raw sink
+  // factories are through 0.3.0 — is one export to document, not two.
+  const parsed = Object.entries(SOURCES).map(([specifier, path]) => ({
+    specifier,
+    ...parseExports(path),
+  }));
+  const exported = [...new Set(parsed.flatMap((p) => p.names))].sort();
+  const unresolvable = parsed.flatMap((p) =>
+    p.unresolvable.map((statement) => `${p.specifier}: ${statement}`)
+  );
   const indexed = indexedNames(reference);
   const markedWithRepeats = markedNames(reference);
   const marked = [...new Set(markedWithRepeats)];
@@ -387,6 +411,45 @@ describe('docs/API.md', () => {
 
     expect(marked.length).toBeGreaterThan(50);
     expect(marked).toContain('Log');
+  });
+
+  /**
+   * `SOURCES` is this file's model of the package's public entry points, and a
+   * model of something you do not own goes stale silently. The export map is
+   * the thing itself, so it decides.
+   *
+   * The rule is narrow on purpose: an entry whose `-source` condition points
+   * into `src/` is a TypeScript barrel a consumer can import names from, and
+   * every one of those must be parsed here. `./eslint-plugin` is not — it is
+   * JavaScript with its own README — and `./package.json` is not code at all.
+   * Both directions, because a stale entry here would parse a file nobody can
+   * import and quietly demand documentation for names that are not public.
+   */
+  test('every source-backed entry point in the export map is parsed here', () => {
+    const map = JSON.parse(readFileSync(MANIFEST, 'utf8')).exports;
+    const SOURCE_CONDITION = 'react-native-nitro-logger-source';
+
+    const fromMap = Object.entries(map)
+      .filter(
+        ([, value]) =>
+          value !== null &&
+          typeof value === 'object' &&
+          typeof value[SOURCE_CONDITION] === 'string' &&
+          value[SOURCE_CONDITION].startsWith('./src/')
+      )
+      .map(([specifier, value]) => [specifier, value[SOURCE_CONDITION]]);
+
+    // Not vacuous: the map has at least the root, and the filter above is what
+    // would silently empty this list if the condition were ever renamed.
+    expect(fromMap.length).toBeGreaterThanOrEqual(2);
+
+    const asPaths = Object.fromEntries(
+      Object.entries(SOURCES).map(([specifier, path]) => [
+        specifier,
+        `./src/${path.split(`${sep}src${sep}`).pop()}`,
+      ])
+    );
+    expect(Object.fromEntries(fromMap)).toEqual(asPaths);
   });
 
   test('every export statement names something resolvable from this file', () => {

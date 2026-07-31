@@ -162,10 +162,16 @@ public struct LogCollectOutcome: Sendable, Equatable {
 
   /// No bundle, nothing left out, nothing finished.
   ///
-  /// The answer for a writer that has been terminated or a collect whose
-  /// deadline expired. `truncated: false` is deliberate: nothing was dropped
-  /// from a bundle that does not exist, and saying otherwise would have a
-  /// caller apologising to a user for a partial upload that never happened.
+  /// The answer for a writer that has been terminated, a collect whose deadline
+  /// expired, and a collect refused because another one holds the writer or the
+  /// handle. `truncated: false` is deliberate: nothing was dropped from a bundle
+  /// that does not exist, and saying otherwise would have a caller apologising
+  /// to a user for a partial upload that never happened.
+  ///
+  /// A refusal is deliberately indistinguishable from a timeout here. Both mean
+  /// "no bundle, try again", both leave any earlier bundle untouched, and
+  /// splitting them would put a reason code in the caller's hands that it has no
+  /// different action to take on.
   public static let nothing = LogCollectOutcome(
     path: "", byteCount: 0, sourceFileCount: 0, truncated: false, complete: false)
 }
@@ -254,6 +260,22 @@ public final class LogWriter {
   /// injection and the twin test, and iOS had neither.
   public typealias Steady = () -> Int64
 
+  /// The wall clock, injectable — the twin of Android's `clock`.
+  ///
+  /// Distinct from [Steady] and used for the opposite kind of question. Age
+  /// rotation and archive retention ask "how old is this file", which is a claim
+  /// about calendar time that has to survive a restart, so it is measured
+  /// against the same clock that stamped the file rather than against a
+  /// monotonic counter that resets with the process.
+  ///
+  /// It is injectable for the reason [Steady] is: without it, an age is only
+  /// testable by sleeping, and a test that sleeps 200 ms against a 50 ms
+  /// threshold is a test whose result depends on how loaded the machine is.
+  /// Under `swift test --parallel` that stopped being hypothetical — more than
+  /// the threshold could elapse between creating the file and writing to it, so
+  /// the write itself rotated and the assertions moved by one.
+  public typealias Clock = () -> Date
+
   public let fileURL: URL
   public let canonicalPath: String
   let policy: LogRotationPolicy
@@ -264,6 +286,9 @@ public final class LogWriter {
   private let rawWrite: RawWrite
   private let compressor: Compressor
   private let steady: Steady
+  private let clock: Clock
+  /// See the parameter of the same name on `init`. Nil in production.
+  private let openSweepGate: (() -> Void)?
 
   // MARK: State behind `stateLock` — cheap, never held across I/O
 
@@ -272,6 +297,29 @@ public final class LogWriter {
   /// A binary semaphore rather than `NSLock`: the timed acquire in `clearLogs`
   /// needs a monotonic deadline, and `lock(before:)` only speaks `Date`.
   private let purgeLock = DispatchSemaphore(value: 1)
+  /// One collect at a time per writer.
+  ///
+  /// **Not for the reason `purgeLock` exists, and the difference is worth being
+  /// exact about.** Two builds cannot corrupt each other's staging file: builds
+  /// run as tasks on the serial `queue`, so they are already ordered end to end.
+  /// This lock does not add that.
+  ///
+  /// What it adds is that a second collect does not *enqueue* while a first is
+  /// running. Without it, N concurrent callers put N full copies of the log on
+  /// the queue, each one holding up every flush behind it, and each caller then
+  /// spends its whole deadline waiting for work it never began — and reports a
+  /// timeout, having caused one. Refusing is both cheaper and truer.
+  ///
+  /// **It does not make the bundle path stable for a caller.** There is one
+  /// well-known bundle name, so a later collect replaces an earlier one's file
+  /// whether or not they overlapped, and a caller holding a path from a
+  /// completed collect can always find different bytes there by the time it
+  /// uploads. That is inherent to the name, not to concurrency.
+  ///
+  /// A semaphore rather than `NSLock` for the reason `purgeLock` is one: the
+  /// acquire is timed against the caller's monotonic budget, and
+  /// `lock(before:)` only speaks `Date`.
+  private let collectLock = DispatchSemaphore(value: 1)
   private var reservedBytes = 0
   private var generation: UInt64 = 1
   private var closed = false
@@ -291,6 +339,9 @@ public final class LogWriter {
   /// is idempotent, because a writer that fails to open has both to run.
   private var lockDescriptor: Int32 = -1
   private var currentFileSize: UInt64 = 0
+  /// A placeholder only. `init` overwrites it with the file's real creation
+  /// date before anything reads it; the injected `clock` does not exist yet at
+  /// property-initialiser time, which is why this one literal stays.
   private var currentFileStart = Date()
   /// Monotonic ms of the last reopen attempt; nil until one has been made, so
   /// the very first attempt is never held back by an uninitialised timestamp.
@@ -326,6 +377,15 @@ public final class LogWriter {
     rawWrite: RawWrite? = nil,
     compressor: Compressor? = nil,
     steady: Steady? = nil,
+    clock: Clock? = nil,
+    /// Runs on the queue immediately before the open sweep, so a test can hold
+    /// the sweep there and observe the writer as it is *before* retention has
+    /// run.
+    ///
+    /// Injected rather than assigned afterwards because the sweep is submitted
+    /// during `init` — by the time a caller has a writer to set a property on,
+    /// the sweep may already have run.
+    openSweepGate: (() -> Void)? = nil,
     directoryShortfall: LogSecureFile.Shortfall = []
   ) throws {
     self.fileURL = fileURL
@@ -341,6 +401,8 @@ public final class LogWriter {
       #endif
     }
     self.steady = steady ?? Self.steadyMillis
+    self.clock = clock ?? { Date() }
+    self.openSweepGate = openSweepGate
     self.queue = DispatchQueue(label: "com.nitrologger.filewriter")
     queue.setSpecific(key: queueKey, value: true)
 
@@ -378,10 +440,33 @@ public final class LogWriter {
     handle = opened.handle
     descriptor = opened.descriptor
     currentFileSize = Self.size(of: opened.descriptor)
-    currentFileStart = Self.creationDate(of: fileURL)
+    currentFileStart = fileStart(created: opened.created)
 
     trimTornTailIfFramed()
-    sweepRetention()
+    // Submitted, not run here — the twin of Android's change, and made
+    // identically so the next person editing one finds the other.
+    //
+    // The queue is serial, so the sweep still runs before the first append's
+    // write. That is the only ordering it needs: it moves archives, and nothing
+    // can append to an archive it has not finished moving if the append is
+    // behind it in the same queue.
+    //
+    // It was never a deadlock risk here the way it was on Android — same
+    // thread, no cross-thread wait — but it is the same unbounded directory I/O
+    // performed **while the registry lock is held**, so opening one file with a
+    // large backlog to prune stalled every other file's acquire and release.
+    //
+    // The trim above stays synchronous. It must finish before any byte is
+    // appended, it is what the exclusive lock is taken to protect, and it is
+    // bounded by the file's size rather than by the directory's history.
+    // `.utility` for the same reason the append path is: nobody is waiting for
+    // this. It is the other half of the change that moved it off the acquiring
+    // thread — having decided the caller does not wait for the sweep, letting
+    // it compete with the UI at the caller's priority would be odd.
+    queue.async(qos: .utility) { [self] in
+      openSweepGate?()
+      sweepRetention()
+    }
     opening = false
   }
 
@@ -422,6 +507,12 @@ public final class LogWriter {
   /// `fstat` afterwards rejects anything that is not a regular file, so a FIFO
   /// left in place cannot wedge the writer on open either.
   ///
+  /// The `O_EXCL` probe below does not reopen that window. It is a second
+  /// `open`, not a check-then-open: each call decides the file it gets from its
+  /// own flags, and `O_CREAT | O_EXCL` refuses an existing name *including a
+  /// symlink*. Whichever call returns the descriptor, it was protected on the
+  /// way in and the checks after it run on that descriptor.
+  ///
   /// The mode is applied through the descriptor rather than the path for the
   /// same reason — `fchmod` acts on the file already held.
   ///
@@ -434,16 +525,30 @@ public final class LogWriter {
   /// meaning for the regular file that survives the check.
   private static func openForAppending(
     at url: URL
-  ) -> (handle: FileHandle, descriptor: Int32, shortfall: LogSecureFile.Shortfall)? {
+  ) -> (handle: FileHandle, descriptor: Int32, shortfall: LogSecureFile.Shortfall, created: Bool)? {
     // `O_RDWR`, not `O_WRONLY`: the startup tail scan reads through this exact
     // descriptor so that the offsets it computes and the `ftruncate` it applies
     // are guaranteed to concern the same inode. `pread` on a write-only
     // descriptor fails with `EBADF`, which would silently skip crash recovery.
-    let fd = Darwin.open(
-      url.path,
-      O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
-      mode_t(LogSecureFile.fileMode)
-    )
+    let appendFlags = O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+
+    // `O_EXCL` first, only to learn whether this call is the one that made the
+    // file. `open(2)` will not otherwise say, and the answer picks the clock
+    // that stamps the file's age — see `fileStart(created:)`, where getting it
+    // wrong makes every write after a rotation rotate again.
+    var created = true
+    var fd = Darwin.open(
+      url.path, appendFlags | O_CREAT | O_EXCL, mode_t(LogSecureFile.fileMode))
+    if fd < 0 {
+      // Deliberately not conditioned on `EEXIST`. Whatever refused the
+      // exclusive open, the ordinary one is the call that decides, and it
+      // reports its own failure below. `O_CREAT` stays on it so a file
+      // unlinked between the two calls is still created rather than failing
+      // `ENOENT`; that race reports `created: false` for a file it did make,
+      // which costs one age measured against a creation date of a moment ago.
+      created = false
+      fd = Darwin.open(url.path, appendFlags | O_CREAT, mode_t(LogSecureFile.fileMode))
+    }
     guard fd >= 0 else { return nil }
 
     var info = stat()
@@ -468,7 +573,29 @@ public final class LogWriter {
       Darwin.close(fd)
       return nil
     }
-    return (FileHandle(fileDescriptor: fd, closeOnDealloc: true), fd, shortfall)
+    return (FileHandle(fileDescriptor: fd, closeOnDealloc: true), fd, shortfall, created)
+  }
+
+  /// The instant this file's age is measured from.
+  ///
+  /// A file this open just created is stamped from `clock()`; one that was
+  /// already there is stamped from the filesystem. They are two different
+  /// timebases and the distinction is the whole point.
+  ///
+  /// A file created a moment ago is zero seconds old *by the writer's clock*,
+  /// whatever the filesystem says — so taking its real creation date while the
+  /// writer measures against an injected clock standing anywhere else makes the
+  /// fresh file instantly over-age. Rotation is where that bites: it renames
+  /// the file away and reopens a new one, so a wrong stamp here means the next
+  /// write rotates again, and the one after that, for as long as writing
+  /// continues.
+  ///
+  /// The filesystem date is right for the other case and only that one. An
+  /// existing file's age has to survive the process that created it, which is
+  /// why this is calendar time rather than the monotonic `steady` — and there
+  /// the two bases legitimately meet, because a real file carries a real date.
+  private func fileStart(created: Bool) -> Date {
+    created ? clock() : Self.creationDate(of: fileURL, fallback: clock())
   }
 
   private static func size(of descriptor: Int32) -> UInt64 {
@@ -477,9 +604,15 @@ public final class LogWriter {
     return UInt64(max(0, info.st_size))
   }
 
-  private static func creationDate(of url: URL) -> Date {
+  /// The filesystem's creation date, or `fallback` when it will not say.
+  ///
+  /// `fallback` is passed rather than defaulted to `Date()` because this is the
+  /// value age rotation measures against: taking the real clock here while the
+  /// writer runs on an injected one would make a fresh file look arbitrarily old
+  /// or arbitrarily young to the very check that reads it.
+  private static func creationDate(of url: URL, fallback: Date) -> Date {
     let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-    return (attributes?[.creationDate] as? Date) ?? Date()
+    return (attributes?[.creationDate] as? Date) ?? fallback
   }
 
   /// Cuts a torn trailing record left by a crash — but only when the producer
@@ -578,7 +711,33 @@ public final class LogWriter {
     let status = statusLocked(handleID)
     stateLock.unlock()
 
-    queue.async { [self] in
+    // `.utility`, and the *submission* carries it rather than the queue.
+    //
+    // This is the one place the priority is lowered, because this is the work
+    // nobody is waiting for: `appendBatch` has already returned by the time the
+    // block runs, and rotation and compression happen inside it. Dropping it
+    // below the UI is the whole point — a log write must never be why a frame
+    // is late.
+    //
+    // The queue itself deliberately has NO assigned QoS, and that is not an
+    // oversight. A `DispatchQueue` created with a QoS treats it as a ceiling
+    // and silently discards the QoS of anything submitted with `async(qos:)`;
+    // only a `DispatchWorkItem` carrying `.enforceQoS` gets past it. So giving
+    // the queue `.utility` would have quietly demoted the six deadline-bound
+    // barriers — `flush`, `close`, `maintain`, `collectLogs`, `clearLogs`,
+    // `logFilePaths` — to utility as well, which is the exact opposite of what
+    // is wanted for calls the JavaScript thread is blocked on. Leaving the
+    // queue unassigned lets those barriers keep inheriting their caller's QoS,
+    // which is a better answer than any constant picked here.
+    //
+    // What this does NOT buy: a barrier still queues behind whatever appends
+    // are already in front of it, and those now run at utility. Dispatch is
+    // documented to raise queued work when something higher-priority arrives
+    // behind it, but that override is not observable through
+    // `qos_class_self()`, so it is not something this comment will claim.
+    // Utility rather than background is partly why: the gap is a scheduling
+    // preference, not a starvation cliff.
+    queue.async(qos: .utility) { [self] in
       performWrite(data, handleID: handleID, entryCount: entryCount, generation: handleGeneration)
     }
     return LogAppendResult(accepted: true, rejectReason: nil, status: status)
@@ -751,7 +910,7 @@ public final class LogWriter {
       // which archives the file again and again until pruning has eaten every
       // real archive.
       currentFileSize = 0
-      currentFileStart = Date()
+      currentFileStart = clock()
       writesSinceHealthCheck = 0
       return false
     }
@@ -759,7 +918,7 @@ public final class LogWriter {
     handle = opened.handle
     descriptor = opened.descriptor
     currentFileSize = Self.size(of: opened.descriptor)
-    currentFileStart = Self.creationDate(of: fileURL)
+    currentFileStart = fileStart(created: opened.created)
     writesSinceHealthCheck = 0
     return true
   }
@@ -875,7 +1034,28 @@ public final class LogWriter {
   /// caller's thread could copy in an archive that is being renamed out from
   /// under it.
   func collectLogs(handleID: UInt64, deadlineMs: Double, maxTotalBytes: Double) -> LogCollectOutcome {
+    // One absolute instant, computed before any waiting, and every wait below
+    // is against it rather than against a fresh budget of its own: the gate,
+    // the flush, and the build. A caller that asked for 100 ms means 100 ms for
+    // the lot — handing each step the full figure turns the deadline into a
+    // multiple of itself.
     let expiry = DispatchTime.now() + .milliseconds(Self.clampDeadline(deadlineMs))
+
+    // One collect at a time per writer — see `collectLock`. Refused, not
+    // queued: a second collect that waited its turn would spend the caller's
+    // whole deadline before starting and then report a timeout for work it
+    // never began, which is a worse answer than "not now".
+    //
+    // Taken before the flush so the whole call is one exclusive region, and
+    // before anything is submitted to the queue, so this refusal leaves nothing
+    // enqueued to publish later.
+    guard collectLock.wait(timeout: expiry) == .success else { return .nothing }
+    // Registered here rather than after the `group.wait` below, so it runs
+    // *after* `handoff.giveUp()` on the timeout path: the return value is
+    // evaluated before the deferred blocks. That order is the point — a build
+    // abandoned under the handoff's own lock can never publish, so the next
+    // collect through this gate cannot find one racing it.
+    defer { collectLock.signal() }
 
     // Everything buffered goes in. A support bundle missing the last few
     // seconds is missing exactly the part somebody is asking about.
@@ -964,11 +1144,20 @@ public final class LogWriter {
     let finalURL = directory.appendingPathComponent(Self.supportName(baseName))
     let stagingURL = directory.appendingPathComponent(Self.supportStagingName(baseName))
 
-    // Both, before anything is written. The previous bundle is replaced rather
-    // than added to, and a staging file from a collect that died mid-write is
-    // not something to append to.
+    // Staging only, and deliberately not `finalURL`.
+    //
+    // Staging is this call's own scratch: a `.part` from a collect that died
+    // mid-write is not something to append to, and clearing it is what stops
+    // abandoned builds accumulating. Deleting it can destroy nothing a caller
+    // holds, because no call ever returns a `.part` path.
+    //
+    // The published bundle used to be deleted here too, and that was the
+    // defect. Every failure below — abandoned by timeout, nothing selected, a
+    // member that would not copy, a rename that failed — then left the caller
+    // of an *earlier* successful collect holding a path to a file that no
+    // longer existed, and no call ever reported destroying it. It is replaced
+    // by the `rename` at the end instead, which needs no pre-delete at all.
     try? fm.removeItem(at: stagingURL)
-    try? fm.removeItem(at: finalURL)
 
     // Newest first: the active file, then archives. `archives` already
     // excludes `.part` and — because the bundle is not an archive name — the
@@ -1092,6 +1281,23 @@ public final class LogWriter {
       return failed
     }
 
+    // **What serialises this against a purge is the queue, not a lock.** The
+    // rename below, and `clearLogs`'s whole sweep, are each a single task on
+    // this serial queue, so their mutating phases cannot interleave — one runs
+    // to completion before the other starts.
+    //
+    // Stated precisely, because the guarantee is narrower than "purge and
+    // collect are mutually exclusive": a purge CAN linearize between this
+    // collect's flush and the submission of this build, and then it deletes
+    // artifacts this build was about to read. What it cannot do is preempt a
+    // build already running. A purge submitted behind a slow compressor waits
+    // for it — returning non-durable if its own deadline expires first, then
+    // executing when the queue frees.
+    //
+    // A shared gate would close the first gap and cost more than it is worth:
+    // purge would additionally have to wait through collect's *flush*, which
+    // touches none of the files it deletes.
+    //
     // The publish barrier, with the rename inside it. Holding the lock across
     // the rename is what makes "did this publish?" a question with one answer:
     // a waiter that takes the lock either finds nothing renamed — and marks the
@@ -1107,13 +1313,20 @@ public final class LogWriter {
     )
     var renameFailed = false
     let committed = handoff.commit(published) {
-      do {
-        try fm.moveItem(at: stagingURL, to: finalURL)
-        return true
-      } catch {
+      // POSIX `rename(2)`, not `FileManager.moveItem`. `moveItem` refuses an
+      // existing destination, which is what forced the pre-delete this
+      // replaces; `rename` replaces one atomically, so a reader of the bundle
+      // path sees either the old bundle or the new one and never neither.
+      //
+      // It is also the failure behaviour that matters here: `rename` does not
+      // touch its destination unless it succeeds. A failed publish therefore
+      // leaves the earlier bundle exactly where it was, which is the window
+      // closed rather than narrowed.
+      guard rename(stagingURL.path, finalURL.path) == 0 else {
         renameFailed = true
         return false
       }
+      return true
     }
     guard committed else {
       try? fm.removeItem(at: stagingURL)
@@ -1300,14 +1513,21 @@ public final class LogWriter {
     let group = DispatchGroup()
     group.enter()
     queue.async { [self] in
-      terminated = true
-      closeCurrentHandle()
-      // After the handle, before anyone is told: the claim must outlast every
+      // `defer`, so the ordering is structural rather than incidental. Nothing
+      // in this block throws today, so this is not a behaviour change — it is
+      // the guarantee the Kotlin twin needs a `finally` to get, written the same
+      // way here so the next edit to either cannot quietly break one of them.
+      //
+      // The order is the stream-then-claim rule: the claim must outlast every
       // byte this writer will ever put on disk, or a replacement process can
       // start appending while the last batch is still landing.
-      releaseExclusiveLock()
-      onTerminated?()
-      group.leave()
+      defer {
+        releaseExclusiveLock()
+        onTerminated?()
+        group.leave()
+      }
+      terminated = true
+      closeCurrentHandle()
     }
     // Whatever the flush left of the budget, and nothing more. A deadline
     // already in the past makes this return at once rather than wait afresh.
@@ -1439,7 +1659,7 @@ public final class LogWriter {
     guard steady() >= rotationBlockedUntil else { return }
     let tooBig = currentFileSize >= policy.maxFileSizeBytes
     let tooOld = policy.maxFileAgeSeconds.map {
-      Date().timeIntervalSince(currentFileStart) >= $0
+      clock().timeIntervalSince(currentFileStart) >= $0
     } ?? false
     guard tooBig || tooOld else { return }
     rotationAttempts += 1
@@ -1449,7 +1669,7 @@ public final class LogWriter {
 
     let archiveURL = fileURL
       .deletingLastPathComponent()
-      .appendingPathComponent("\(fileURL.lastPathComponent).\(Self.rotationStamp())")
+      .appendingPathComponent("\(fileURL.lastPathComponent).\(Self.rotationStamp(at: clock()))")
 
     do {
       try FileManager.default.moveItem(at: fileURL, to: archiveURL)
@@ -1522,9 +1742,12 @@ public final class LogWriter {
     return formatter
   }()
 
-  private static func rotationStamp() -> String {
+  /// `at` rather than reading the clock here: this is `static`, and the
+  /// instant an archive is named after should be the same one the writer is
+  /// measuring ages against.
+  private static func rotationStamp(at instant: Date) -> String {
     let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
-    return "\(stampFormatter.string(from: Date()))_\(suffix)"
+    return "\(stampFormatter.string(from: instant))_\(suffix)"
   }
 
   // MARK: - Retention (queue only)
@@ -1567,7 +1790,7 @@ public final class LogWriter {
     // Oldest first for age, then count, then total size — each pass works on
     // what the previous one left.
     if let maxAge = policy.maxArchiveAgeSeconds {
-      let cutoff = Date().addingTimeInterval(-maxAge)
+      let cutoff = clock().addingTimeInterval(-maxAge)
       let expired = archives.filter { $0.modified < cutoff }
       expired.forEach(remove)
       archives.removeAll { entry in expired.contains { $0.url == entry.url } }
@@ -1777,6 +2000,168 @@ public final class LogWriter {
     return active + archives(in: directory, baseName: baseName).map(\.url.path)
   }
 
+  // MARK: - Support bundle deletion
+
+  /// Deletes the support bundle and its staging leftovers — see the spec's
+  /// `deleteSupportBundle` for what `true` does and does not promise.
+  ///
+  /// Queue-confined for the reason `logFilePaths` is, and a sharper one: a
+  /// collect publishes by renaming its staging name onto the final one, on this
+  /// queue. Unlinking those same two names from the caller's thread would run
+  /// inside that rename.
+  ///
+  /// Bounded, because this is reachable from the JS thread and the queue may be
+  /// wedged. A timeout is `false`: nothing was observed, and the one thing this
+  /// call must never do is report a bundle gone while it is still on disk.
+  ///
+  /// `handleGeneration` is checked the way `append` checks it, and on the queue
+  /// rather than here: a purge between this call and the block reaching the
+  /// front would otherwise have this handle delete the *current* generation's
+  /// bundle. Being active is not the same as being current — `liveGeneration()`
+  /// answers the first question only — and a stale handle owns nothing in that
+  /// directory any more.
+  func deleteSupportBundle(handleGeneration: UInt64, deadlineMs: Double) -> Bool {
+    // Already on the queue — a nested `async` + `wait` here would deadlock,
+    // exactly as `logFilePaths` guards against.
+    if DispatchQueue.getSpecific(key: queueKey) == true {
+      return deleteIfCurrent(handleGeneration)
+    }
+
+    let request = DeleteRequest()
+    var removed = false
+    let group = DispatchGroup()
+    group.enter()
+    // No explicit QoS, like every other deadline-bound barrier here: the
+    // submission inherits the caller, which is the thread waiting on it. See
+    // `queueQoSForTesting`.
+    queue.async { [self] in
+      // Nothing is cancellable once queued, so the block asks whether it is
+      // still wanted rather than being removed.
+      if request.begin() { removed = deleteIfCurrent(handleGeneration) }
+      group.leave()
+    }
+    guard group.wait(timeout: .now() + .milliseconds(Self.clampDeadline(deadlineMs)))
+      != .timedOut
+    else {
+      // A timed-out delete is not a cancelled one, and unlike a stale read it
+      // does damage. Sitting behind a slow build, this block would otherwise
+      // reach the front of the queue *after* that build renamed a fresh bundle
+      // into place, and unlink a bundle some later collect had just published
+      // and reported the path of — a call that returned "I deleted nothing"
+      // deleting somebody else's file, seconds later. This is the same barrier
+      // `CollectHandoff.giveUp` puts in front of a publish, for the same
+      // reason, in the opposite direction.
+      request.abandon()
+      return false
+    }
+    return removed
+  }
+
+  /// Deletes only if `handleGeneration` is still the writer's current one.
+  ///
+  /// Queue only, and the ordering is the point: the generation is read at the
+  /// last possible instant before the unlinks, so a purge that landed while
+  /// this block waited its turn is seen. Reading it at the call site instead
+  /// would compare a number that was true when the caller asked and false by
+  /// the time anything was deleted.
+  private func deleteIfCurrent(_ handleGeneration: UInt64) -> Bool {
+    stateLock.lock()
+    let current = generation
+    stateLock.unlock()
+    // Not this handle's directory any more. The same refusal `append` gives a
+    // stale handle, for the same reason, with more at stake: an append that
+    // slipped through would add a record to somebody else's file, and a delete
+    // that slipped through would remove somebody else's bundle.
+    guard handleGeneration == current else { return false }
+    return Self.deleteSupportArtifacts(at: fileURL)
+  }
+
+  /// One `deleteSupportBundle` call's claim on its own queued block.
+  ///
+  /// Per call, and shared by exactly the two parties to it — the thread waiting
+  /// and the block running — for the reason `CollectHandoff` is per collect: a
+  /// writer-wide flag would let one caller's timeout abandon another caller's
+  /// deletion.
+  ///
+  /// The window this does *not* close is the terminal one: a block that has
+  /// already passed `begin` runs to completion, so a caller can be told `false`
+  /// about a deletion that then happens. That direction is safe — the artifacts
+  /// are gone and a retry says so — and it cannot take a later bundle, because
+  /// the queue is serial and any subsequent publish is a later task than a
+  /// block that has already started.
+  private final class DeleteRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var abandoned = false
+
+    /// Claims the right to unlink. `false` once the caller has stopped waiting.
+    func begin() -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return !abandoned
+    }
+
+    func abandon() {
+      lock.lock()
+      abandoned = true
+      lock.unlock()
+    }
+  }
+
+  /// Unlinks the three support names under `fileURL`'s directory and reports
+  /// whether none of them remains.
+  ///
+  /// The one implementation, called from two places: on the queue while a
+  /// handle is live, and directly for a sink whose handle has gone — the same
+  /// split, for the same reason, as `logFilePaths` and `artifactPaths`. What
+  /// differs between the callers is what serializes them, never which names get
+  /// deleted.
+  ///
+  /// Absence is success. `removeItem` on a name that was never there fails, and
+  /// treating that as a failure would report a surviving bundle for the
+  /// overwhelmingly common case of deleting one that was already deleted — so
+  /// the verdict is a re-check of the three names rather than the return value
+  /// of three removals.
+  ///
+  /// The directory is synced for the reason the purge syncs it: `unlink`
+  /// returning success only puts the change in the directory's in-memory state,
+  /// and a crash before that reaches storage brings back a gzipped copy of the
+  /// whole log that this call said was gone.
+  static func deleteSupportArtifacts(at fileURL: URL) -> Bool {
+    let fm = FileManager.default
+    let directory = fileURL.deletingLastPathComponent()
+    let baseName = fileURL.lastPathComponent
+    // Exactly these three, from the same helpers `isArtifactName` uses. Never a
+    // directory listing filtered by `isArtifactName`: that matches the log files
+    // too, and this call is not a purge.
+    let names = [
+      supportName(baseName), supportStagingName(baseName), supportMemberName(baseName),
+    ]
+
+    for name in names {
+      let target = directory.appendingPathComponent(name)
+      // The result is deliberately ignored; the loop below is the verdict.
+      try? fm.removeItem(at: target)
+    }
+
+    // Only ENOENT counts as gone, matching the `Presence.ABSENT` rule the purge
+    // applies on both platforms. `fileExists` is the tempting spelling and the
+    // wrong one: it answers false for a permissions failure and for an I/O
+    // error as readily as for absence, so a directory that has stopped
+    // answering would report every artifact deleted.
+    let absent = names.allSatisfy { name in
+      var info = stat()
+      return lstat(directory.appendingPathComponent(name).path, &info) != 0 && errno == ENOENT
+    }
+    guard absent else { return false }
+
+    // A directory that is not there cannot be opened and has nothing whose
+    // removal needs committing; the three names are absent for the strongest
+    // possible reason.
+    var info = stat()
+    if lstat(directory.path, &info) != 0 && errno == ENOENT { return true }
+    return syncDirectory(directory)
+  }
+
   // MARK: - Purge
 
   /// Deletes every artifact and fences every handle.
@@ -1825,6 +2210,10 @@ public final class LogWriter {
     degraded = LogDegradation()
     stateLock.unlock()
 
+    // The whole sweep is ONE queue task, and that is what serialises it against
+    // a collect's publish — see the matching note in `buildBundle`. Splitting
+    // it into several tasks would let a build's rename land in the middle of a
+    // deletion, publishing a bundle the purge has already walked past.
     var outcome = LogClearOutcome(deletedCount: 0, failedPaths: [], durable: false)
     let group = DispatchGroup()
     group.enter()
@@ -1907,7 +2296,7 @@ public final class LogWriter {
       }
 
       currentFileSize = 0
-      currentFileStart = Date()
+      currentFileStart = clock()
       // Deletion succeeded whether or not a fresh file could be opened, and
       // `durable` describes the deletion — that is what a compliance caller
       // asked about. Whether the writer is usable again is a separate fact,
@@ -1982,6 +2371,15 @@ public final class LogWriter {
   var rotationAttemptsForTesting: Int {
     queue.sync { rotationAttempts }
   }
+
+  /// The queue's own QoS, which must stay `.unspecified`.
+  ///
+  /// Not a curiosity: a `DispatchQueue` created with a QoS treats it as a
+  /// ceiling and discards the QoS of work submitted with `async(qos:)`, so an
+  /// assigned QoS here would silently demote every deadline-bound barrier to
+  /// it. The appends carry `.utility` on the submission instead, which leaves
+  /// the barriers inheriting their caller.
+  var queueQoSForTesting: DispatchQoS { queue.qos }
 
   /// Blocks until everything already enqueued has run, so a test can assert on
   /// the file without racing the writer.

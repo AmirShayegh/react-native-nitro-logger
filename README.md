@@ -25,18 +25,65 @@ npm install react-native-nitro-logger react-native-nitro-modules
 `react-native-nitro-modules` is a required peer — this library is built on
 [Nitro Modules][nitro].
 
+## Setup
+
+Autolinking does the wiring; what it cannot do is any of the four things below,
+and each of them fails in a way that looks like something else.
+
+- **`react-native-nitro-modules` is a peer, not a dependency.** It is not
+  installed for you, and it is where the `createHybridObject` runtime lives.
+- **New Architecture only.** There is no bridge fallback: on an app with the
+  old architecture the Hybrid Object is never registered, so the failure is at
+  the first sink construction rather than at build time. React Native 0.76 and
+  later default to New Architecture; below that, turn it on explicitly.
+- **iOS: `cd ios && pod install`** after installing. The pods carry the
+  vendored Swift writer and the generated Nitro bindings; a stale `Podfile.lock`
+  builds an app whose binary does not contain them.
+- **Android: JDK 17.** The Gradle module targets it
+  (`JavaVersion.VERSION_17`). Check what Gradle is actually using with
+  `./gradlew --version` — the JVM it reports is the one that matters, and it is
+  not always the one on your `PATH`.
+
+They fail at different times, which is the fastest way to tell them apart.
+
+**At build time.** A JDK older than 17 fails the Android build, so there is no
+app and nothing below applies. Which phase reports it varies — the Android
+Gradle plugin often rejects the JVM while configuring, before this library is
+compiled at all — so the reliable check is `./gradlew --version` rather than
+matching an error string.
+
+**At module resolution.** A missing `react-native-nitro-modules` fails when the
+import is resolved, so it reads as a bundler error about a package that is not
+installed rather than as anything to do with logging.
+
+**At the first call that asks for the native object** — `createFileDestination()`
+— once the JavaScript has resolved and the app is running:
+
+```
+Cannot create an instance of HybridObject "FileSink" - It has not yet been
+registered in the Nitro Modules HybridObjectRegistry! Suggestions:
+...
+- All registered HybridObjects: [...]
+```
+
+That message means the native side is not registered, which narrows it to the
+New Architecture or the pods. The bracketed list at the end is what separates
+those two: empty means Nitro itself never initialised, so the app is on the old
+architecture; entries but no `FileSink` means Nitro is fine and *this* library's
+native code did not build in, which on iOS is a `pod install` that has not been
+run since it was added.
+
 ## Quick start
 
 ```ts
 import {
   Log,
   ConsoleDestination,
-  FileDestination,
-  createFileSink,
+  createFileDestination,
 } from 'react-native-nitro-logger';
 
 Log.addDestination(new ConsoleDestination());
-Log.addDestination(new FileDestination(createFileSink()));
+Log.addDestination(createFileDestination());
 
 Log.info('app started');
 Log.warning('retrying upload', { attempt: 2, statusCode: 503 });
@@ -154,10 +201,82 @@ handles regulated data.** It covers what the contract does and does not
 promise, the approved-key catalog, and the compliance boundary — in short, a
 build where reveal is possible is a build for synthetic data only.
 
+## Upgrading to 0.3.0
+
+Four breaking changes, each of which the compiler points at:
+
+| Was | Now |
+| --- | --- |
+| `scope.log(msg, 'error', meta)` | `scope.log(msg, { level: 'error', metadata: meta })` |
+| `LogOptions.scopeMetadata` | gone from the public type; set it by using a scope |
+| `import { createFileSink } from 'react-native-nitro-logger'` | `…from 'react-native-nitro-logger/unstable'` |
+| mutating a `CollectOutcome` field | the six spec result types are `readonly` |
+
+The scope's six level methods (`scope.info(msg, meta)` and siblings) did not
+change. Most callers of `createFileSink` want `createFileDestination()`
+instead, which is a root export and does both steps.
+
+### `/unstable` needs one line of Metro config on React Native 0.78
+
+That third row is the only change that is not purely an import edit, and only
+at the bottom of the supported range. `react-native-nitro-logger/unstable` is a
+**subpath export**, and Metro resolves subpath exports only when
+`unstable_enablePackageExports` is on:
+
+| Metro | Ships with | Default | `…/unstable` resolves |
+| --- | --- | --- | --- |
+| 0.81 | React Native 0.78 | `false` | no — `Unable to resolve module` |
+| 0.82+ | React Native ≥ 0.79 | `true` | yes |
+
+So on **React Native 0.78 only**, a project that imports `/unstable` sets the
+flag in its existing `metro.config.js`. Merged into the stock 0.78 template,
+which is what `npx @react-native-community/cli init` writes:
+
+```js
+// metro.config.js
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+const config = {
+  resolver: { unstable_enablePackageExports: true },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+Add the property to whatever `resolver` object your config already has — do not
+replace the file. `getDefaultConfig` is what supplies React Native's own
+transformer, asset and resolver settings, and a `metro.config.js` that exports
+a bare object without it will bundle something subtly wrong rather than fail
+loudly.
+
+Measured rather than inferred, and the two rows are not backed by the same
+thing.
+
+**The 0.81 row is a CI gate.** `scripts/check-metro-resolution.sh` installs
+React Native 0.78.0, React 19.0.0, Metro 0.81 and the packed tarball, then
+bundles each entry point twice — once under the stock template
+`metro.config.js` and once under the config above. It requires the root to
+bundle both times, requires `/unstable` to fail under the stock config *naming
+that specifier*, and requires the snippet above to fix it. So both the problem
+and the workaround are executed on every run. `min-rn-ios` and `min-rn-android`
+stay stock and import only the root entry point, because their value is in
+standing for an unmodified consumer app.
+
+**The 0.82+ row is not.** Its default is read out of
+`metro-config/src/defaults/index.js` at 0.82 and 0.83, plus the fact that
+neither `@react-native/metro-config@0.78.0` nor `@0.79.0` mentions the option,
+so a stock app gets Metro's own default either way; the resolution behaviour
+was bundled once locally on Metro 0.82, not in CI. Nothing re-checks it, so
+read it as accurate when written rather than as enforced.
+
+The **root** entry point resolved under every combination tried — this affects
+`/unstable` and nothing else, so a project that only ever imports from
+`react-native-nitro-logger` never meets any of it.
+
 ## Writing to a file
 
 ```ts
-const file = new FileDestination(createFileSink(), {
+const file = createFileDestination({
   rotation: {
     maxFileSizeBytes: 10 * 1024 * 1024,
     maxArchivedFilesCount: 5,
@@ -185,6 +304,12 @@ file.getLogFilePaths();     // the individual files, if you would rather send th
 const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
 if (bundle.complete && bundle.path !== '') {
   // Upload `bundle.path`. Nothing is transmitted or encrypted for you.
+  // Then delete it: collect -> upload -> delete. A bundle left behind is a
+  // gzipped copy of the whole log that retention never reclaims, because the
+  // sweep deliberately keeps a finished one in case you are still uploading it.
+  // Delete before disposing the destination — a released handle no longer knows
+  // whether that bundle is still its own, so it refuses rather than guess.
+  file.deleteSupportBundle();
 }
 
 const outcome = file.purge(5000);   // the compliance purge
@@ -214,12 +339,11 @@ Console.app, Xcode, and `adb logcat`.
 ```ts
 import {
   Log,
-  NativeConsoleDestination,
-  createNativeConsoleSink,
+  createNativeConsoleDestination,
 } from 'react-native-nitro-logger';
 
 Log.addDestination(
-  new NativeConsoleDestination(createNativeConsoleSink(), {
+  createNativeConsoleDestination({
     subsystem: 'com.example.app',
     category: 'network',
   })
@@ -316,12 +440,49 @@ into crash-tail trimming.
 
 | | Supported | Verified |
 | --- | --- | --- |
-| iOS | React Native ≥ 0.78 | CI builds, launches and exercises a pristine 0.78 consumer app |
-| Android | React Native at the example's version; **≥ 0.78 experimental**. minSdk 24 | CI runs the writer's unit suite and builds the example; no minimum-version consumer job exists yet |
+| iOS | React Native ≥ 0.78 | `min-rn-ios` packs a tarball into a pristine 0.78 app, builds it Release, launches it on a simulator and reads a run-ID-matched verdict out of the app container |
+| Android | React Native ≥ 0.78, minSdk 24 | `min-rn-android` does the same into a pristine 0.78 app, builds it Release for the emulator's ABI, launches it on API 34 and reads the verdict off the `ReactNativeJS` logcat tag |
 
 New Architecture only. The compatibility claims are split per platform on
 purpose — see [docs/PARITY.md](docs/PARITY.md) for what backs each one, and for
 where the two native writers genuinely differ.
+
+**Read the "Verified" column as the whole of the claim.** "Supported" is a
+statement of intent; only the right-hand column is a statement about something
+that ran, and both rows now point at a job that installs this package the way a
+consumer would — from a packed tarball into an app generated from the community
+template — rather than at a build of the example.
+
+The one difference between them is how the verdict leaves the app: iOS reads a
+file the library itself wrote, Android reads what the app said about itself over
+logcat. Reading the file on Android would need `run-as` and therefore a
+debuggable build, and a debug build is not what the job exists to verify — R8,
+the bundled JavaScript and the packaged `.so` set are precisely what differ in
+release. [docs/PARITY.md](docs/PARITY.md#compatibility-per-platform) has the
+rest, including where the two native writers genuinely differ.
+
+## Threading and builds
+
+Every public method on `Logger`, `ScopedLogger` and the destinations is
+synchronous and safe to call from any thread. What is *not* synchronous is the
+I/O: `Log.info(…)` renders the entry, hands it to each destination and returns,
+and the file destination buffers it. Records reach the disk when the buffer
+fills, when a timer expires, or when you call `flush(deadlineMs)` — which is the
+only call that waits for them.
+
+That matters in three places:
+
+- **Before the process ends.** `flushOnBackground()` covers the ordinary
+  backgrounding case. A crash is covered by the crash-tail recovery on the next
+  open, not by a flush, because there is nothing left to run one.
+- **Around `purge()`.** It is synchronous and deadline-bounded on purpose: a
+  compliance deletion that returned before finishing would be worth nothing.
+- **In a debug build.** The reveal branch is `__DEV__`-gated, so a debug build
+  writes private payloads in the clear to every destination — including the
+  file, where they outlive the session.
+  [docs/PRIVACY.md](docs/PRIVACY.md#the-compliance-boundary) is the contract;
+  the short version is that a build where reveal is possible is a build for
+  synthetic data only.
 
 ## Documentation
 

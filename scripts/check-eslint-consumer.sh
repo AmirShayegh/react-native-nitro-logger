@@ -164,13 +164,39 @@ EOF
   sed "s|nitroLogger.configs.strictTypeScript|nitroLogger.configs.$config|" \
     "$WORK/eslint.config.mjs" > eslint.config.mjs
 
-  # Same violation in each language. `patient.name` interpolated into the
-  # message is the leak the rules exist to stop.
+  # One violating source per rule, in each language.
+  #
+  # A single source exercising `no-dynamic-message` was enough to catch the
+  # bug this script was written for — a config that matched no files at all —
+  # and it is not enough for the question the script actually claims to
+  # answer, which is whether the DOCUMENTED setup enforces the rules a
+  # consumer is told it enforces. Three of the four could have been dropped
+  # from a preset, or renamed, and every case here would have stayed green.
+  #
+  # Each leaks through a different channel, and each is written so exactly one
+  # rule fires: the message is a literal wherever the message rule is not the
+  # subject, the metadata object is empty where the key rule is not, and the
+  # subsystem is a literal where the subsystem rule is not.
   for ext in ts tsx js; do
-    cat > "violating.$ext" <<'EOF'
+    cat > "msg.$ext" <<'EOF'
 import { Log } from 'react-native-nitro-logger';
 const patient = { name: 'Jane Doe' };
 Log.info(`patient ${patient.name} admitted`);
+EOF
+    cat > "meta.$ext" <<'EOF'
+import { Log } from 'react-native-nitro-logger';
+const patient = { id: 'p-1', name: 'Jane Doe' };
+Log.info('patient admitted', { [patient.id]: patient.name });
+EOF
+    cat > "corr.$ext" <<'EOF'
+import { Log } from 'react-native-nitro-logger';
+const patient = { mrn: 'MRN-1' };
+Log.scoped(patient.mrn, 'network');
+EOF
+    cat > "sub.$ext" <<'EOF'
+import { Log } from 'react-native-nitro-logger';
+const request = { path: '/patients/42' };
+Log.info('patient admitted', {}, `net-${request.path}`);
 EOF
   done
   # Controls: the correct form must produce nothing at all.
@@ -178,7 +204,7 @@ EOF
     cat > "clean.$ext" <<'EOF'
 import { Log } from 'react-native-nitro-logger';
 const patient = { name: 'Jane Doe' };
-Log.info('patient admitted', { patientName: patient.name });
+Log.info('patient admitted', { patientName: patient.name }, 'network');
 EOF
   done
 
@@ -207,7 +233,13 @@ parser_present() {
 }
 
 # Assert on the JSON: which files carry which rule IDs, and no fatal errors.
-# expect_findings <fixture> <files that must report> <label> <files to lint>
+# expect_findings <fixture> <file=rule pairs> <label> <files to lint>
+#
+# The expectation is a MAP, not a list. A list of filenames says only that each
+# reported something, which a preset that had swapped two rules would satisfy
+# — and swapping them is exactly what a config edit does by accident. Naming
+# the rule per file is what makes case 5 below able to say `recommended`
+# enables these two and not those two.
 #
 # The lint set is a parameter because the JavaScript-only config is SUPPOSED to
 # ignore TypeScript. Handing it a `.ts` file and calling the resulting "File
@@ -225,11 +257,20 @@ expect_findings() {
     process.stdin.on("end", () => {
       let results;
       try { results = JSON.parse(raw); } catch { console.log("FAIL|eslint produced no JSON"); return; }
-      const expected = new Set(process.env.EXPECTED.split(" ").filter(Boolean));
+      // `file=rule` pairs. A file absent from the map is a control and must
+      // report nothing at all.
+      const expected = new Map(
+        process.env.EXPECTED.split(" ")
+          .filter(Boolean)
+          .map((pair) => {
+            const at = pair.indexOf("=");
+            if (at < 0) throw new Error(`expectation "${pair}" is not file=rule`);
+            return [pair.slice(0, at), "nitro-logger/" + pair.slice(at + 1)];
+          })
+      );
       const targets = process.env.TARGETS.split(" ").filter(Boolean);
-      const RULE = "nitro-logger/no-dynamic-message";
       const problems = [];
-      const flagged = new Set();
+      const flagged = new Map();
       const seen = [];
 
       for (const r of results) {
@@ -240,8 +281,18 @@ expect_findings() {
           problems.push(`${name}: fatal — ${m && m.message}`);
         }
         for (const m of r.messages) {
-          if (m.ruleId === RULE) flagged.add(name);
-          else if (!m.fatal) problems.push(`${name}: unexpected ${m.ruleId || m.message}`);
+          if (m.ruleId && m.ruleId.startsWith("nitro-logger/")) {
+            const already = flagged.get(name);
+            // Two different rules on one file means the source is not the
+            // single-channel leak it was written to be, and the map below
+            // would then be asserting on whichever arrived first.
+            if (already && already !== m.ruleId) {
+              problems.push(`${name}: ${already} AND ${m.ruleId}`);
+            }
+            flagged.set(name, m.ruleId);
+          } else if (!m.fatal) {
+            problems.push(`${name}: unexpected ${m.ruleId || m.message}`);
+          }
         }
         if (/File ignored/.test(JSON.stringify(r.messages))) problems.push(`${name}: ignored, no matching config`);
       }
@@ -271,9 +322,19 @@ expect_findings() {
         }
       }
 
-      for (const f of expected) if (!flagged.has(f)) problems.push(`${f}: expected ${RULE}, got nothing`);
-      for (const f of flagged) if (!expected.has(f)) problems.push(`${f}: flagged but should be clean`);
-      console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + [...flagged].sort().join(","));
+      for (const [f, rule] of expected) {
+        const got = flagged.get(f);
+        if (!got) problems.push(`${f}: expected ${rule}, got nothing`);
+        else if (got !== rule) problems.push(`${f}: expected ${rule}, got ${got}`);
+      }
+      for (const f of flagged.keys()) {
+        if (!expected.has(f)) problems.push(`${f}: flagged but should be clean`);
+      }
+      const summary = [...flagged.entries()]
+        .sort()
+        .map(([f, rule]) => `${f}:${rule.replace("nitro-logger/", "")}`)
+        .join(",");
+      console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + summary);
     });
   ' <<< "$json")"
 
@@ -285,15 +346,25 @@ expect_findings() {
   fi
 }
 
-ALL_FILES="violating.ts violating.tsx violating.js clean.ts clean.tsx clean.js"
-JS_FILES="violating.js clean.js"
+# The four leaks, in every language, plus the clean controls.
+ALL_FILES="msg.ts msg.tsx msg.js meta.ts meta.tsx meta.js corr.ts corr.tsx corr.js sub.ts sub.tsx sub.js clean.ts clean.tsx clean.js"
+JS_FILES="msg.js meta.js corr.js sub.js clean.js"
+
+# file=rule, for the strict presets, which carry all four.
+STRICT_EXPECTED="\
+msg.ts=no-dynamic-message msg.tsx=no-dynamic-message msg.js=no-dynamic-message \
+meta.ts=no-computed-metadata-key meta.tsx=no-computed-metadata-key meta.js=no-computed-metadata-key \
+corr.ts=no-derived-correlation corr.tsx=no-derived-correlation corr.js=no-derived-correlation \
+sub.ts=literal-subsystem sub.tsx=literal-subsystem sub.js=literal-subsystem"
+STRICT_EXPECTED_JS="msg.js=no-dynamic-message meta.js=no-computed-metadata-key \
+corr.js=no-derived-correlation sub.js=literal-subsystem"
 
 echo "==> case 1: strictTypeScript, locked parser $PARSER_LOCKED + TypeScript $TS_LOCKED"
 if fixture ts-locked strictTypeScript "$PARSER_LOCKED" "$TS_LOCKED"; then
   if parser_present ts-locked; then
     note ok "parser resolves, as this case requires"
-    expect_findings ts-locked "violating.ts violating.tsx violating.js" \
-      "all three languages" "$ALL_FILES"
+    expect_findings ts-locked "$STRICT_EXPECTED" \
+      "all four rules, all three languages" "$ALL_FILES"
   else
     note FAIL "parser did not install; this case cannot prove anything"
     failures=$((failures + 1))
@@ -306,8 +377,8 @@ echo "==> case 2: strictTypeScript, lowest verified parser $PARSER_LOWEST + Type
 # they cannot read — a failure that looks like a plugin bug and is not.
 if fixture ts-lowest strictTypeScript "$PARSER_LOWEST" "$TS_FOR_LOWEST"; then
   if parser_present ts-lowest; then
-    expect_findings ts-lowest "violating.ts violating.tsx violating.js" \
-      "all three languages" "$ALL_FILES"
+    expect_findings ts-lowest "$STRICT_EXPECTED" \
+      "all four rules, all three languages" "$ALL_FILES"
   else
     note FAIL "parser did not install; this case cannot prove anything"
     failures=$((failures + 1))
@@ -322,7 +393,8 @@ if fixture js-only strict; then
   else
     note ok "parser is genuinely absent"
     # The documented JS-only config must still work without the optional peer.
-    expect_findings js-only "violating.js" "JavaScript, without the optional peer" "$JS_FILES"
+    expect_findings js-only "$STRICT_EXPECTED_JS" \
+      "JavaScript, without the optional peer" "$JS_FILES"
   fi
 fi
 
@@ -335,7 +407,7 @@ if fixture ts-noparser strictTypeScript; then
     # Capture status separately: substring checks alone would accept a WARNING
     # that happened to contain these words while ESLint exited 0, which is the
     # silent-pass this whole script exists to rule out.
-    OUT="$( (cd "$WORK/ts-noparser" && node ./node_modules/eslint/bin/eslint.js violating.ts) 2>&1 )"
+    OUT="$( (cd "$WORK/ts-noparser" && node ./node_modules/eslint/bin/eslint.js msg.ts) 2>&1 )"
     STATUS=$?
     problems=()
     [ "$STATUS" -eq 0 ] && problems+=("exited 0; it must fail closed")
@@ -357,6 +429,29 @@ if fixture ts-noparser strictTypeScript; then
       note FAIL "$(IFS='; '; echo "${problems[*]}")"
       failures=$((failures + 1))
     fi
+  fi
+fi
+
+echo "==> case 5: recommendedTypeScript enables exactly the two OSS rules"
+# The presets are the package's public promise about which channels are
+# policed, and until now nothing checked that promise from outside. `strict` is
+# documented as `recommended` plus correlation and subsystem; if a rule moved
+# between them, or a preset lost one, every case above would still pass because
+# all of them use a strict preset.
+#
+# This says it in the only way that cannot be satisfied by accident: the SAME
+# four sources cases 1 and 2 prove are violations, two of which must now report
+# nothing. A source that had stopped being a violation would take the strict
+# cases red first.
+if fixture ts-recommended recommendedTypeScript "$PARSER_LOCKED" "$TS_LOCKED"; then
+  if parser_present ts-recommended; then
+    expect_findings ts-recommended \
+      "msg.ts=no-dynamic-message msg.tsx=no-dynamic-message msg.js=no-dynamic-message \
+       meta.ts=no-computed-metadata-key meta.tsx=no-computed-metadata-key meta.js=no-computed-metadata-key" \
+      "message and metadata keys only; correlation and subsystem silent" "$ALL_FILES"
+  else
+    note FAIL "parser did not install; this case cannot prove anything"
+    failures=$((failures + 1))
   fi
 fi
 

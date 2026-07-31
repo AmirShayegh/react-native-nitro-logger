@@ -7,6 +7,7 @@ import { utf8Length } from '../src/utf8';
 import type { LogEntry } from '../src/types';
 import type { LogFormatter } from '../src/formatters/types';
 import { MemoryWriter } from './helpers/MemoryFileSink';
+import type { MemoryFileSink } from './helpers/MemoryFileSink';
 import type { ClearOutcome } from '../src/specs/FileSink.nitro';
 
 const at = Date.UTC(2026, 6, 27, 12, 15, 30, 842);
@@ -258,7 +259,10 @@ describe('FileDestination — maintain', () => {
     expect(destination.degradation()).toBe(0b001);
 
     // Someone else purged underneath it. The files this one would sweep are
-    // the new generation's.
+    // the new generation's. `other` has to be *open* to purge: a handle that
+    // never opened has no live handle to delete through, and both natives
+    // refuse it — see the no-handle rows of `FileSinkLifecycle`'s table.
+    other.open(sink.openedPath!, undefined, true);
     other.clearLogs(1000);
     destination.write(entry({ message: 'fences it' }));
     destination.flush(1000);
@@ -392,7 +396,9 @@ describe('FileDestination — collectForSupport', () => {
 
     // Someone else purged underneath it. The files this one would pack are the
     // new generation's, and a bundle built from them would be a stale read of
-    // somebody else's log.
+    // somebody else's log. `other` is opened first because a handle that never
+    // opened cannot purge — the natives answer that with no deletion at all.
+    other.open(sink.openedPath!, undefined, true);
     other.clearLogs(1000);
     destination.write(entry({ message: 'fences it' }));
     destination.flush(1000);
@@ -453,11 +459,15 @@ describe('FileDestination — collectForSupport', () => {
     destination.dispose();
 
     const first = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
-    first.path = '/tmp/somewhere-else';
+    // The cast is the point, not a workaround. `CollectOutcome`'s fields are
+    // `readonly` from 0.3.0, which tells a TypeScript caller not to do this and
+    // stops nothing at runtime — the annotation is erased, and the object that
+    // crosses the Nitro boundary is an ordinary mutable one. So the hazard the
+    // assertion below guards is still exactly as real as it was.
+    (first as { path: string }).path = '/tmp/somewhere-else';
 
-    // `CollectOutcome` crosses the Nitro boundary with mutable fields. A shared
-    // constant handed to every failed call would let one caller's edit change
-    // what the next one is told.
+    // A shared constant handed to every failed call would let one caller's
+    // edit change what the next one is told.
     const second = destination.collectForSupport({ maxTotalBytes: 1_000_000 });
     expect(second.path).toBe('');
   });
@@ -474,6 +484,156 @@ describe('FileDestination — collectForSupport', () => {
     expect(sink.collectedBundles[1]).toContain('first');
   });
 });
+
+describe('FileDestination — deleteSupportBundle', () => {
+  test('the bundle a collect produced is gone afterwards', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    expect(sink.bundleExists).toBe(true);
+
+    // Asserted on the sink's own state, not just on the returned boolean: a
+    // wrapper that answered `true` without calling anything would pass the
+    // second assertion alone.
+    expect(destination.deleteSupportBundle()).toBe(true);
+    expect(sink.bundleExists).toBe(false);
+  });
+
+  test('deleting a bundle that was never collected is true, not an error', () => {
+    const { destination, sink } = build();
+
+    // The overwhelmingly common case for a retry, and for a support flow whose
+    // collect found nothing to pack. "Already gone" is the outcome the caller
+    // asked for.
+    expect(destination.deleteSupportBundle()).toBe(true);
+    expect(sink.bundleExists).toBe(false);
+  });
+
+  test('the deadline reaches the sink, and defaults without one', () => {
+    const { destination, sink } = build();
+    destination.deleteSupportBundle(250);
+    destination.deleteSupportBundle();
+
+    expect(sink.deleteBundleCalls[0]).toBe(250);
+    // Three unlinks and an fsync, not a compression pass — so this takes the
+    // ordinary deadline rather than the collect's longer one.
+    expect(sink.deleteBundleCalls[1]).toBe(2000);
+  });
+
+  test('a disposed destination refuses, and leaves the bundle alone', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'collected before teardown' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    destination.dispose();
+
+    // Tempting to allow — the upload really can finish after teardown — and
+    // wrong. With the handle gone there is no generation left to check, so
+    // another destination may own that path by now and be mid-publish in it,
+    // and the bundle removed would be *its* bundle. `getLogFilePaths` still
+    // answering after dispose is not a precedent: reading a directory you no
+    // longer own is harmless, deleting from it is not.
+    const callsBefore = sink.deleteBundleCalls.length;
+
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+    // The sink is never reached, which is what pins THIS guard rather than the
+    // double's. Both refuse a disposed sink — the adapters do it too — so
+    // without this the assertions above pass on a wrapper that has no guard at
+    // all and simply relays whatever the sink says.
+    expect(sink.deleteBundleCalls).toHaveLength(callsBefore);
+  });
+
+  test('a sink that never opened has nothing to delete, vacuously', () => {
+    // Asserted on the sink, because a `FileDestination` opens in its
+    // constructor and cannot reach this state. It is the other side of the
+    // no-handle case and the reason that case is not a blanket refusal:
+    // nothing was ever created, so "no bundle remains" holds with nothing to
+    // check — the same `!mayHaveArtifacts` both adapters read.
+    const neverOpened = new MemoryWriter().attach();
+
+    expect(neverOpened.deleteSupportBundle(1000)).toBe(true);
+  });
+
+  test('a fenced destination refuses, and leaves the bundle alone', () => {
+    const { destination, sink, writer } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    fenceFromOutside(destination, writer.attach());
+
+    // The opposite answer to the disposed case, and the right one: a fence
+    // means a purge moved the writer on, so the bundle in that directory is
+    // whoever holds the writer's now — the same reason `collectForSupport`
+    // declines to pack it.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a destination that has not yet noticed it is stale reports the sinks refusal', () => {
+    const { destination, sink, writer } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    // A sibling purges; this destination is now stale at the sink and does not
+    // know it, because fencing is not instantaneous — a handle finds out on its
+    // next write, and this one has not written since. So `isEnabled` is still
+    // true here while the sink refuses.
+    const other = writer.attach();
+    other.open('/memory/logs/app.log', undefined, true);
+    other.clearLogs(1000);
+    expect(destination.isEnabled).toBe(true);
+
+    // The wrapper must return what the sink said. Answering `true` off the back
+    // of its own un-updated flag would tell a support flow the copy is gone
+    // while it is sitting in another generation's directory.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a native throw is reported as false, not raised at the caller', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    sink.deleteBundleThrows = true;
+
+    // A support flow can act on "the copy may still be there". It can do
+    // nothing with a native error object that it cannot do with that fact.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a purge removes the bundle too, so a later delete is vacuously true', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(destination.purge(1000).durable).toBe(true);
+    // A compliance purge that left a gzipped copy of the log behind would not
+    // be a purge. Both natives sweep the three support names with everything
+    // else, and this is the JS side of that claim.
+    expect(sink.bundleExists).toBe(false);
+    expect(destination.deleteSupportBundle()).toBe(true);
+  });
+});
+
+/**
+ * Fences `victim` the way production does — a second handle purges the writer,
+ * and the victim finds out on its next write by having the append rejected.
+ *
+ * Not `victim.purge()`: that rebinds its own caller, so it produces a *live*
+ * destination rather than a fenced one. The asymmetry is the whole point of
+ * every test that uses this.
+ */
+function fenceFromOutside(
+  victim: FileDestination,
+  other: MemoryFileSink,
+  path = '/memory/logs/app.log'
+): void {
+  other.open(path, undefined, true);
+  other.clearLogs(1000);
+  victim.write(entry({ message: 'rejected by a stale generation' }));
+  victim.flush(1000);
+  expect(victim.isEnabled).toBe(false);
+}
 
 describe('FileDestination — oversized entries', () => {
   test('a formatter that can shed structure is asked to', () => {
@@ -571,6 +731,64 @@ describe('FileDestination — oversized entries', () => {
     expect(
       (oversize!.metadata as { droppedBytes: number }).droppedBytes
     ).toBeGreaterThan(5000);
+  });
+
+  /**
+   * The size that travels to the batcher is the size of what it is given.
+   *
+   * `write` now hands the batcher the byte count rendering already computed,
+   * so the count is not measured twice per record. The trap is on this path:
+   * the string that reaches the batcher on an oversize entry is the *notice*,
+   * a couple of hundred bytes, while the number in scope a line earlier is the
+   * five-kilobyte entry that caused it. Handing over that number would inflate
+   * the batcher's pending total by twenty times per oversize record, which
+   * would then flush early, refuse records it had room for, and report a
+   * buffered figure that matches nothing on disk.
+   *
+   * Buffered bytes are the assertion because they are the batcher's own
+   * arithmetic — the one number that comes from what it was told rather than
+   * from what it can see.
+   */
+  test('an oversize entry buffers the notice size, not the entry size', () => {
+    // `maxPendingBytes` is the instrument: 1000 is roomy for the notice, which
+    // fits inside `maxEntryBytes` by construction, and far too small for the
+    // 5 KB entry. So if the entry's size were the number handed over, the
+    // batcher would believe its buffer had just overflowed and drop the notice
+    // — and the file would end up with nothing in it at all.
+    const { destination, writer } = build({
+      maxEntryBytes: 220,
+      maxPendingBytes: 1000,
+    });
+    destination.write(
+      entry({ message: 'x'.repeat(5000), correlation: 'c'.repeat(300) })
+    );
+    destination.flush(1000);
+
+    const [written] = records(writer);
+    expect(written!.message).toBe('a log entry was too large to record');
+    // One loss — the entry — not two.
+    expect(destination.unreportedLoss().entries).toBe(0);
+  });
+
+  test('a shortened entry buffers its shortened size', () => {
+    // The same hazard one branch over: `formatWithin` got under the limit, so
+    // what reaches the batcher is the shortened record — not the original that
+    // was measured before shortening was attempted.
+    const { destination, writer } = build({
+      maxEntryBytes: 400,
+      maxPendingBytes: 1000,
+    });
+    destination.write(entry({ message: 'x'.repeat(5000) }));
+    destination.flush(1000);
+
+    // Asserting on the CONTENT, not the line count. Overstate the size and the
+    // batcher drops the record as an overflow — then writes a loss notice
+    // about it, which is also one line and also parses. A count would be
+    // satisfied by exactly the failure this test exists to catch.
+    const written = records(writer);
+    expect(written).toHaveLength(1);
+    expect(written[0]!.message).toMatch(/^x+/);
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
   });
 
   test('an entry inside the limit is left exactly alone', () => {
@@ -926,47 +1144,800 @@ describe('FileDestination — through the Logger', () => {
 });
 
 /**
- * The double is only worth anything if it can fail the way the real thing
- * fails, and answer the way the real thing answers.
+ * The double, on the questions the shared table does not ask.
  *
- * These are `FileSinkLifecycle`'s no-live-handle rules — the table both native
- * adapters derive from — asserted against the in-memory sink. The double had
- * two divergences from it: it named a `failedPath` for a deletion nobody
- * attempted, and it hardcoded `durable: false` even for a sink that never
- * opened, where the claim is vacuously true. Neither was reachable through
- * `FileDestination`, which short-circuits before a disposed sink; both would
- * have been inherited by the next caller that was not guarded.
+ * The no-handle rows themselves moved to `spec/file-sink-lifecycle.rows.json`
+ * and are asserted by `__tests__/fileSinkLifecycleRows.test.ts` alongside the
+ * two native suites that read the same file. They used to live here, in a
+ * `describe.each` that could agree with a table nobody else was reading — and
+ * this double had in fact drifted from it on four rows: it accepted batches on
+ * a sink that was never opened, reported an unfinished collect where the
+ * natives report a finished one with nothing in it, drained on a flush after
+ * close, and named a `failedPath` for a deletion nobody attempted. None was
+ * reachable through `FileDestination`, which short-circuits first, which is
+ * exactly why they survived.
+ *
+ * What stays here is everything the table's shape cannot carry: a third
+ * lifecycle state, the hostile hatch, and the aliasing rule. The table is a
+ * map of op and mode to an answer; these are not answers.
  */
-describe('MemoryFileSink — the no-handle rules the natives follow', () => {
-  test('a closed sink that wrote files cannot claim a durable purge', () => {
-    const writer = new MemoryWriter();
-    const sink = writer.attach();
+describe('MemoryFileSink — beyond the shared no-handle table', () => {
+  /** A sink that was never opened: no handle, and nothing can exist yet. */
+  function neverOpened(): MemoryFileSink {
+    return new MemoryWriter().attach();
+  }
+
+  /** A sink that opened, wrote, and closed: no handle, and files may exist. */
+  function openedThenClosed(): MemoryFileSink {
+    const sink = new MemoryWriter().attach();
     sink.open('/memory/logs/app.log', undefined, true);
     sink.appendBatch('{"m":1}\n', 1);
     sink.close(1000);
+    return sink;
+  }
 
-    const outcome = sink.clearLogs(1000);
-
-    expect(outcome.durable).toBe(false);
-    expect(outcome.deletedCount).toBe(0);
-    expect(outcome.rebound).toBe(false);
-    // Nothing was attempted, so nothing failed. A path here reports a deletion
-    // failure for a file no one tried to delete.
-    expect(outcome.failedPaths).toEqual([]);
+  /**
+   * The table's `getLogFilePaths` row pins a *count*, because the natives
+   * enumerate a real directory and a literal path is not portable across the
+   * three targets. A count alone would let a closed double hand back one
+   * entirely wrong path, so the identity of the path stays asserted here.
+   */
+  test('a closed sink still lists exactly what it left behind', () => {
+    expect(openedThenClosed().getLogFilePaths()).toEqual([
+      '/memory/logs/app.log',
+    ]);
+    expect(neverOpened().getLogFilePaths()).toEqual([]);
   });
 
-  test('a sink that never opened purges vacuously, not falsely', () => {
+  test('lists archives when a test stages them', () => {
+    const sink = openedThenClosed();
+    sink.artifactPaths = [
+      '/memory/logs/app.log',
+      '/memory/logs/app.log.20260101T000000Z_abcd.gz',
+    ];
+    expect(sink.getLogFilePaths()).toHaveLength(2);
+  });
+
+  /**
+   * A failed open forfeits vacuous success, and does not get it back.
+   *
+   * `acquire` creates the log directory before it opens the file, so a throw
+   * is not evidence that nothing was written. A double that only set the bit
+   * on success would let a half-failed open claim a durable compliance purge
+   * over a directory it had just made.
+   */
+  test('a sink whose open threw cannot claim a vacuous purge', () => {
     const writer = new MemoryWriter();
-    const sink = writer.attach();
-    sink.close(1000);
+    const first = writer.attach();
+    first.open('/memory/logs/app.log', undefined, true);
+
+    const second = writer.attach();
+    // Same writer, different path: the double refuses, the way the registry
+    // refuses a conflicting configuration.
+    expect(() =>
+      second.open('/memory/logs/other.log', undefined, true)
+    ).toThrow();
+
+    expect(second.clearLogs(1000).durable).toBe(false);
+    expect(second.flush(1000).durable).toBe(false);
+  });
+
+  /**
+   * The hatch, and its limits.
+   *
+   * The double must be able to lie the way a native across a bridge can lie —
+   * a status reporting bytes queued on a sink that has none is a real thing a
+   * caller has to survive. It is deliberately confined to two answers, because
+   * a double that can be told what to say about its own *lifecycle* cannot
+   * disagree with the caller, and disagreeing is the entire job.
+   */
+  test('a hostile status is merged over the computed one', () => {
+    const sink = neverOpened();
+    sink.hostileStatus = { queuedBytes: 4096, degraded: 0b100 };
+
+    const status = sink.getStatus();
+    expect(status.queuedBytes).toBe(4096);
+    expect(status.degraded).toBe(0b100);
+    // Merged, not replaced: the fields it does not name keep their real values.
+    expect(status.lostEntries).toBe(0);
+  });
+
+  test('a hostile clear outcome is merged over the computed one', () => {
+    const sink = openedThenClosed();
+    sink.hostileClear = { durable: true, deletedCount: 99 };
 
     const outcome = sink.clearLogs(1000);
-
-    // Nothing was ever created, so "every artifact is gone" holds with nothing
-    // to check. `false` here would re-arm a compliance failure for a sink that
-    // cannot owe one.
     expect(outcome.durable).toBe(true);
-    expect(outcome.failedPaths).toEqual([]);
+    expect(outcome.deletedCount).toBe(99);
     expect(outcome.rebound).toBe(false);
+  });
+
+  /**
+   * Answers are fresh objects, not shared constants.
+   *
+   * The no-handle answers are built from module-level constants, and handing
+   * one back unchanged would let a caller that mutates a status it was given
+   * change what every later call on every sink reports. A real bridge marshals
+   * a new value each time and has no such failure mode; a double that does is
+   * a source of cross-test contamination that looks like a real bug.
+   */
+  test('a mutated status does not poison the next one', () => {
+    const first = neverOpened();
+    const status = first.getStatus();
+    (status as { queuedBytes: number }).queuedBytes = 9999;
+
+    expect(first.getStatus().queuedBytes).toBe(0);
+    expect(neverOpened().getStatus().queuedBytes).toBe(0);
+    expect(neverOpened().maintain(1000).queuedBytes).toBe(0);
+  });
+
+  /**
+   * A live handle comes from `open`, and there is no other way to get one.
+   *
+   * Staging "this sink's handle is gone" is legitimate; staging "this sink has
+   * a handle it never acquired" is a state no adapter can be in, and the point
+   * of computing every answer from the state is that a test cannot script its
+   * way into one.
+   */
+  test('a handle cannot be conjured by assignment', () => {
+    const sink = neverOpened();
+    expect(() => {
+      sink.closed = false;
+    }).toThrow(/open\(\)/);
+  });
+
+  /**
+   * A purge deletes artifacts, including the archives a test staged.
+   *
+   * The two outcomes differ: a purge that rebound recreated the log file and
+   * nothing else, and one that could not reopen left the directory empty.
+   * Reporting the pre-purge list for either would have a support flow offer
+   * files a compliance deletion has already removed.
+   */
+  test('a durable purge takes the staged archives with it', () => {
+    const sink = new MemoryWriter().attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = [
+      '/memory/logs/app.log',
+      '/memory/logs/app.log.20260101T000000Z_abcd.gz',
+    ];
+    sink.appendBatch('{"m":1}\n', 1);
+    sink.flush(1000);
+
+    expect(sink.clearLogs(1000).rebound).toBe(true);
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toEqual(['/memory/logs/app.log']);
+  });
+
+  test('a purge that cannot reopen leaves nothing to list', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = ['/memory/logs/app.log', '/memory/logs/app.log.gz'];
+    writer.reopenFails = true;
+
+    const outcome = sink.clearLogs(1000);
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toEqual([]);
+  });
+
+  /**
+   * A failed deletion leaves the list alone, because the files are still there.
+   */
+  test('a failed purge keeps listing what it could not delete', () => {
+    const writer = new MemoryWriter();
+    const sink = writer.attach();
+    sink.open('/memory/logs/app.log', undefined, true);
+    sink.artifactPaths = ['/memory/logs/app.log', '/memory/logs/app.log.gz'];
+    writer.clearFails = true;
+
+    expect(sink.clearLogs(1000).durable).toBe(false);
+    sink.close(1000);
+    expect(sink.getLogFilePaths()).toHaveLength(2);
+  });
+
+  /**
+   * Rotation is a forwarding pin, not an implementation, and that is on
+   * purpose.
+   *
+   * A second rotation implementation living in a test double drifts from the
+   * two real ones and produces confidence that is worse than a stated gap. So
+   * the double records what it was handed and rotates nothing; size, age and
+   * archive limits are pinned in the native suites, where the code that
+   * implements them lives.
+   */
+  test('rotation config is recorded and not acted on', () => {
+    const sink = new MemoryWriter().attach();
+    const rotation = {
+      maxFileSizeBytes: 8,
+      maxArchivedFilesCount: 3,
+      compressArchives: false,
+    };
+    sink.open('/memory/logs/app.log', rotation, true);
+
+    sink.appendBatch('{"m":"much longer than eight bytes"}\n', 1);
+    sink.flush(1000);
+
+    expect(sink.openedRotation).toBe(rotation);
+    expect(sink.getLogFilePaths()).toEqual(['/memory/logs/app.log']);
+  });
+});
+
+/**
+ * `reopen()` — the way back from a fence.
+ *
+ * A fence is permanent by design, and until 0.3.0 it was permanent in
+ * practice: `purge` promised "disabled until an explicit retry" twice over and
+ * there was no retry to make. These pin what the retry does and, just as
+ * importantly, what it refuses to do.
+ *
+ * What none of them prove: that the file behind the new handle holds what the
+ * old one wrote. It does not, after a purge, and that is the purge working.
+ */
+describe('FileDestination.reopen', () => {
+  /** Fence `victim` from the outside — a second handle purges the writer out
+   * from under it, exactly as a compliance deletion on another destination
+   * does. The rejection arrives on the next append, so one is forced. */
+  test('a handle fenced by another purge writes again after reopen', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+    const opensBefore = sink.openCount;
+
+    expect(destination.reopen(1000)).toBe(true);
+    expect(destination.isEnabled).toBe(true);
+    expect(sink.openCount).toBe(opensBefore + 1);
+
+    destination.write(entry({ message: 'after the retry' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('after the retry');
+  });
+
+  /**
+   * "The config the first one had" means the values at construction, not the
+   * caller's object as it stands now.
+   *
+   * The caller owns what it passed and may keep mutating it. Reopening with a
+   * drifted policy is not a quiet difference: the native registry compares
+   * policies to decide whether two handles may share a writer, so a reopen
+   * carrying a changed one is a `CONFIG_CONFLICT` against a sibling handle
+   * that is still open — a recovery path that fails because of an edit made
+   * somewhere else entirely.
+   */
+  test('the new handle is opened with the config the first one had', () => {
+    const rotation = {
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    };
+    const { destination, sink, writer } = build({
+      path: '/memory/logs/custom.log',
+      rotation,
+      formatter: new DefaultFormatter(),
+    });
+    fenceFromOutside(destination, writer.attach(), '/memory/logs/custom.log');
+
+    // The caller edits its own object between the two opens.
+    rotation.maxFileSizeBytes = 999;
+    rotation.compressArchives = false;
+
+    expect(destination.reopen(1000)).toBe(true);
+    expect(sink.openedPath).toBe('/memory/logs/custom.log');
+    expect(sink.openedRotation).toEqual({
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    });
+    // A copy, not the caller's object — which is the whole point.
+    expect(sink.openedRotation).not.toBe(rotation);
+    // Framing follows the formatter, and DefaultFormatter makes no guarantee.
+    expect(sink.openedLineFramed).toBe(false);
+  });
+
+  test('the first open already gets the snapshot, not the caller object', () => {
+    const rotation = {
+      maxFileSizeBytes: 4096,
+      maxArchivedFilesCount: 3,
+      compressArchives: true,
+    };
+    const { sink } = build({ rotation });
+
+    expect(sink.openedRotation).toEqual(rotation);
+    expect(sink.openedRotation).not.toBe(rotation);
+    // Frozen, so nothing downstream can edit the record of what was opened.
+    expect(Object.isFrozen(sink.openedRotation)).toBe(true);
+  });
+
+  test('an unfenced destination is left completely alone', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'still buffered' }));
+    const opens = sink.openCount;
+    const closes = sink.closeCalls;
+
+    expect(destination.reopen(1000)).toBe(true);
+    // No close, no open: the buffer and the file position are worth more than
+    // a proof that reopening would have worked.
+    expect(sink.openCount).toBe(opens);
+    expect(sink.closeCalls).toBe(closes);
+    expect(destination.isEnabled).toBe(true);
+  });
+
+  test('a disposed destination refuses, and stays disposed', () => {
+    const { destination, sink } = build();
+    destination.dispose();
+    const opens = sink.openCount;
+
+    expect(destination.reopen(1000)).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+    // Not reopened behind its owner's back: dispose is a release, not a pause.
+    expect(sink.openCount).toBe(opens);
+  });
+
+  test('an open that fails leaves the destination exactly as fenced as it was', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    sink.throwNextOpens = 1;
+    expect(destination.reopen(1000)).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+
+    // And the fence still means what it meant: records go nowhere, and the
+    // retry can be made again.
+    destination.write(entry({ message: 'must not appear' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).not.toContain(
+      'must not appear'
+    );
+    expect(destination.reopen(1000)).toBe(true);
+  });
+
+  test('a close that throws does not stop the reopen', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    sink.throwNextCloses = 1;
+    // The close is best-effort — there was nothing drainable behind a fence,
+    // and the open is what decides.
+    expect(destination.reopen(1000)).toBe(true);
+    expect(destination.isEnabled).toBe(true);
+    destination.write(entry({ message: 'through despite the close' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain(
+      'through despite the close'
+    );
+  });
+
+  /**
+   * The reopened file starts clean, and this is the assertion that says so.
+   *
+   * Two separate decisions produce it and neither is stated as a rule here:
+   * `Batcher.fence` clears the owed delta on the way in, because a notice about
+   * deliberately deleted data would describe the deletion; and `write` refuses
+   * while fenced, so nothing piles up behind the fence to be owed later. A
+   * post-purge file opening with "4,182 entries dropped" would be a statement
+   * about data someone was legally obliged to delete.
+   */
+  test('the reopened file does not open with a notice about the old one', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+
+    // Written while fenced: refused at the door, and not counted as a drop
+    // either — the logger never routes to a destination reporting
+    // `isEnabled: false`, so these can only arrive by a direct call.
+    destination.write(entry({ message: 'refused while fenced' }));
+    destination.write(entry({ message: 'also refused while fenced' }));
+
+    expect(destination.reopen(1000)).toBe(true);
+    destination.write(entry({ message: 'the first record of the new file' }));
+    destination.flush(1000);
+
+    const written = records(writer);
+    expect(written.map((r) => r.message)).toEqual([
+      'the first record of the new file',
+    ]);
+    // Neither the refused records nor a count of them.
+    const text = JSON.stringify(written);
+    expect(text).not.toContain('refused while fenced');
+    expect(text).not.toContain('dropped');
+    expect(sink.openCount).toBeGreaterThan(1);
+  });
+
+  test('reopen after a purge through this same handle is a no-op', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'pre-purge' }));
+    const outcome = destination.purge(1000);
+    expect(outcome.rebound).toBe(true);
+    const opens = sink.openCount;
+
+    // The purge already rebound this handle — `clearLogs` does that itself,
+    // and re-opening a live writer is a config conflict.
+    expect(destination.reopen(1000)).toBe(true);
+    expect(sink.openCount).toBe(opens);
+  });
+
+  test('reopen recovers a purge that deleted durably but could not reopen', () => {
+    const { destination, sink, writer } = build();
+    writer.reopenFails = true;
+    const outcome = destination.purge(1000);
+
+    // The compliance answer is still true; the destination is still dead.
+    expect(outcome.durable).toBe(true);
+    expect(outcome.rebound).toBe(false);
+    expect(destination.isEnabled).toBe(false);
+
+    writer.reopenFails = false;
+    expect(destination.reopen(1000)).toBe(true);
+    destination.write(entry({ message: 'writing again' }));
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('writing again');
+    expect(sink.openCount).toBeGreaterThan(1);
+  });
+
+  test('the deadline goes to the close, which is the half that waits', () => {
+    const { destination, sink, writer } = build();
+    fenceFromOutside(destination, writer.attach());
+    const seen: number[] = [];
+    const realClose = sink.close.bind(sink);
+    sink.close = (deadlineMs: number) => {
+      seen.push(deadlineMs);
+      return realClose(deadlineMs);
+    };
+
+    destination.reopen(250);
+    expect(seen).toEqual([250]);
+  });
+});
+
+/**
+ * Records turned away before they are rendered.
+ *
+ * Formatting is the expensive half of writing a log line, and under sustained
+ * backpressure every record the buffer will refuse is formatted for the
+ * wastebasket. `Batcher.hasRoom()` is asked first so that work is not done.
+ *
+ * The cost is stated rather than hidden: a record dropped before rendering has
+ * no length to report, so `LossCounts.bytes` becomes a lower bound while
+ * `entries` stays exact. These pin both halves — that the render really is
+ * skipped, and that the entry is still counted.
+ */
+describe('FileDestination — dropping before rendering', () => {
+  /** A formatter that reports how often it was actually asked to work. */
+  function counting(): { formatter: LogFormatter; calls: () => number } {
+    const inner = new JsonLinesFormatter();
+    let calls = 0;
+    return {
+      formatter: {
+        get framing() {
+          return inner.framing;
+        },
+        format(e: LogEntry): string {
+          calls += 1;
+          return inner.format(e);
+        },
+      },
+      calls: () => calls,
+    };
+  }
+
+  test('a record the full buffer will refuse is never formatted', () => {
+    const { formatter, calls } = counting();
+    const { destination } = build({ maxPendingEntries: 1, formatter });
+
+    destination.write(entry({ message: 'fills the buffer' }));
+    expect(calls()).toBe(1);
+
+    destination.write(entry({ message: 'never rendered' }));
+    destination.write(entry({ message: 'nor this one' }));
+    expect(calls()).toBe(1);
+  });
+
+  test('the refused records are still counted, exactly', () => {
+    const { destination } = build({ maxPendingEntries: 1 });
+
+    destination.write(entry({ message: 'kept' }));
+    destination.write(entry({ message: 'refused' }));
+    destination.write(entry({ message: 'refused too' }));
+
+    const loss = destination.unreportedLoss();
+    expect(loss.entries).toBe(2);
+    // No bytes, because producing a byte count means rendering. This is the
+    // documented asymmetry, not an oversight.
+    expect(loss.bytes).toBe(0);
+  });
+
+  test('the notice still reaches the file and names the right count', () => {
+    const { destination, writer } = build({ maxPendingEntries: 1 });
+
+    destination.write(entry({ message: 'kept' }));
+    destination.write(entry({ message: 'refused' }));
+    destination.flush(1000);
+
+    const written = records(writer);
+    expect(written).toHaveLength(2);
+    expect(written[1]).toMatchObject({
+      message: 'log entries were dropped',
+      metadata: { droppedEntries: 1 },
+    });
+  });
+
+  test('rendering resumes once a flush frees the buffer', () => {
+    const { formatter, calls } = counting();
+    const { destination, writer } = build({ maxPendingEntries: 1, formatter });
+
+    destination.write(entry({ message: 'first' }));
+    destination.write(entry({ message: 'refused' }));
+    const before = calls();
+
+    destination.flush(1000);
+    destination.write(entry({ message: 'after the flush' }));
+
+    expect(calls()).toBeGreaterThan(before);
+    destination.flush(1000);
+    expect(records(writer).map((r) => r.message)).toContain('after the flush');
+  });
+
+  /**
+   * The byte cap exactly, which is the only place `<` and `<=` differ.
+   *
+   * A buffer sitting precisely on `maxPendingBytes` has room for nothing: the
+   * smallest possible record still costs its own newline. Reading that as room
+   * is not a lost record — `add` drops it either way — but it is the render
+   * this whole change exists to skip, done at the one moment the buffer is
+   * provably full. Approached at the boundary rather than near it, because
+   * near it is where an off-by-one hides.
+   */
+  test('a buffer sitting exactly on the byte cap has room for nothing', () => {
+    // The exact on-the-wire cost of the record below: its rendered bytes plus
+    // the newline the batcher adds. Measured rather than guessed, so the cap
+    // lands on the boundary and not one byte to either side.
+    const first = entry({ message: 'exactly filling' });
+    const exact = utf8Length(new JsonLinesFormatter().format(first)) + 1;
+
+    const { formatter, calls } = counting();
+    const { destination } = build({
+      maxPendingEntries: 100,
+      maxPendingBytes: exact,
+      formatter,
+    });
+
+    destination.write(first);
+    expect(calls()).toBe(1);
+
+    // pendingBytes === maxPendingBytes now. Nothing fits, so nothing renders.
+    destination.write(entry({ message: 'x' }));
+    expect(calls()).toBe(1);
+    expect(destination.unreportedLoss()).toEqual({ entries: 1, bytes: 0 });
+  });
+
+  /**
+   * The asymmetry in `hasRoom()`'s contract, from the side that matters.
+   *
+   * `false` must mean *no* record fits. A byte cap with room left in it still
+   * admits the record for rendering, and if it then turns out not to fit, it
+   * is dropped by `add` with its bytes counted exactly. Getting this backwards
+   * would silently discard records that had room, which is far worse than
+   * rendering one that did not.
+   */
+  test('a record is still rendered when only its own size will not fit', () => {
+    const { formatter, calls } = counting();
+    // Room for many entries, and a byte budget the second record overruns on
+    // its own. `batchBytes` is raised past the cap so nothing drains in
+    // between and empties the buffer under the test.
+    const { destination } = build({
+      maxPendingEntries: 100,
+      maxPendingBytes: 600,
+      batchBytes: 4096,
+      formatter,
+    });
+
+    destination.write(entry({ message: 'a'.repeat(300) }));
+    const afterFirst = calls();
+    expect(afterFirst).toBe(1);
+
+    // Buffer is under its byte cap, so this is admitted, rendered, and only
+    // then found not to fit.
+    destination.write(entry({ message: 'b'.repeat(1000) }));
+    expect(calls()).toBe(afterFirst + 1);
+
+    const loss = destination.unreportedLoss();
+    expect(loss.entries).toBe(1);
+    // Rendered, so its bytes are known exactly — this is the other side of the
+    // contract, and the reason `bytes` is a lower bound rather than a fiction.
+    expect(loss.bytes).toBeGreaterThan(1000);
+  });
+});
+
+/**
+ * Which entries a formatter is actually asked to render.
+ *
+ * `LogFormatter.format` has never been called once per logged entry — level
+ * filters and a fenced destination have always skipped it — and 0.3.0 widened
+ * that by skipping records the buffer is too full to accept. A formatter that
+ * carries state across calls therefore sees a sequence with holes in it.
+ *
+ * These pin that shape deliberately rather than leaving it to be discovered.
+ * They are not an endorsement of stateful formatters; they are what makes the
+ * documented requirement checkable.
+ */
+describe('FileDestination — what the formatter is asked to render', () => {
+  /** Stamps its own call number, which is exactly what the contract forbids
+   * relying on — used here as an instrument, not as a recommendation. */
+  function sequencing(): { formatter: LogFormatter; seen: string[] } {
+    const inner = new JsonLinesFormatter();
+    const seen: string[] = [];
+    return {
+      formatter: {
+        get framing() {
+          return inner.framing;
+        },
+        format(e: LogEntry): string {
+          seen.push(e.message);
+          return inner.format(e);
+        },
+      },
+      seen,
+    };
+  }
+
+  test('a level-filtered entry never reaches the formatter', () => {
+    const { formatter, seen } = sequencing();
+    const { destination } = build({ minimumLevel: 'warning', formatter });
+    const logger = new Logger();
+    logger.removeDestination('console');
+    logger.addDestination(destination);
+
+    logger.info('below the floor');
+    logger.warning('above it');
+
+    expect(seen).toEqual(['above it']);
+  });
+
+  test('a fenced destination renders nothing, and counts nothing', () => {
+    const { formatter, seen } = sequencing();
+    const { destination, writer } = build({ formatter });
+    const other = writer.attach();
+    other.open('/memory/logs/app.log', undefined, true);
+    other.clearLogs(1000);
+    destination.write(entry({ message: 'trips the fence' }));
+    destination.flush(1000);
+    expect(destination.isEnabled).toBe(false);
+    const rendered = seen.length;
+
+    destination.write(entry({ message: 'after the fence' }));
+
+    expect(seen).toHaveLength(rendered);
+    // Refused at the door, not dropped by the buffer: nothing accepted this
+    // record, so nothing owes a notice for it.
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
+  });
+
+  test('an overloaded buffer skips the formatter for what it will refuse', () => {
+    const { formatter, seen } = sequencing();
+    const { destination } = build({ maxPendingEntries: 2, formatter });
+
+    destination.write(entry({ message: 'one' }));
+    destination.write(entry({ message: 'two' }));
+    destination.write(entry({ message: 'three' }));
+    destination.write(entry({ message: 'four' }));
+
+    // The holes a stateful formatter would see, spelled out.
+    expect(seen).toEqual(['one', 'two']);
+    expect(destination.unreportedLoss().entries).toBe(2);
+  });
+});
+
+/**
+ * The per-entry limit, approached from both sides of the exact value.
+ *
+ * Every other test in this file clears or overruns `maxEntryBytes` by a wide
+ * margin, which is enough to prove the two branches exist and nothing about
+ * where the line between them falls. `<=` and `<` differ on exactly one
+ * input, and it is the input a caller sizing records to a documented cap
+ * produces deliberately — so an off-by-one here replaces the record a caller
+ * built to fit with a notice saying it did not.
+ */
+describe('FileDestination — the exact per-entry limit', () => {
+  /** A formatter whose output size is the message size, so the cap is exact. */
+  const identity: LogFormatter = {
+    framing: 'line',
+    format: (e) => e.message,
+  };
+
+  // Wide enough that the 35-byte oversize notice fits under it too, so the
+  // two cases below differ in the record's size and in nothing else.
+  const budget = 40;
+
+  test('a record of exactly maxEntryBytes is written unchanged', () => {
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: budget,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(budget) }));
+    destination.flush(1000);
+
+    expect(writer.lines()).toEqual(['x'.repeat(budget)]);
+    expect(destination.unreportedLoss().entries).toBe(0);
+  });
+
+  test('and one byte more is replaced by the notice', () => {
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: budget,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(budget + 1) }));
+    destination.flush(1000);
+
+    expect(writer.lines()[0]).toBe('a log entry was too large to record');
+  });
+
+  /**
+   * The notice is held to the same limit, and that limit is inclusive too.
+   *
+   * `boundedNotice` has its own `<=` against the same field, and the one
+   * input that separates it from `<` is a notice that is exactly the size of
+   * the budget. Tightening it there is worse than tightening the record path:
+   * the entry is already gone, and the line that would have said so does not
+   * get written either.
+   */
+  test('a notice of exactly maxEntryBytes still fits', () => {
+    // 35 is the length of the oversize notice under this formatter — the
+    // budget is set to exactly what the notice costs and nothing more.
+    const notice = 'a log entry was too large to record';
+    expect(utf8Length(notice)).toBe(35);
+
+    const { destination, writer } = build({
+      formatter: identity,
+      maxEntryBytes: 35,
+    });
+
+    destination.write(entry({ message: 'x'.repeat(36) }));
+    destination.flush(1000);
+
+    expect(writer.lines()[0]).toBe(notice);
+  });
+});
+
+/**
+ * A count that comes back across the bridge is a number in name only.
+ *
+ * `deletedCount` is reported by native code and can arrive negative,
+ * fractional or not a number at all — from an old binary, a partial failure
+ * counted the wrong way, or a marshalling bug. It is handed to a caller who
+ * is usually purging for compliance and usually writing the number down, so
+ * "−1 files deleted" is worse than useless. The positive pass-through is
+ * pinned above; these are the clauses that have to reject.
+ */
+describe('FileDestination — a hostile deletedCount', () => {
+  test('a negative count is floored at zero, not passed on', () => {
+    const { destination, sink } = build();
+    sink.hostileClear = { durable: true, rebound: true, deletedCount: -5 };
+
+    expect(destination.purge(1000).deletedCount).toBe(0);
+  });
+
+  test('a fractional count is floored, never rounded up', () => {
+    const { destination, sink } = build();
+    sink.hostileClear = { durable: true, rebound: true, deletedCount: 3.9 };
+
+    // Three files were deleted and a fourth was not. Rounding invents it.
+    expect(destination.purge(1000).deletedCount).toBe(3);
+  });
+
+  test.each([
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+  ])('a %s count reports zero rather than propagating', (_label, value) => {
+    const { destination, sink } = build();
+    sink.hostileClear = {
+      durable: true,
+      rebound: true,
+      deletedCount: value,
+    };
+
+    expect(destination.purge(1000).deletedCount).toBe(0);
   });
 });

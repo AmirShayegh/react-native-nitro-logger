@@ -145,6 +145,29 @@ class LogWriterRegistry {
    *
    * Counted rather than a set: it costs nothing and stops a stray double
    * release from clearing a marker another close still needs.
+   *
+   * ## An entry here can be permanent, and that is the chosen behaviour
+   *
+   * The marker is dropped by the close that set it. Since 0.3.0 that drop is in
+   * a `finally`, so it now survives a `close` whose barrier dies — including on
+   * an `Error`, which was the one reachable way to strand a path on healthy
+   * storage.
+   *
+   * What remains is a writer that never finishes draining, because the disk it
+   * is writing to stopped answering. That path then refuses every later acquire
+   * with `STILL_CLOSING` for the life of the process, and no timer clears it.
+   * **This is deliberate.** While that writer exists it still holds the
+   * descriptor and the OS-level exclusive lock, so the alternative is not
+   * "recover" — it is "open a second writer onto a file the first has not let
+   * go of", which is the collision this map exists to prevent. A marker that is
+   * correct and unhelpful beats one that is wrong.
+   *
+   * Reclaiming it needs a second source of truth for "will this writer ever
+   * finish" — a writer-owned predicate that answers *stopped forever*, not
+   * *slow* — and `dropClaimLocked`'s doc explains why inventing one lightly is
+   * worse than the wait. A timeout is not that predicate: an acquire timing out
+   * says only that [CLOSE_WAIT_MS] passed. Revisit if field reports show
+   * `STILL_CLOSING` outliving the storage problem that caused it.
    */
   private val closing = HashMap<String, Int>()
   private var nextHandleId = 1L
@@ -186,6 +209,13 @@ class LogWriterRegistry {
     compressor: LogFileWriter.Compressor? = null,
     clock: (() -> Long)? = null,
     monotonic: (() -> Long)? = null,
+    /**
+     * Holds the open sweep on the executor — see [LogFileWriter.open].
+     * Forwarded here for the same reason [clock] and [monotonic] are: writers
+     * are only ever built through this call, so this is the only place a test
+     * can reach it.
+     */
+    openSweepGate: (() -> Unit)? = null,
     /**
      * Reports the canonical path, once, the instant resolution produces it.
      *
@@ -290,7 +320,8 @@ class LogWriterRegistry {
           rawWrite = rawWrite,
           compressor = compressor,
           clock = clock,
-          monotonic = monotonic
+          monotonic = monotonic,
+          openSweepGate = openSweepGate
         )
         writers[resolved.canonicalPath] = writer
       }
@@ -517,7 +548,25 @@ class LogFileHandle internal constructor(
   /** A purge is running on this handle; close has to wait it out. */
   private var purging = false
 
+  /**
+   * One collect at a time on THIS handle, mirroring [purging].
+   *
+   * The writer's `collectLock` already refuses a second collect on the same
+   * writer, so this is not what makes the operation safe — it is what makes the
+   * refusal cheap and local. A second collect on one handle is answered here
+   * without touching the writer, without a flush, and without spending any of
+   * its deadline discovering it lost.
+   */
+  private var collecting = false
+
   val filePath: String get() = writer.file.absolutePath
+
+  /**
+   * The writer behind this handle, for tests that need to reach its injected
+   * seams while still going through the registry — the Kotlin twin of Swift's
+   * accessor of the same name. Nothing in production reads it.
+   */
+  internal val writerForTesting: LogFileWriter get() = writer
 
   /**
    * Whether this handle may still speak for the writer.
@@ -562,10 +611,34 @@ class LogFileHandle internal constructor(
    * Gated on liveness like every other entry point. A released handle
    * collecting would read files a live handle is still rotating, and would
    * write its bundle into that handle's directory.
+   *
+   * **[close] deliberately does not wait this out**, unlike [purging]. Closing
+   * waits out a purge because tearing the writer down mid-deletion leaves the
+   * fresh file missing. A collect only reads logs and writes its own scratch,
+   * and being abandoned is already a first-class, tested outcome — so a third
+   * wait on close's budget would buy nothing and cost teardown latency.
    */
   fun collectLogs(deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
-    if (!isLive) return LogCollectOutcome.NOTHING
-    return writer.collectLogs(id, deadlineMs, maxTotalBytes)
+    lock.lock()
+    if (state != State.ACTIVE || collecting) {
+      lock.unlock()
+      return LogCollectOutcome.NOTHING
+    }
+    collecting = true
+    lock.unlock()
+
+    return try {
+      writer.collectLogs(id, deadlineMs, maxTotalBytes)
+    } finally {
+      lock.withLock {
+        collecting = false
+        // Signalled even though nothing waits on this today: [purgeFinished] is
+        // the one place a waiter for any of this handle's state would sleep,
+        // and a flag cleared without a wake is the shape that strands the first
+        // one somebody adds.
+        purgeFinished.signalAll()
+      }
+    }
   }
 
   fun flush(deadlineMs: Double): LogFlushOutcome {
@@ -578,6 +651,25 @@ class LogFileHandle internal constructor(
   fun logFilePaths(): List<String> {
     if (!isLive) return emptyList()
     return writer.logFilePaths()
+  }
+
+  /**
+   * Deletes the support bundle — see [LogFileWriter.deleteSupportBundle].
+   *
+   * Gated on liveness like every other entry point, and `false` when the gate
+   * refuses. But liveness is only half of it: [isLive] says this handle is
+   * active, not that it is current, so the generation travels down to the
+   * writer and is checked against the current one on the executor — the same
+   * two-part gate [appendBatch] applies, and for a sharper reason. A stale
+   * append adds a record to somebody else's file; a stale delete removes
+   * somebody else's bundle.
+   */
+  fun deleteSupportBundle(deadlineMs: Double): Boolean {
+    val handleGeneration = lock.withLock {
+      if (state != State.ACTIVE) return false
+      generation
+    }
+    return writer.deleteSupportBundle(handleGeneration, deadlineMs)
   }
 
   /**

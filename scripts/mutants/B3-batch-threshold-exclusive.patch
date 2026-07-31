@@ -1,0 +1,13 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..55c775b 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -284,7 +284,7 @@ export class Batcher {
+     // first reports the loss zero times.
+     this.noticeBlocked = false;
+ 
+-    if (!this.paused && this.pendingBytes >= this.batchBytes) {
++    if (!this.paused && this.pendingBytes > this.batchBytes) {
+       this.pushOnce();
+     }
+     this.ensureTimer();

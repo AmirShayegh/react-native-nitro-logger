@@ -5,6 +5,7 @@ import type {
   SinkStatus,
 } from '../specs/FileSink.nitro';
 import { utf8Length } from '../utf8';
+import { clampDeadline, startDeadline } from '../deadline';
 
 /**
  * The part of a `FileSink` the batcher drives. Narrow on purpose: it is what
@@ -18,7 +19,27 @@ export interface BatchTarget {
   flush(deadlineMs: number): FlushOutcome;
 }
 
-/** Entries that never reached the file, and the bytes they would have been. */
+/**
+ * Entries that never reached the file, and the bytes they would have been.
+ *
+ * `entries` is exact for everything this pipeline accepted: a record the
+ * batcher took responsibility for and could not deliver is counted once,
+ * wherever it was lost. It does not count what never got that far — an entry
+ * filtered out by level was never destined for the file, and one handed to a
+ * fenced or disposed destination is turned away by the `isEnabled` guard
+ * before anything here sees it. Nothing accepted it, so nothing owes a notice
+ * for it.
+ *
+ * `bytes` is narrower than it looks, and from 0.3.0 deliberately so: it is the
+ * bytes of records that were **rendered and then dropped**. A record turned
+ * away before rendering — the buffer already full, so formatting it would have
+ * been work done for the wastebasket — has no length to report and adds `0`.
+ * The alternative was rendering every record just to have an exact byte total
+ * for the ones being thrown away, which is the cost this exists to avoid.
+ *
+ * So under sustained overload `bytes` under-reports while `entries` stays
+ * right. Alert on `entries`; read `bytes` as the lower bound it is.
+ */
 export interface LossCounts {
   readonly entries: number;
   readonly bytes: number;
@@ -109,9 +130,6 @@ const DEFAULTS = {
   watermarkBytes: 256 * 1024,
   maxBatchBytes: 256 * 1024,
 };
-
-/** Upper bound on any deadline handed to the sink, in milliseconds. */
-const MAX_DEADLINE_MS = 30_000;
 
 /** Consecutive no-progress rounds before a bounded drain gives up. */
 const MAX_STALLS = 8;
@@ -213,13 +231,39 @@ export class Batcher {
    * Buffer one formatted record. Never performs I/O beyond handing a full
    * batch to the sink, and never throws: a logging call must not fail the
    * code that made it.
+   *
+   * `recordBytes` is the record's own UTF-8 length, **without** the framing
+   * newline this adds. It is an optimisation and nothing else: the caller that
+   * rendered the record has usually just measured it — `FileDestination` must,
+   * to enforce `maxEntryBytes` — and measuring it a second time here is a full
+   * second pass over every record that reaches the file. Omit it and this
+   * measures for itself; the answer is identical either way, which is what the
+   * differential test in `batcher.test.ts` pins.
+   *
+   * **A supplied count is trusted, and the check below does not change that.**
+   * It rejects what cannot be a length at all — a fraction, a negative, a
+   * `NaN`, a number past `Number.MAX_SAFE_INTEGER` — and recomputes instead of
+   * propagating nonsense into the pending total. It cannot tell that `1` is
+   * the wrong length for a ten-byte record, and nothing short of measuring
+   * could, which would be the optimisation undone. So the contract on this
+   * parameter is exact measurement or nothing: `FileDestination` is the only
+   * caller that supplies it, `utf8Length` is what it supplies, and a caller
+   * that passes a plausible wrong number gets a pending-byte total that drifts
+   * from what is actually buffered.
    */
-  add(record: string): void {
+  add(record: string, recordBytes?: number): void {
+    const measured =
+      recordBytes !== undefined &&
+      Number.isSafeInteger(recordBytes) &&
+      recordBytes >= 0
+        ? recordBytes
+        : utf8Length(record);
+    const bytes = measured + 1; // the record's own newline
+
     if (this.disposed || this.fenced) {
-      this.dropped(record);
+      this.dropped(record, bytes);
       return;
     }
-    const bytes = utf8Length(record) + 1; // the record's own newline
     if (
       this.pending.length >= this.maxPendingEntries ||
       this.pendingBytes + bytes > this.maxPendingBytes
@@ -255,6 +299,30 @@ export class Batcher {
     this.observed.localEntries += toCount(entries);
     this.observed.localBytes += toCount(bytes);
     this.ensureTimer();
+  }
+
+  /**
+   * Whether *any* record could be accepted right now.
+   *
+   * For an owner that would otherwise render a record only to have it dropped:
+   * formatting is the expensive part of writing a log line, and under sustained
+   * backpressure it is work done entirely for the wastebasket.
+   *
+   * Deliberately conservative, and the asymmetry is the contract. `false`
+   * means no record of any size fits — the buffer is at its entry cap, at or
+   * past its byte cap, or there is nowhere to write at all. `true` does not
+   * promise that *this* record fits, because that depends on a length only
+   * rendering can produce, and a caller that skipped rendering to ask has not
+   * got one. So a record can still be dropped by {@link add} after a `true`
+   * answer, with its bytes counted exactly; what cannot happen is a `false`
+   * that turns away a record which would have been accepted.
+   */
+  hasRoom(): boolean {
+    if (this.disposed || this.fenced) return false;
+    if (this.pending.length >= this.maxPendingEntries) return false;
+    // `>=`, not `>`: a record costs at least its newline, so a buffer already
+    // at the cap has room for nothing.
+    return this.pendingBytes < this.maxPendingBytes;
   }
 
   /** Losses with no notice in the file yet. */
@@ -301,7 +369,11 @@ export class Batcher {
   // ── Draining ────────────────────────────────────────────────────────────
 
   /**
-   * Drain to the sink and fsync, bounded by a wall-clock deadline.
+   * Drain to the sink and fsync, bounded by an elapsed-time deadline.
+   *
+   * Elapsed, not wall-clock: the budget is read from a monotonic clock where
+   * the host has one, so a device clock correction landing mid-drain cannot
+   * stretch or end it. See `startDeadline`.
    *
    * Backpressure is overridden for the duration: the whole point of a flush
    * is to push through a full queue rather than wait for it to clear, so a
@@ -316,7 +388,7 @@ export class Batcher {
     this.cancelTimer();
     if (this.disposed || this.fenced) return this.outcome(false, false, 0);
 
-    const deadlineAt = Date.now() + clampDeadline(deadlineMs);
+    const remaining = startDeadline(deadlineMs);
     this.paused = false;
     // An explicit flush is the retry: a notice the sink refused on its own
     // gets one more chance here before being set aside again.
@@ -328,7 +400,7 @@ export class Batcher {
     const maxAttempts = this.maxPendingEntries + MAX_STALLS * 2 + 16;
 
     while (this.pending.length > 0 || this.owesNotice()) {
-      if (attempts >= maxAttempts || Date.now() >= deadlineAt) {
+      if (attempts >= maxAttempts || remaining() <= 0) {
         timedOut = true;
         break;
       }
@@ -340,12 +412,12 @@ export class Batcher {
 
       if (result === 'full') {
         // Ask the sink to write what it has, then retry.
-        const remaining = deadlineAt - Date.now();
-        if (remaining <= 0) {
+        const left = remaining();
+        if (left <= 0) {
           timedOut = true;
           break;
         }
-        const mid = this.targetFlush(remaining);
+        const mid = this.targetFlush(left);
         if (mid.timedOut) timedOut = true;
       }
 
@@ -362,7 +434,7 @@ export class Batcher {
       }
     }
 
-    const final = this.targetFlush(Math.max(0, deadlineAt - Date.now()));
+    const final = this.targetFlush(remaining());
     if (final.timedOut) timedOut = true;
 
     const settled =
@@ -809,11 +881,4 @@ function positive(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : fallback;
-}
-
-function clampDeadline(value: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    return 0;
-  }
-  return Math.min(Math.floor(value), MAX_DEADLINE_MS);
 }

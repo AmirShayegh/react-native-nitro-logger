@@ -152,13 +152,33 @@ interface LossTotals {
   bytes: number;
 }
 
-/** No bundle, and the collect did not finish. */
+/** No bundle, and the collect did not finish — a fenced handle's answer. */
 const NOTHING_COLLECTED: CollectOutcome = {
   path: '',
   byteCount: 0,
   sourceFileCount: 0,
   truncated: false,
   complete: false,
+};
+
+/**
+ * No bundle, and there was nothing to put in one.
+ *
+ * `complete: true` is the difference that matters, and it is what both
+ * adapters answer with no handle: a sink nobody opened has finished collecting
+ * everything it has.
+ */
+const NOTHING_TO_COLLECT: CollectOutcome = {
+  ...NOTHING_COLLECTED,
+  complete: true,
+};
+
+/** The status both adapters report when there is no handle to ask. */
+const ZEROED: SinkStatus = {
+  queuedBytes: 0,
+  lostBytes: 0,
+  lostEntries: 0,
+  degraded: 0,
 };
 
 /** One handle on a {@link MemoryWriter}; one `FileDestination` drives one. */
@@ -183,8 +203,93 @@ export class MemoryFileSink implements FileSinkLike {
   failNextAppends = 0;
   /** Throw out of the next N appends, as a native call can. */
   throwNextAppends = 0;
-  /** Refuse every append with 'closed'. */
-  closed = false;
+  /**
+   * Throw out of the next N opens, as `HybridFileSink` does on an open failure
+   * or a config conflict — the two reasons a `FileDestination` constructor can
+   * throw, and the two a `reopen` has to survive.
+   *
+   * Thrown *after* `mayHaveArtifacts` is forfeited, matching the real one: the
+   * log directory may already exist by the time the open fails.
+   */
+  throwNextOpens = 0;
+  /**
+   * Throw out of the next N closes. A close and an open are separate native
+   * calls with separate failure modes, and a reopen that treated a failed
+   * close as a failed reopen would refuse to recover from the more likely of
+   * the two.
+   */
+  throwNextCloses = 0;
+  /**
+   * Which of the two bits every no-handle answer is derived from.
+   *
+   * The natives do not carry a "closed" boolean; they carry a handle that is
+   * either there or not, plus `FileSinkLifecycle.vacuousSuccess`. Deriving the
+   * answers from the same two bits here is what stops this double drifting
+   * from the table both adapters implement — it had drifted on four rows.
+   */
+  private state: 'idle' | 'open' | 'closed' = 'idle';
+
+  /**
+   * The negation of `FileSinkLifecycle.vacuousSuccess`.
+   *
+   * Set when the open is *claimed*, not when it succeeds, for the reason the
+   * Swift twin gives: `acquire` creates the log directory before it opens the
+   * file, so a failed open is not evidence that nothing was written.
+   */
+  private mayHaveArtifacts = false;
+
+  /**
+   * Whether this sink has no live handle.
+   *
+   * A settable alias kept because tests use `sink.closed = true` to mean "now
+   * behave like a sink whose handle is gone", which is a legitimate thing to
+   * stage. Reading it answers the natives' question — `current() == nil` —
+   * which is why a sink that was never opened reads as closed: it has no
+   * handle either.
+   */
+  get closed(): boolean {
+    return this.state !== 'open';
+  }
+
+  set closed(value: boolean) {
+    // Only ever closes. Assigning `false` would put the double in a state no
+    // adapter can be in — live handle, no path claimed, nothing opened — and
+    // the whole point of computing the answers from the state is that a test
+    // cannot script its way into a lifecycle the natives cannot reach.
+    if (!value) {
+      throw new Error(
+        'a live handle comes from open(), not from an assignment'
+      );
+    }
+    this.state = 'closed';
+  }
+
+  /**
+   * Artifacts the sink left behind, listed when there is no live handle.
+   *
+   * The natives answer `getLogFilePaths` on a closed sink from the *recorded
+   * path*, not from the handle — closing releases a handle, it does not delete
+   * files, and `[]` would tell a support-upload flow there is nothing to
+   * collect over logs still sitting on the device. Defaults to the log file
+   * alone; a test staging archives assigns the fuller list, which is the only
+   * way to exercise the multi-file shape from JavaScript.
+   */
+  artifactPaths: string[] | undefined;
+
+  /**
+   * Fields merged over the computed [getStatus] answer.
+   *
+   * The double must be able to lie the way a native across a bridge can lie —
+   * a status that reports bytes queued on a sink that has none, a degradation
+   * bit nothing set. **Nothing else in this file may.** Every other answer is
+   * computed from the state above, because a double that can be told what to
+   * say about its own lifecycle is a double that cannot disagree with the
+   * caller, and disagreeing is the entire job.
+   */
+  hostileStatus: Partial<SinkStatus> | undefined;
+
+  /** The same hatch for [clearLogs]. See [hostileStatus]. */
+  hostileClear: Partial<ClearOutcome> | undefined;
   /** Throw out of getStatus. */
   statusThrows = false;
   /** Throw out of maintain, as a native call can. */
@@ -195,6 +300,10 @@ export class MemoryFileSink implements FileSinkLike {
   onMaintain: (() => void) | undefined;
   /** Throw out of collectLogs, as a native call can. */
   collectThrows = false;
+  /** Throw out of deleteSupportBundle, as a native call can. */
+  deleteBundleThrows = false;
+  /** Deadlines `deleteSupportBundle` was called with, in order. */
+  deleteBundleCalls: number[] = [];
   /** Arguments every collect was called with, in order. */
   collectCalls: Array<{ deadlineMs: number; maxTotalBytes: number }> = [];
   /**
@@ -217,7 +326,16 @@ export class MemoryFileSink implements FileSinkLike {
   }
 
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void {
+    // Forfeited before anything that can fail, matching `beginOpen`: the
+    // directory may already have been created by the time an open throws, so a
+    // sink whose open failed can no longer claim that nothing exists.
+    this.mayHaveArtifacts = true;
+    if (this.throwNextOpens > 0) {
+      this.throwNextOpens -= 1;
+      throw new Error('native open failed');
+    }
     this.writer.claimPath(path);
+    this.state = 'open';
     this.openedPath = path;
     this.openedRotation = rotation;
     this.openedLineFramed = lineFramed;
@@ -231,7 +349,15 @@ export class MemoryFileSink implements FileSinkLike {
       this.throwNextAppends -= 1;
       throw new Error('native append failed');
     }
-    if (this.closed) return this.reject('closed');
+    // Covers the sink that was never opened too, which is the point: it has no
+    // handle either, and this double used to accept its batches.
+    if (this.closed) {
+      return {
+        accepted: false,
+        rejectReason: 'closed',
+        ...this.withHostileStatus(ZEROED),
+      };
+    }
     if (this.generation !== this.writer.generation) {
       return this.reject('staleGeneration');
     }
@@ -248,7 +374,9 @@ export class MemoryFileSink implements FileSinkLike {
   getStatus(): SinkStatus {
     this.statusCalls += 1;
     if (this.statusThrows) throw new Error('status unavailable');
-    return this.status();
+    // No handle, nothing to report — the same zeroed answer both adapters
+    // give, rather than the last status the handle happened to have.
+    return this.closed ? this.withHostileStatus(ZEROED) : this.status();
   }
 
   maintain(deadlineMs: number): SinkStatus {
@@ -258,7 +386,7 @@ export class MemoryFileSink implements FileSinkLike {
     // zeroed status otherwise — the sweep belongs to whoever holds the writer
     // now, not to a handle a purge fenced.
     if (this.closed || this.generation !== this.writer.generation) {
-      return { queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0 };
+      return this.withHostileStatus(ZEROED);
     }
     this.onMaintain?.();
     return this.status();
@@ -281,7 +409,13 @@ export class MemoryFileSink implements FileSinkLike {
     // pack the files it used to own; they belong to whoever holds the writer
     // now, and a bundle built from them would be a stale-generation read of
     // somebody else's log.
-    if (this.closed || this.generation !== this.writer.generation) {
+    // Two different answers, and they used to be one. A *fenced* handle has
+    // collected nothing and is not finished — the files belong to whoever holds
+    // the writer now. A sink with no handle at all has finished collecting
+    // everything it has, which is nothing: `complete: true`, because a support
+    // flow must not show a failure for an app that simply has no logs yet.
+    if (this.closed) return { ...NOTHING_TO_COLLECT };
+    if (this.generation !== this.writer.generation) {
       return { ...NOTHING_COLLECTED };
     }
 
@@ -319,6 +453,7 @@ export class MemoryFileSink implements FileSinkLike {
     }
 
     this.collectedBundles.push(contents);
+    this.bundleOnDisk = true;
     return {
       path: this.bundlePath,
       byteCount: bytes,
@@ -328,7 +463,42 @@ export class MemoryFileSink implements FileSinkLike {
     };
   }
 
+  /**
+   * Whether a bundle is sitting beside the log file.
+   *
+   * Computed, not settable. A collect that produced one sets it; deleting it
+   * and purging clear it. Tests assert on this rather than on the boolean
+   * `deleteSupportBundle` returned, so that a double which reported success
+   * without removing anything would still be caught.
+   */
+  private bundleOnDisk = false;
+
+  get bundleExists(): boolean {
+    return this.bundleOnDisk;
+  }
+
+  deleteSupportBundle(deadlineMs: number): boolean {
+    this.deleteBundleCalls.push(deadlineMs);
+    if (this.deleteBundleThrows) throw new Error('delete unavailable');
+
+    // No handle: the `clearLogs` answer, not the `getLogFilePaths` one. Never
+    // opened is vacuously gone; opened and since closed cannot be vouched for,
+    // because with the handle went the generation that said whose directory
+    // that is.
+    if (this.closed) return !this.mayHaveArtifacts;
+
+    // A fenced handle refuses too, exactly where the registry and the writer
+    // refuse it — the registry turns away a handle that is not active, and the
+    // writer re-checks the generation on its own queue immediately before
+    // unlinking, so a purge landing mid-call is still caught.
+    if (this.generation !== this.writer.generation) return false;
+
+    this.bundleOnDisk = false;
+    return true;
+  }
+
   flush(deadlineMs: number): FlushOutcome {
+    if (this.closed) return this.noHandleOutcome();
     const before = this.writer.queuedBytes;
     const result =
       deadlineMs > 0
@@ -344,45 +514,54 @@ export class MemoryFileSink implements FileSinkLike {
 
   close(deadlineMs: number): FlushOutcome {
     this.closeCalls += 1;
+    if (this.throwNextCloses > 0) {
+      this.throwNextCloses -= 1;
+      throw new Error('native close failed');
+    }
+    // Idempotent, like `beginClose`: the second close finds no handle and
+    // answers without draining anything. Draining again would let a test see a
+    // durable flush from a sink that has nothing left to flush through.
+    if (this.closed) return this.noHandleOutcome();
     const outcome = this.flush(deadlineMs);
-    this.closed = true;
+    this.state = 'closed';
     return outcome;
   }
 
   getLogFilePaths(): string[] {
-    return this.openedPath ? [this.openedPath] : [];
+    if (this.openedPath === undefined) return [];
+    // Not `[]` for a closed sink. Closing releases a handle; it does not delete
+    // files, and answering `[]` tells a support-upload flow there is nothing to
+    // collect over logs that are still on the device.
+    return this.artifactPaths ?? [this.openedPath];
   }
 
   clearLogs(_deadlineMs: number): ClearOutcome {
     this.clearCalls += 1;
-    // A closed sink has no handle to delete through, and the file it wrote is
-    // still there. Both native adapters answer `durable: false` here; a double
-    // that purged anyway would let a purge-after-dispose test pass against a
-    // library that reports a successful compliance deletion over surviving
-    // files. The double has to be able to fail the way the real thing fails.
+    // No live handle to delete through — the sink was closed, or was never
+    // opened at all. A double that purged anyway would let a
+    // purge-after-dispose test pass against a library reporting a successful
+    // compliance deletion over surviving files.
     //
-    // Which means answering the way they answer, not merely failing: this is
-    // the `FileSinkLifecycle` table, and both natives derive these two fields
-    // from it.
-    //
-    // - `failedPaths` is empty. There is no handle, so nothing was attempted,
-    //   and naming a path here would report a *deletion failure* for a file
-    //   nobody tried to delete. This double used to name one.
-    // - `durable` is vacuously true for a sink that never opened — nothing was
-    //   ever created, so "every artifact is gone" holds with nothing to check
-    //   — and false once files may exist. It used to be hardcoded false, which
-    //   re-arms a compliance failure for a sink that cannot owe one.
+    // Which means answering the way the adapters answer, not merely failing:
+    // this is the `FileSinkLifecycle` table, and both derive these fields from
+    // the same two bits.
     //
     // Dead today: `FileDestination.purge` short-circuits before reaching a
-    // disposed sink. Fixed anyway, because the reason it is dead is a guard in
+    // disposed sink. Right anyway, because the reason it is dead is a guard in
     // the caller, and the next caller inherits whatever this says.
     if (this.closed) {
-      return {
+      return this.withHostileClear({
         deletedCount: 0,
+        // No handle, so nothing was attempted. Naming a path here reports a
+        // deletion *failure* for a file nobody tried to delete.
         failedPaths: [],
-        durable: this.openedPath === undefined,
+        // Vacuously true only while nothing may exist. Derived from the same
+        // bit the natives read, rather than from whether `open` was called —
+        // an open that threw halfway may still have created the directory.
+        durable: !this.mayHaveArtifacts,
+        // Nothing to rebind onto, whatever else is true.
         rebound: false,
-      };
+      });
     }
     const deleted = this.writer.file.length;
     const durable = this.writer.purge();
@@ -392,22 +571,56 @@ export class MemoryFileSink implements FileSinkLike {
     // generation along with every other handle.
     const rebound = durable && !this.writer.reopenFails;
     if (rebound) this.generation = this.writer.generation;
-    return {
+    // Staged archives are artifacts, and a durable purge deletes artifacts. A
+    // rebound purge recreates the log file and nothing else; one that could not
+    // reopen leaves the directory empty. Untouched when the deletion failed —
+    // that is the case where the files are still there.
+    if (durable) {
+      this.artifactPaths =
+        rebound && this.openedPath !== undefined ? [this.openedPath] : [];
+      // The bundle is an artifact, and a purge that left a gzipped copy of the
+      // log behind would not be a purge. Both natives include the three support
+      // names in the sweep; this is the double saying the same thing.
+      this.bundleOnDisk = false;
+    }
+    return this.withHostileClear({
       deletedCount: durable ? deleted : 0,
       failedPaths: durable ? [] : [this.openedPath ?? ''],
       durable,
       rebound,
-    };
+    });
   }
 
   private status(): SinkStatus {
     const totals = this.writer.totals(this.id);
-    return {
+    return this.withHostileStatus({
       queuedBytes: this.writer.queuedBytes,
       lostBytes: totals.bytes,
       lostEntries: totals.entries,
       degraded: this.writer.degraded,
+    });
+  }
+
+  /** What both adapters answer for a flush or a close with no handle. */
+  private noHandleOutcome(): FlushOutcome {
+    return {
+      durable: !this.mayHaveArtifacts,
+      timedOut: false,
+      pendingBytes: 0,
+      ...this.withHostileStatus(ZEROED),
     };
+  }
+
+  // Both always build a fresh object, even with no override to merge. Handing
+  // back the shared `ZEROED` constant would let one caller mutating a status it
+  // was given change what every later call on every sink reports — a failure
+  // mode a real bridge, which marshals a new value each time, does not have.
+  private withHostileStatus(computed: SinkStatus): SinkStatus {
+    return { ...computed, ...(this.hostileStatus ?? {}) };
+  }
+
+  private withHostileClear(computed: ClearOutcome): ClearOutcome {
+    return { ...computed, ...(this.hostileClear ?? {}) };
   }
 
   private reject(rejectReason: AppendResult['rejectReason']): AppendResult {

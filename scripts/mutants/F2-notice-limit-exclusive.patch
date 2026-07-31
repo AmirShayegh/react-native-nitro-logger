@@ -1,0 +1,13 @@
+diff --git a/src/destinations/FileDestination.ts b/src/destinations/FileDestination.ts
+index de5e759..56cbb6a 100644
+--- a/src/destinations/FileDestination.ts
++++ b/src/destinations/FileDestination.ts
+@@ -805,7 +805,7 @@ export class FileDestination implements LogDestination {
+     const text = this.formatOrUndefined(entry);
+     if (text === undefined) return undefined;
+     const bytes = utf8Length(text);
+-    if (bytes <= this.maxEntryBytes) return { record: text, bytes };
++    if (bytes < this.maxEntryBytes) return { record: text, bytes };
+     if (this.formatter.formatWithin) {
+       const shorter = this.formatWithinOrUndefined(entry);
+       if (shorter !== undefined) {

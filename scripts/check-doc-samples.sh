@@ -28,6 +28,62 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# --target src|lib — which build of the package the samples are checked
+# against, and the reason there are two.
+#
+# `src` is the working tree: fast, needs no build, and is what belongs in
+# `lint`, where a renamed export should break the docs in the same commit that
+# renames it. What it cannot see is the boundary a consumer actually meets. The
+# samples resolve `react-native-nitro-logger` to `src/index.tsx` — a file the
+# tarball ships but nothing published ever imports, because `exports` sends
+# every consumer to `lib/typescript/**`. A type that is exported from the
+# source and dropped by the declaration build typechecks here and fails for
+# every reader.
+#
+# `lib` resolves the same specifier the way `exports` does — through
+# `exports['.'].import.types`, the condition a bundler and `tsc
+# --moduleResolution bundler` take — so it is the published surface being
+# checked.
+#
+# It needs no separate build step, and that is worth stating because the
+# obvious assumption is wrong in a way that would make this target quietly
+# meaningless. The manifest step below runs `npm pack`, and npm runs `prepare`
+# on pack even under `--ignore-scripts` (verified on npm 10.9.3), so `lib/` is
+# rebuilt from the current tree on every run of this script. The existence
+# check further down is therefore a fail-closed guard for the day that stops
+# being true, not a routine precondition — an absent build must never quietly
+# fall back to the source, which is the one thing this target exists not to
+# check.
+#
+# It still belongs in `build-library` rather than in `lint`: `lint` runs on
+# every change and this target pays for a full declaration build, while `src`
+# gives the same answer for everything except the source-versus-declarations
+# boundary.
+TARGET=src
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target)
+      TARGET="${2:-}"
+      shift 2
+      ;;
+    --target=*)
+      TARGET="${1#--target=}"
+      shift
+      ;;
+    *)
+      echo "usage: $0 [--target src|lib]" >&2
+      exit 2
+      ;;
+  esac
+done
+case "$TARGET" in
+  src | lib) ;;
+  *)
+    echo "unknown target '$TARGET' — expected 'src' or 'lib'" >&2
+    exit 2
+    ;;
+esac
+
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
@@ -241,10 +297,33 @@ if [ "$count" = "0" ]; then
   exit 1
 fi
 
-# Resolve `react-native-nitro-logger` to the local source, so samples are
-# checked against this working tree rather than whatever is installed. `paths`
-# is only accepted from a config file, hence writing one rather than passing
-# flags.
+# Where the specifier resolves, which is the whole difference between the two
+# targets. `paths` is only accepted from a config file, hence writing one
+# rather than passing flags.
+if [ "$TARGET" = lib ]; then
+  # Read from the manifest rather than written down here: `exports` is what
+  # decides where a consumer's `import` lands, and a second copy of that answer
+  # in this script is a second thing to keep correct. The `import`/`types`
+  # condition is the one a bundler and `tsc --moduleResolution bundler` take.
+  ENTRY_TYPES="$(node -p "require('./package.json').exports['.'].import.types")"
+  UNSTABLE_TYPES="$(node -p "require('./package.json').exports['./unstable'].import.types")"
+  for declaration in "$ENTRY_TYPES" "$UNSTABLE_TYPES"; do
+    if [ ! -f "$declaration" ]; then
+      echo "no declarations at $declaration."
+      echo "The pack step above normally rebuilds them; if it no longer does,"
+      echo "run \`yarn prepare\`. This target checks the PUBLISHED surface, so"
+      echo "an absent build is a failure rather than a reason to fall back to"
+      echo "the source — which would check nothing this target exists for."
+      exit 1
+    fi
+  done
+  ENTRY="$(pwd)/$ENTRY_TYPES"
+  UNSTABLE_PATH="\"react-native-nitro-logger/unstable\": [\"$(pwd)/$UNSTABLE_TYPES\"],"
+else
+  ENTRY="$(pwd)/src/index.tsx"
+  UNSTABLE_PATH=""
+fi
+
 cat > "$OUT/tsconfig.json" <<JSON
 {
   "compilerOptions": {
@@ -257,7 +336,8 @@ cat > "$OUT/tsconfig.json" <<JSON
     "jsx": "react-jsx",
     "types": [],
     "paths": {
-      "react-native-nitro-logger": ["$(pwd)/src/index.tsx"],
+      "react-native-nitro-logger": ["$ENTRY"],
+      $UNSTABLE_PATH
       "react-native-nitro-logger/*": ["$(pwd)/*"]
     }
   },
@@ -268,8 +348,8 @@ JSON
 # The one command allowed to fail: under `set -e` its non-zero status would
 # otherwise abort the script before anything could be reported about it.
 if npx tsc -p "$OUT/tsconfig.json"; then
-  echo "every documentation sample typechecks ($count document(s))"
+  echo "every documentation sample typechecks against $TARGET ($count document(s))"
 else
-  echo "documentation samples do not compile against this tree"
+  echo "documentation samples do not compile against $TARGET"
   exit 1
 fi

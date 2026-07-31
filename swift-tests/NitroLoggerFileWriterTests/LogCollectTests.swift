@@ -70,21 +70,6 @@ final class LogCollectTests: LogWriterTestCase {
     }
   }
 
-  /// `gzip -dc`, the way somebody handed a bundle would open it.
-  private func gunzip(_ url: URL) throws -> String {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["gzip", "-dc", url.path]
-    let out = Pipe()
-    process.standardOutput = out
-    process.standardError = Pipe()
-    try process.run()
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    XCTAssertEqual(process.terminationStatus, 0, "gzip refused the bundle")
-    return String(decoding: data, as: UTF8.self)
-  }
-
   // MARK: - The bundle is the log
 
   /// The whole point: concatenated gzip members decompress as one stream, so a
@@ -355,8 +340,11 @@ final class LogCollectTests: LogWriterTestCase {
         "\(orphan.lastPathComponent) is not an artifact")
     }
 
-    // The sweep runs at open.
+    // Open *queues* the sweep — it no longer waits for it, so asserting on the
+    // directory needs a barrier. `settleForTesting` is that barrier and nothing
+    // more: it is the queue draining, not a second chance for the sweep.
     let handle = try makeHandle(policy: policy())
+    handle.writerForTesting.settleForTesting()
 
     for orphan in orphans {
       XCTAssertFalse(
@@ -381,6 +369,182 @@ final class LogCollectTests: LogWriterTestCase {
     XCTAssertEqual(archiveNames().filter { $0 != LogWriter.supportName("app.log") }.count, 1)
 
     XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+  }
+
+  // MARK: - Deleting the bundle
+
+  /// The third step of the support flow, and the one that decides whether a
+  /// gzipped copy of the whole log stays on the device after the upload.
+  func testDeletingTheBundleRemovesItAndLeavesTheLogsAlone() throws {
+    let handle = try makeHandle(policy: policy(bytes: 64))
+    writeRotating(handle, count: 6)
+    _ = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+    let logsBefore = handle.logFilePaths()
+    XCTAssertGreaterThan(logsBefore.count, 1, "the setup did not produce archives to spare")
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "it reported the bundle gone with the bundle still on disk")
+    // The half that makes this not a smaller purge. Deleting the copy must
+    // leave every original exactly where it was.
+    XCTAssertEqual(handle.logFilePaths(), logsBefore, "it deleted log files too")
+  }
+
+  /// Deleting a bundle that is not there is the outcome the caller asked for,
+  /// not a failure — a retry, and a collect that found nothing to pack, both
+  /// land here.
+  func testDeletingABundleThatWasNeverCollectedSucceeds() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+  }
+
+  /// The staging names hold log bytes too — a half-written bundle and the
+  /// scratch file a plaintext source was being compressed into. Leaving either
+  /// behind would leave a partial copy of the log the caller believes it
+  /// deleted.
+  func testDeletingTakesTheStagingLeftoversAsWell() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    let leftovers = [
+      LogWriter.supportStagingName("app.log"),
+      LogWriter.supportMemberName("app.log"),
+    ].map { logsDirectory.appendingPathComponent($0) }
+    for leftover in leftovers { try Data("truncated".utf8).write(to: leftover) }
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    for leftover in leftovers {
+      XCTAssertFalse(
+        FileManager.default.fileExists(atPath: leftover.path),
+        "\(leftover.lastPathComponent) survived")
+    }
+  }
+
+  /// Gated on liveness like every other entry point: a released handle
+  /// unlinking would reach into a directory a live handle now owns, and may be
+  /// mid-publish in.
+  func testAReleasedHandleCannotDeleteTheBundle() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    _ = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    _ = handle.close(deadlineMs: 5000)
+
+    XCTAssertFalse(handle.deleteSupportBundle(deadlineMs: 5000))
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "a released handle deleted a bundle anyway")
+  }
+
+  /// Being active is not the same as being current, and this is the difference.
+  ///
+  /// The handle below is never closed, so every liveness gate it passes says
+  /// yes; what it is not is the owner of that directory any more. A sibling
+  /// purged, the writer moved to a new generation, and the bundle sitting there
+  /// now was produced by whoever holds it — and has already been handed back to
+  /// a caller as a path to upload. Deleting it is the ownership violation this
+  /// check exists for, and nothing about the handle's own state would catch it.
+  func testAHandleLeftBehindByAnotherPurgeCannotDeleteTheBundle() throws {
+    let victim = try makeHandle(policy: policy())
+    let sibling = try makeHandle(policy: policy())
+    write(victim, record)
+
+    // The sibling purges, taking the generation with it, then collects. The
+    // bundle on disk afterwards is the sibling's.
+    XCTAssertTrue(sibling.clearLogs(deadlineMs: 5000).durable)
+    write(sibling, record)
+    XCTAssertTrue(sibling.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000).complete)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    XCTAssertFalse(
+      victim.deleteSupportBundle(deadlineMs: 5000),
+      "a stale handle reported deleting a bundle it does not own")
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "a stale handle deleted the current generation's bundle")
+
+    // And the owner can still delete its own.
+    XCTAssertTrue(sibling.deleteSupportBundle(deadlineMs: 5000))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: bundleURL.path))
+  }
+
+  /// A delete that lands *before* a build publishes leaves a bundle behind, and
+  /// that is correct rather than a leak.
+  ///
+  /// `true` is a statement about the instant the call ran, not a promise about
+  /// the next one — the collect that was already in flight legitimately writes
+  /// a fresh bundle afterwards. Sequencing the two is the caller's job, and the
+  /// alternative would be a delete that reaches forward in time to cancel a
+  /// collect it never knew about.
+  func testABundleDeletedBeforeAPublishIsRecreatedByTheCollect() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+
+    let gated: LogWriter.Compressor = { source, destination in
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    let handle = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    write(handle, "precious\n")
+    // A bundle from an earlier collect, so the delete below has something real
+    // to remove rather than succeeding vacuously.
+    try Data("earlier".utf8).write(to: bundleURL)
+
+    let collectFinished = DispatchSemaphore(value: 0)
+    var collected = LogCollectOutcome.nothing
+    DispatchQueue.global().async {
+      collected = handle.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      collectFinished.signal()
+    }
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    // The build owns the queue, so this cannot run yet — the same serialization
+    // `testAPurgeCannotPreemptABuildAlreadyRunning` pins. It is bounded, and a
+    // bound that expires is `false`.
+    XCTAssertFalse(
+      handle.deleteSupportBundle(deadlineMs: 50),
+      "it reported a deletion it never got the queue to perform")
+
+    held.release()
+    collectFinished.wait()
+    XCTAssertTrue(collected.complete, "the build was not preempted; it published")
+
+    // The queued delete runs, then the publish already happened — so what is on
+    // disk at the end is the collect's bundle, not the one that was deleted.
+    handle.writerForTesting.settleForTesting()
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "the collect's own bundle went missing")
+    XCTAssertNotEqual(
+      try String(contentsOf: bundleURL, encoding: .isoLatin1), "earlier",
+      "the earlier bundle survived a delete that was queued before the publish")
+  }
+
+  /// The ordinary support flow, with the delete last: nothing remains.
+  func testABundleDeletedAfterAPublishIsGone() throws {
+    let handle = try makeHandle(policy: policy(bytes: 64))
+    writeRotating(handle, count: 6)
+    let collected = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(collected.complete)
+    XCTAssertEqual(collected.path, bundleURL.path)
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    // Every support name, not just the published one: a staging file the build
+    // left behind is a partial copy of the same log.
+    XCTAssertEqual(
+      names().filter { $0.hasPrefix("app.log.support") }, [],
+      "a support artifact survived the delete")
   }
 
   // MARK: - The deadline
@@ -518,5 +682,331 @@ final class LogCollectTests: LogWriterTestCase {
 
     XCTAssertTrue(outcome.complete)
     XCTAssertEqual(try gunzip(bundleURL), "in flight\n")
+  }
+
+  // MARK: - The publish barrier
+
+  /*
+   What the tests below do NOT prove.
+
+   - **Not that the replace is atomic to an external reader.** Nothing here
+     opens the bundle path while the rename runs. That property comes from
+     `rename(2)`'s contract, and this suite takes it on the contract.
+   - **Not the behaviour on a filesystem where `rename` is not atomic.** A
+     network mount is the case, and the temp directory these run in is not one.
+   - **Not that two completed collects leave a caller's path meaningful.** There
+     is one bundle name, so a later collect replaces an earlier one's file
+     whether or not they overlapped; a caller holding a path from a completed
+     collect can find different bytes there by the time it uploads. That is
+     inherent to the name and `collectLock` does not change it.
+   - **Not that two builds cannot corrupt each other.** They cannot, but the
+     serial queue is what guarantees it, not `collectLock`. Removing the lock
+     leaves the bundles intact and only wastes the queue — which is why the
+     contention test asserts the compressor call count rather than the contents.
+   - **Not that `close` never waits for a collect.** The asymmetry test asserts
+     that close returns inside its own budget. A *bounded* wait added to close
+     would still satisfy it; only an unbounded one shows up, and it shows up as
+     a hung run rather than a red one.
+   */
+
+  /// **The headline fix.** A collect that produces no bundle must not destroy
+  /// the one that is already there.
+  ///
+  /// `buildBundle` used to delete the published bundle as its *first* action,
+  /// before it knew whether it would publish anything. Every failure after that
+  /// — abandoned by timeout, nothing selected, a member that would not copy, a
+  /// rename that failed — left the caller of an earlier successful collect
+  /// holding a path to a file that no longer existed, and no call ever reported
+  /// destroying it. A support flow that had collected, shown the user a size,
+  /// and was about to upload would find nothing there.
+  ///
+  /// Nothing pre-deletes now. The publish is a `rename`, which replaces its
+  /// destination atomically and, when it fails, does not touch it at all.
+  func testAnOverrunCollectLeavesTheEarlierBundleInPlace() throws {
+    let compressor = SlowCompressor()
+    compressor.slow = false
+    let handle = try makeHandle(
+      policy: policy(bytes: 10_000_000), compressor: compressor.compress)
+    write(handle, "precious\n")
+
+    let first = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(first.complete, "the setup collect has to succeed for this to test anything")
+    XCTAssertEqual(try gunzip(bundleURL), "precious\n")
+
+    // Now one that cannot finish inside its deadline.
+    compressor.slow = true
+    let second = handle.collectLogs(deadlineMs: 50, maxTotalBytes: 10_000_000)
+    XCTAssertFalse(second.complete, "the wait was 50ms and the build takes 500")
+
+    // Let the abandoned build run to the end it would have reached anyway; the
+    // barrier stops it publishing, and it must not have destroyed anything on
+    // the way either.
+    handle.writerForTesting.settleForTesting()
+
+    XCTAssertEqual(
+      try gunzip(bundleURL),
+      "precious\n",
+      "a collect that published nothing deleted the bundle a previous one published"
+    )
+    XCTAssertEqual(
+      first.path, bundleURL.path,
+      "the path the first caller is still holding is the one that survived")
+  }
+
+  /// A collect refused for contention must not queue a build behind the winner.
+  ///
+  /// Two observables, because the two ways of getting this wrong look identical
+  /// from a single one. A *blocking* acquire is caught by the elapsed time: the
+  /// loser would sit until the winner released, which here is never within the
+  /// test's control. *No lock at all* is caught by the compressor call count:
+  /// the loser would flush and enqueue a second full copy of the log, and the
+  /// count would be two.
+  func testAConcurrentCollectIsRefusedRatherThanQueued() throws {
+    let held = Latch()
+    // Released before any assertion can fail, so a failure cannot wedge the
+    // writer and turn a clear failure into a teardown that waits out deadlines.
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+    let calls = Counter()
+
+    let gated: LogWriter.Compressor = { source, destination in
+      calls.increment()
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    // Two handles on ONE writer — a per-handle flag cannot see this, which is
+    // why the lock lives on the writer.
+    let winner = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    let loserHandle = try makeHandle(policy: policy(bytes: 10_000_000))
+    write(winner, "precious\n")
+
+    var winnerOutcome = LogCollectOutcome.nothing
+    let winnerFinished = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      winnerOutcome = winner.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      winnerFinished.signal()
+    }
+    // The winner's build is now provably inside the compressor, holding both
+    // the queue and the collect gate. No sleep, no guessing.
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    let began = Date()
+    let loser = loserHandle.collectLogs(deadlineMs: 100, maxTotalBytes: 10_000_000)
+    let elapsed = Date().timeIntervalSince(began)
+
+    XCTAssertFalse(loser.complete)
+    XCTAssertEqual(loser.path, "")
+    XCTAssertLessThan(
+      elapsed, 2.0,
+      "the refused collect waited for the winner instead of giving up on its own deadline")
+
+    held.release()
+    winnerFinished.wait()
+    XCTAssertTrue(winnerOutcome.complete, "the winner should have published")
+    handle(winner).settleForTesting()
+
+    XCTAssertEqual(
+      calls.value, 1,
+      "the refused collect enqueued a build of its own — the point is that it does not")
+  }
+
+  /// The per-handle flag: a second collect on the SAME handle is refused
+  /// locally, without touching the writer.
+  ///
+  /// The observable is time, not the outcome. Both a refusal here and a refusal
+  /// at the writer's gate return the same `.nothing`; what separates them is
+  /// that this one costs nothing. Without the flag the second call would flush,
+  /// then sit on the writer's gate for the whole five seconds it was given
+  /// before reporting the same thing.
+  func testASecondCollectOnOneHandleIsRefused() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+
+    let gated: LogWriter.Compressor = { source, destination in
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    let handle = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    write(handle, "precious\n")
+
+    var firstOutcome = LogCollectOutcome.nothing
+    let firstFinished = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      firstOutcome = handle.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      firstFinished.signal()
+    }
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    let began = Date()
+    let second = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    let elapsed = Date().timeIntervalSince(began)
+
+    XCTAssertFalse(second.complete)
+    XCTAssertEqual(second.path, "")
+    XCTAssertLessThan(
+      elapsed, 1.0,
+      "the second collect on this handle spent its deadline discovering it had lost")
+
+    held.release()
+    firstFinished.wait()
+    XCTAssertTrue(firstOutcome.complete)
+  }
+
+  /// The deliberate asymmetry: `close` waits out a purge and does **not** wait
+  /// out a collect.
+  ///
+  /// A purge is waited for because tearing the writer down mid-deletion leaves
+  /// the fresh file missing. A collect only reads logs and writes its own
+  /// scratch, and being abandoned is already a first-class, tested outcome — so
+  /// a third wait on close's budget would buy nothing and cost teardown
+  /// latency, which on the JS side is a dispose that blocks the runtime.
+  func testACollectInFlightDoesNotDelayTheHandleClose() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+
+    let gated: LogWriter.Compressor = { source, destination in
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    let handle = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    write(handle, "precious\n")
+
+    let collectFinished = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      _ = handle.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      collectFinished.signal()
+    }
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    let began = Date()
+    _ = handle.close(deadlineMs: 50)
+    let elapsed = Date().timeIntervalSince(began)
+
+    XCTAssertLessThan(
+      elapsed, 2.0,
+      "close waited out a collect it deliberately does not wait for")
+
+    held.release()
+    collectFinished.wait()
+  }
+
+  /// Cross-operation ordering, stated exactly: **a purge cannot preempt a build
+  /// that is already running**, and the queue is what guarantees it.
+  ///
+  /// The publish and the sweep are each a single queue task, so their mutating
+  /// phases cannot interleave. What that buys, and what it does not:
+  ///
+  /// - A purge submitted behind a running build waits for it. If its own
+  ///   deadline expires first it reports non-durable — truthfully, because it
+  ///   has deleted nothing yet — and then runs when the queue frees.
+  /// - It does **not** mean a purge cannot land between a collect's flush and
+  ///   its build. It can, and then the build reads a directory the purge
+  ///   emptied. That is a legitimate linearization, not a defect.
+  func testAPurgeCannotPreemptABuildAlreadyRunning() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+
+    let gated: LogWriter.Compressor = { source, destination in
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    let handle = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    write(handle, "precious\n")
+
+    let collectFinished = DispatchSemaphore(value: 0)
+    var collected = LogCollectOutcome.nothing
+    DispatchQueue.global().async {
+      collected = handle.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      collectFinished.signal()
+    }
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    // The sweep cannot start: the build owns the queue.
+    let purge = handle.clearLogs(deadlineMs: 50)
+    XCTAssertFalse(
+      purge.durable,
+      "a purge that has not run a single unlink reported a durable deletion")
+    XCTAssertEqual(purge.failedPaths, [logURL.path], "and it names what it did not delete")
+
+    held.release()
+    collectFinished.wait()
+    XCTAssertTrue(collected.complete, "the build was not preempted; it published")
+
+    // Now let the queued sweep run. It was never cancelled — only late.
+    handle.writerForTesting.settleForTesting()
+    XCTAssertEqual(
+      names().filter { $0.hasPrefix("app.log.support") }, [],
+      "the purge ran once the build let go of the queue, and took the bundle with it")
+  }
+
+  /// Reaches the writer behind a handle. Named rather than inlined so the two
+  /// spellings of "settle this writer" in this file stay one idea.
+  private func handle(_ handle: LogFileHandle) -> LogWriter { handle.writerForTesting }
+
+  /// A gate that latches open, so any number of waiters proceed once released
+  /// and a second `release()` is harmless.
+  ///
+  /// A `DispatchSemaphore` is the wrong shape here: it would have to be
+  /// signalled once per waiter, and the number of waiters is exactly what these
+  /// tests are trying to establish rather than assume.
+  private final class Latch: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var open = false
+
+    func wait() {
+      condition.lock()
+      while !open { condition.wait() }
+      condition.unlock()
+    }
+
+    func release() {
+      condition.lock()
+      open = true
+      condition.broadcast()
+      condition.unlock()
+    }
+
+    /// Opens the latch from somewhere other than the test thread, after
+    /// `seconds`.
+    ///
+    /// Insurance against the mutation, not against the code. Every test here
+    /// gates the writer and then does bounded work on the test thread — but if
+    /// a bound under test were removed, the test thread would block before
+    /// reaching its own `release()` and the whole suite would hang instead of
+    /// reporting a failure. A wedged run says far less than a red one, and it
+    /// says it much later. This fires long after the assertions in a passing
+    /// run and changes nothing there.
+    func releaseAfter(_ seconds: TimeInterval) {
+      DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [self] in release() }
+    }
+  }
+
+  /// A counter the writer's queue increments and the test thread reads.
+  private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+      lock.lock()
+      count += 1
+      lock.unlock()
+    }
+
+    var value: Int {
+      lock.lock()
+      defer { lock.unlock() }
+      return count
+    }
   }
 }

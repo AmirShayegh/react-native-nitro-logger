@@ -104,3 +104,7 @@ android/generated
 # script — tracking them would let a committed report answer for a run that
 # never happened.
 .jest-reports/
+
+# Written by `yarn test:coverage`. Like .jest-reports above, a build
+# artifact of a gate rather than anything to keep.
+coverage/

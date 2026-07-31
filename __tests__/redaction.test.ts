@@ -67,6 +67,23 @@ describe('privacy default', () => {
     expect(md(dest)).toEqual({ state: 'running', patientRef: '<private>' });
   });
 
+  /**
+   * The twin of the test above, and the reason it is worth having.
+   *
+   * On its own, "redacts in production" is satisfied by a `priv()` that
+   * redacts always — including on the developer's machine, where seeing the
+   * value is the entire point of marking it rather than omitting it. A
+   * library that quietly did that would push developers back to logging the
+   * bare value, which is the failure the marker exists to prevent. Both
+   * halves, or the pair proves only that nothing leaks.
+   */
+  test('and reveals under that same default in a dev build', () => {
+    setDev(true);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { state: 'running', patientRef: priv('abc') });
+    expect(md(dest)).toEqual({ state: 'running', patientRef: 'abc' });
+  });
+
   test('a forgotten wrapper hides data rather than leaking it', () => {
     setDev(false);
     const { logger, dest } = makeLogger();
@@ -609,6 +626,93 @@ describe('key validation happens before any value is read', () => {
     });
     scope.info('m');
     expect(md(dest)).toEqual({ ok: 'kept', [DROPPED_COUNT_KEY]: 1 });
+  });
+
+  /**
+   * The scope snapshot applies the key rule before it reads, like redaction.
+   *
+   * It did not until 0.3.0, and the gap was worth closing on its own terms:
+   * `redactMetadata` is careful never to run a getter behind a rejected key,
+   * and the snapshot then ran it anyway — at construction, before a single
+   * message had been logged. A scope built with a `patient.name` getter that
+   * phoned home fired on `logger.scoped(...)`, not on any `info()` call, so
+   * nothing about level filtering or redaction could prevent it.
+   *
+   * Constructing the scope is the whole test. Nothing is logged.
+   */
+  test('a scope getter behind a malformed key is never read', () => {
+    setDev(false);
+    const { logger } = makeLogger();
+    let touched = false;
+    logger.scoped('s-1', undefined, {
+      ok: 'kept',
+      get ['has space']() {
+        touched = true;
+        return 'PHI';
+      },
+    } as never);
+    expect(touched).toBe(false);
+  });
+
+  test('a scope getter behind the reserved diagnostic key is never read', () => {
+    setDev(false);
+    const { logger } = makeLogger();
+    let touched = false;
+    logger.scoped('s-1', undefined, {
+      ok: 'kept',
+      get [DROPPED_COUNT_KEY]() {
+        touched = true;
+        return 999;
+      },
+    } as never);
+    expect(touched).toBe(false);
+  });
+
+  test('a rejected scope key is still counted, not dropped unread', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    // Left unread, but not left out: the key still has to reach redaction to
+    // be counted, or scope defaults would under-report what call-site
+    // metadata reports correctly. That symmetry is asserted here directly.
+    const scope = logger.scoped('s-1', undefined, {
+      ok: 'kept',
+      ['has space']: 'PHI',
+    } as never);
+    scope.info('m');
+    expect(md(dest)).toEqual({ ok: 'kept', [DROPPED_COUNT_KEY]: 1 });
+
+    const direct = makeLogger();
+    direct.logger.info('m', { ok: 'kept', ['has space']: 'PHI' } as never);
+    expect(md(direct.dest)).toEqual({ ok: 'kept', [DROPPED_COUNT_KEY]: 1 });
+  });
+
+  /**
+   * The catalog is the one check that cannot move into the snapshot.
+   *
+   * `metadataKeyCatalog` intersects at any time, so a key approved when a
+   * scope was constructed can be unapproved by the time it emits — the
+   * snapshot has no answer to consult. This pins the honest version of the
+   * guarantee rather than the flattering one: the getter runs exactly once,
+   * at construction, and never again on any message.
+   */
+  test('a scope getter behind an unapproved key runs once, at construction', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    let reads = 0;
+    logger.metadataKeyCatalog(['approved']);
+    const scope = logger.scoped('s-1', undefined, {
+      approved: 'kept',
+      get patient123() {
+        reads += 1;
+        return 'PHI';
+      },
+    } as never);
+    expect(reads).toBe(1);
+
+    scope.info('m1');
+    scope.info('m2');
+    expect(reads).toBe(1);
+    expect(md(dest)).toEqual({ approved: 'kept', [DROPPED_COUNT_KEY]: 1 });
   });
 
   test('an undefined scope value is counted, matching direct metadata', () => {

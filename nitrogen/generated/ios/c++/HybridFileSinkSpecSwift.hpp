@@ -153,6 +153,14 @@ namespace margelo::nitro::nitrologger {
       auto __value = std::move(__result.value());
       return __value;
     }
+    inline bool deleteSupportBundle(double deadlineMs) override {
+      auto __result = _swiftPart.deleteSupportBundle(std::forward<decltype(deadlineMs)>(deadlineMs));
+      if (__result.hasError()) [[unlikely]] {
+        std::rethrow_exception(__result.error());
+      }
+      auto __value = std::move(__result.value());
+      return __value;
+    }
     inline ClearOutcome clearLogs(double deadlineMs) override {
       auto __result = _swiftPart.clearLogs(std::forward<decltype(deadlineMs)>(deadlineMs));
       if (__result.hasError()) [[unlikely]] {

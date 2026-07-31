@@ -64,7 +64,9 @@ class LogFileWriter internal constructor(
    * and a close that was promised 200 ms and takes an hour is an ANR. iOS keeps
    * the same split, using `DispatchTime` for deadlines and `Date` for ages.
    */
-  private val monotonic: () -> Long
+  private val monotonic: () -> Long,
+  /** See the parameter of the same name on [open]. Null in production. */
+  private val openSweepGate: (() -> Unit)? = null
 ) {
   /**
    * The raw write, injectable so short writes and hard failures can be tested
@@ -323,6 +325,53 @@ class LogFileWriter internal constructor(
       return active + archives(directory, file.name).map { it.file.absolutePath }
     }
 
+    /**
+     * Unlinks the three support names beside [file] and reports whether none of
+     * them remains.
+     *
+     * The one implementation, called from two places: on the executor while a
+     * handle is live, and directly for a sink whose handle has gone — the same
+     * split, for the same reason, as [logFilePaths] and [artifactPaths]. What
+     * differs between the callers is what serializes them, never which names
+     * get deleted.
+     *
+     * Absence is success. `delete()` on a name that was never there returns
+     * false, and treating that as a failure would report a surviving bundle for
+     * the overwhelmingly common case of deleting one that is already gone — so
+     * the verdict is a re-check of the three names rather than the result of
+     * three deletions. Only [PlatformIo.Presence.ABSENT] counts as gone;
+     * `UNKNOWN` is a lookup that never found out and is treated as a survivor,
+     * which is the same fail-closed rule [sweepArtifacts] applies.
+     *
+     * The directory is synced for the reason the purge syncs it: `unlink`
+     * returning success only puts the change in the directory's in-memory
+     * state, and a crash before that reaches storage brings back a gzipped copy
+     * of the whole log that this call said was gone.
+     */
+    fun deleteSupportArtifacts(file: File, platform: PlatformIo): Boolean {
+      val directory = file.parentFile ?: File(".")
+      val baseName = file.name
+      // Exactly these three, from the same helpers [isArtifactName] uses. Never
+      // a directory listing filtered by [isArtifactName]: that matches the log
+      // files too, and this call is not a purge.
+      val names = listOf(
+        supportName(baseName), supportStagingName(baseName), supportMemberName(baseName)
+      )
+
+      // The results are deliberately ignored; the check below is the verdict.
+      for (name in names) File(directory, name).delete()
+
+      for (name in names) {
+        if (platform.lookup(File(directory, name)) != PlatformIo.Presence.ABSENT) return false
+      }
+
+      // A directory that is not there cannot be opened and has nothing whose
+      // removal needs committing; the three names are absent for the strongest
+      // possible reason.
+      if (platform.lookup(directory) == PlatformIo.Presence.ABSENT) return true
+      return platform.syncDirectory(directory)
+    }
+
     @Throws(LogWriterException::class)
     fun open(
       file: File,
@@ -339,7 +388,20 @@ class LogFileWriter internal constructor(
       rawWrite: RawWrite? = null,
       compressor: Compressor? = null,
       clock: (() -> Long)? = null,
-      monotonic: (() -> Long)? = null
+      monotonic: (() -> Long)? = null,
+      /**
+       * Runs on the executor immediately before the open sweep, so a test can
+       * hold the sweep there and observe the writer as it is *before* retention
+       * has run.
+       *
+       * Injected here rather than set on the instance afterwards because the
+       * sweep is submitted during construction — by the time a caller has a
+       * writer to assign a property on, the sweep may already have run. A
+       * process-wide static would reach it in time and is what this replaces:
+       * these suites share a JVM, and one test's gate left standing is another
+       * test's writer wedged at open.
+       */
+      openSweepGate: (() -> Unit)? = null
     ): LogFileWriter = LogFileWriter(
       file = file,
       canonicalPath = canonicalPath,
@@ -349,7 +411,8 @@ class LogFileWriter internal constructor(
       rawWrite = rawWrite ?: defaultRawWrite,
       compressor = compressor ?: defaultCompressor,
       clock = clock ?: System::currentTimeMillis,
-      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L }
+      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L },
+      openSweepGate = openSweepGate
     ).also { it.start() }
   }
 
@@ -358,7 +421,16 @@ class LogFileWriter internal constructor(
   private var writerThread: Thread? = null
 
   private val executor = Executors.newSingleThreadExecutor(ThreadFactory { runnable ->
-    Thread(runnable, "com.nitrologger.filewriter").apply {
+    Thread({
+      // On the writer thread, not the one that built it. `setThreadPriority`
+      // acts on the caller, so doing this in the factory body — which runs on
+      // whichever thread submitted the first task, usually the JavaScript
+      // thread — would deprioritize the app instead of the log writer.
+      //
+      // Before the runnable, so every task including the first is covered.
+      platform.deprioritizeCurrentThread()
+      runnable.run()
+    }, "com.nitrologger.filewriter").apply {
       isDaemon = true
       writerThread = this
     }
@@ -378,6 +450,28 @@ class LogFileWriter internal constructor(
   private val stateLock = ReentrantLock()
   /** Held for the whole of [clearLogs], so purges cannot interleave. */
   private val purgeLock = ReentrantLock()
+
+  /**
+   * One collect at a time per writer.
+   *
+   * **Not for the reason [purgeLock] exists, and the difference is worth being
+   * exact about.** Two builds cannot corrupt each other's staging file: builds
+   * run as tasks on the single-threaded [executor], so they are already ordered
+   * end to end. This lock does not add that.
+   *
+   * What it adds is that a second collect does not *enqueue* while a first is
+   * running. Without it, N concurrent callers put N full copies of the log on
+   * the executor, each one holding up every flush behind it, and each caller
+   * then spends its whole deadline waiting for work it never began — and
+   * reports a timeout, having caused one. Refusing is both cheaper and truer.
+   *
+   * **It does not make the bundle path stable for a caller.** There is one
+   * well-known bundle name, so a later collect replaces an earlier one's file
+   * whether or not they overlapped, and a caller holding a path from a
+   * completed collect can always find different bytes there by the time it
+   * uploads. That is inherent to the name, not to concurrency.
+   */
+  private val collectLock = ReentrantLock()
   private var reservedBytes = 0L
   private var generation = 1L
   private var closed = false
@@ -454,7 +548,25 @@ class LogFileWriter internal constructor(
         "could not open the log file"
       )
     }
-    onExecutor { sweepRetention() }
+    // Submitted, not awaited — and that is the change worth understanding.
+    //
+    // The executor is single-threaded, so the sweep still runs before the first
+    // append's write reaches the disk. That is the only ordering the sweep
+    // needs: it moves archives, and nothing can append to an archive it has not
+    // finished moving if the append is behind it in the same queue.
+    //
+    // What waiting cost was an unbounded cross-thread wait taken **while the
+    // registry lock is held**. Opening one file with a large backlog of
+    // archives to prune therefore stalled every other file's acquire and
+    // release, including a close with a deadline it had promised to keep.
+    //
+    // The trim above stays synchronous. It must finish before any byte is
+    // appended, it is what the exclusive lock is taken to protect, and it is
+    // bounded by the file's size rather than by the directory's history.
+    executor.execute {
+      openSweepGate?.invoke()
+      sweepRetention()
+    }
   }
 
   /**
@@ -1092,38 +1204,69 @@ class LogFileWriter internal constructor(
    * thread could copy in an archive that is being renamed out from under it.
    */
   fun collectLogs(handleId: Long, deadlineMs: Double, maxTotalBytes: Double): LogCollectOutcome {
-    val expiry = monotonic() + clampDeadline(deadlineMs)
+    // One absolute instant, computed before any waiting, and every wait below
+    // is against it rather than against a fresh budget of its own: the gate,
+    // the flush, and the build. A caller that asked for 100 ms means 100 ms for
+    // the lot — handing each step the full figure turns the deadline into a
+    // multiple of itself.
+    val budget = clampDeadline(deadlineMs)
+    val expiry = monotonic() + budget
 
-    // Everything buffered goes in. A support bundle missing the last few
-    // seconds is missing exactly the part somebody is asking about.
-    flushUntil(handleId, expiry)
-
-    val handoff = CollectHandoff()
-    var outcome = LogCollectOutcome.NOTHING
-    val done = CountDownLatch(1)
-    try {
-      executor.execute {
-        try {
-          if (!terminated) outcome = buildBundle(handoff, maxTotalBytes)
-        } finally {
-          done.countDown()
-        }
-      }
-      // The task cannot be cancelled mid-copy, but it CAN be stopped from
-      // publishing. Without that it would go on to rename a finished bundle
-      // into place seconds after this call reported there was none — a second
-      // copy of the whole log, on a device whose app was told nothing was
-      // collected, outside the retention budget it configured, and skipped by
-      // the orphan sweep because a FINISHED bundle is deliberately kept.
-      if (!done.await(remaining(expiry), TimeUnit.MILLISECONDS)) return handoff.giveUp()
+    // One collect at a time per writer — see [collectLock]. Refused, not
+    // queued: a second collect that waited its turn would spend the caller's
+    // whole deadline before starting and then report a timeout for work it
+    // never began, which is a worse answer than "not now".
+    //
+    // Taken before the flush so the whole call is one exclusive region, and
+    // before anything is submitted to the executor, so this refusal leaves
+    // nothing enqueued to publish later.
+    val acquired = try {
+      collectLock.tryLock(budget, TimeUnit.MILLISECONDS)
     } catch (_: InterruptedException) {
       Thread.currentThread().interrupt()
-      return handoff.giveUp()
-    } catch (_: RejectedExecutionException) {
-      // Nothing was ever queued, so there is nothing to stop.
-      return LogCollectOutcome.NOTHING
+      false
     }
-    return outcome
+    if (!acquired) return LogCollectOutcome.NOTHING
+
+    try {
+      // Everything buffered goes in. A support bundle missing the last few
+      // seconds is missing exactly the part somebody is asking about.
+      flushUntil(handleId, expiry)
+
+      val handoff = CollectHandoff()
+      var outcome = LogCollectOutcome.NOTHING
+      val done = CountDownLatch(1)
+      try {
+        executor.execute {
+          try {
+            if (!terminated) outcome = buildBundle(handoff, maxTotalBytes)
+          } finally {
+            done.countDown()
+          }
+        }
+        // The task cannot be cancelled mid-copy, but it CAN be stopped from
+        // publishing. Without that it would go on to rename a finished bundle
+        // into place seconds after this call reported there was none — a second
+        // copy of the whole log, on a device whose app was told nothing was
+        // collected, outside the retention budget it configured, and skipped by
+        // the orphan sweep because a FINISHED bundle is deliberately kept.
+        //
+        // Every `giveUp()` below runs BEFORE the `finally` releases the gate,
+        // which is the point: a build abandoned under the handoff's own monitor
+        // can never publish, so the next collect through the gate cannot find
+        // one racing it.
+        if (!done.await(remaining(expiry), TimeUnit.MILLISECONDS)) return handoff.giveUp()
+      } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return handoff.giveUp()
+      } catch (_: RejectedExecutionException) {
+        // Nothing was ever queued, so there is nothing to stop.
+        return LogCollectOutcome.NOTHING
+      }
+      return outcome
+    } finally {
+      collectLock.unlock()
+    }
   }
 
   /**
@@ -1144,11 +1287,20 @@ class LogFileWriter internal constructor(
     val finalFile = File(directory, supportName(baseName))
     val staging = File(directory, supportStagingName(baseName))
 
-    // Both, before anything is written. The previous bundle is replaced rather
-    // than added to, and a staging file from a collect that died mid-write is
-    // not something to append to.
+    // Staging only, and deliberately not [finalFile].
+    //
+    // Staging is this call's own scratch: a `.part` from a collect that died
+    // mid-write is not something to append to, and clearing it is what stops
+    // abandoned builds accumulating. Deleting it can destroy nothing a caller
+    // holds, because no call ever returns a `.part` path.
+    //
+    // The published bundle used to be deleted here too, and that was the
+    // defect. Every failure below — abandoned by timeout, nothing selected, a
+    // member that would not copy, a rename that failed — then left the caller
+    // of an *earlier* successful collect holding a path to a file that no
+    // longer existed, and no call ever reported destroying it. It is replaced
+    // by the rename at the end instead, which needs no pre-delete at all.
     staging.delete()
-    finalFile.delete()
 
     // Newest first: the active file, then archives. `archives` already excludes
     // `.part` and — because the bundle is not an archive name — the bundle this
@@ -1250,6 +1402,23 @@ class LogFileWriter internal constructor(
       return failed
     }
 
+    // **What serialises this against a purge is the executor, not a lock.** The
+    // rename below, and `clearLogs`'s whole sweep, are each a single task on
+    // this single-threaded executor, so their mutating phases cannot interleave
+    // — one runs to completion before the other starts.
+    //
+    // Stated precisely, because the guarantee is narrower than "purge and
+    // collect are mutually exclusive": a purge CAN linearize between this
+    // collect's flush and the submission of this build, and then it deletes
+    // artifacts this build was about to read. What it cannot do is preempt a
+    // build already running. A purge submitted behind a slow compressor waits
+    // for it — returning non-durable if its own deadline expires first, then
+    // executing when the executor frees.
+    //
+    // A shared gate would close the first gap and cost more than it is worth:
+    // purge would additionally have to wait through collect's *flush*, which
+    // touches none of the files it deletes.
+    //
     // The publish barrier, with the rename inside it. Holding the lock across
     // the rename is what makes "did this publish?" a question with one answer:
     // a waiter that takes the lock either finds nothing renamed — and marks the
@@ -1262,7 +1431,11 @@ class LogFileWriter internal constructor(
         staging.delete()
         return failed
       }
-      if (!staging.renameTo(finalFile)) {
+      // Through the platform seam rather than `File.renameTo`, which promises
+      // neither the atomic replace nor the leave-the-destination-alone-on-
+      // failure that make the pre-delete unnecessary. See
+      // [PlatformIo.renameReplacing].
+      if (!platform.renameReplacing(staging, finalFile)) {
         staging.delete()
         note(LogDegradation.GZIP)
         return failed
@@ -1447,12 +1620,26 @@ class LogFileWriter internal constructor(
         try {
           terminated = true
           closeCurrentStream()
-          // After the stream, before anyone is told: the claim must outlast
-          // every byte this writer will ever put on disk, or a replacement
-          // process can start appending while the last batch is still landing.
-          releaseExclusiveLock()
-          onTerminated?.invoke()
+          closeFaultForTesting?.invoke()
         } finally {
+          // All three in `finally`, and no `catch`. A `Throwable` escaping
+          // `closeCurrentStream` still propagates and still kills this worker —
+          // something genuinely went wrong and pretending otherwise would be
+          // worse — but it must not take the path's claim with it.
+          // `closeCurrentStream` catches `Exception`, not `Throwable`, so an
+          // `Error` escaping here used to strand `closing[path]` for the life of
+          // the process: every later open on that path refused with the disk
+          // perfectly healthy.
+          //
+          // The order is the same one the stream-then-claim rule always had: the
+          // claim must outlast every byte this writer will ever put on disk, or a
+          // replacement process can start appending while the last batch is still
+          // landing.
+          releaseExclusiveLock()
+          // A throwing callback must not cost us the latch. Swallowing is right
+          // here and only here — this is registry bookkeeping with nowhere to
+          // report, and the caller is still waiting on `done`.
+          runCatching { onTerminated?.invoke() }
           done.countDown()
         }
       }
@@ -1698,6 +1885,123 @@ class LogFileWriter internal constructor(
     return if (captured) snapshot ?: listOf(file.absolutePath) else listOf(file.absolutePath)
   }
 
+  // MARK: - Support bundle deletion
+
+  /**
+   * Deletes the support bundle and its staging leftovers — see the spec's
+   * `deleteSupportBundle` for what `true` does and does not promise.
+   *
+   * Executor-confined for the reason [logFilePaths] is, and a sharper one: a
+   * collect publishes by renaming its staging name onto the final one, on this
+   * executor. Unlinking those same two names from the caller's thread would run
+   * inside that rename.
+   *
+   * Bounded, because this is reachable from the JS thread and the executor may
+   * be wedged. A timeout is `false`, and so is a shut-down executor: neither
+   * observed anything, and the one thing this call must never do is report a
+   * bundle gone while it is still on disk.
+   *
+   * [handleGeneration] is checked the way [append] checks it, and on the
+   * executor rather than here: a purge between this call and the task reaching
+   * the front would otherwise have this handle delete the *current*
+   * generation's bundle. Being active is not the same as being current — the
+   * registry's `isLive` answers the first question only — and a stale handle
+   * owns nothing in that directory any more.
+   */
+  fun deleteSupportBundle(handleGeneration: Long, deadlineMs: Double): Boolean {
+    if (Thread.currentThread() === writerThread) {
+      return deleteIfCurrent(handleGeneration)
+    }
+
+    // Written out rather than handed to [onExecutorBounded], which has no way
+    // to tell its block that nobody is waiting for it any more. That matters
+    // here and nowhere else it is used: every other bounded call reads, and a
+    // stale read is discarded by the caller, while a stale unlink is not.
+    val request = DeleteRequest()
+    var removed = false
+    val done = CountDownLatch(1)
+    val settled = try {
+      executor.execute {
+        try {
+          // Nothing is cancellable once queued, so the task asks whether it is
+          // still wanted rather than being removed.
+          if (request.begin()) removed = deleteIfCurrent(handleGeneration)
+        } finally {
+          done.countDown()
+        }
+      }
+      done.await(clampDeadline(deadlineMs), TimeUnit.MILLISECONDS)
+    } catch (_: RejectedExecutionException) {
+      // A close shut the executor down. Nothing was queued, so there is nothing
+      // to abandon and nothing was deleted.
+      return false
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+      false
+    }
+
+    if (!settled) {
+      // A timed-out delete is not a cancelled one, and unlike a stale read it
+      // does damage. Sitting behind a slow build, this task would otherwise
+      // reach the front of the queue *after* that build renamed a fresh bundle
+      // into place, and unlink a bundle some later collect had just published
+      // and reported the path of — a call that returned "I deleted nothing"
+      // deleting somebody else's file, seconds later. This is the same barrier
+      // [CollectHandoff.giveUp] puts in front of a publish, for the same
+      // reason, in the opposite direction.
+      request.abandon()
+      return false
+    }
+    return removed
+  }
+
+  /**
+   * Deletes only if [handleGeneration] is still the writer's current one.
+   *
+   * Executor only, and the ordering is the point: the generation is read at the
+   * last possible instant before the unlinks, so a purge that landed while this
+   * task waited its turn is seen. Reading it at the call site instead would
+   * compare a number that was true when the caller asked and false by the time
+   * anything was deleted.
+   */
+  private fun deleteIfCurrent(handleGeneration: Long): Boolean {
+    val current = stateLock.withLock { generation }
+    // Not this handle's directory any more. The same refusal [append] gives a
+    // stale handle, for the same reason, with more at stake: an append that
+    // slipped through would add a record to somebody else's file, and a delete
+    // that slipped through would remove somebody else's bundle.
+    if (handleGeneration != current) return false
+    return deleteSupportArtifacts(file, platform)
+  }
+
+  /**
+   * One [deleteSupportBundle] call's claim on its own queued task.
+   *
+   * Per call, and shared by exactly the two parties to it — the thread waiting
+   * and the task running — for the reason [CollectHandoff] is per collect: a
+   * writer-wide flag would let one caller's timeout abandon another caller's
+   * deletion.
+   *
+   * The window this does *not* close is the terminal one: a task that has
+   * already passed [begin] runs to completion, so a caller can be told `false`
+   * about a deletion that then happens. That direction is safe — the artifacts
+   * are gone and a retry says so — and it cannot take a later bundle, because
+   * the executor is single-threaded and any subsequent publish is a later task
+   * than one that has already started.
+   */
+  private class DeleteRequest {
+    private var abandoned = false
+
+    /** Claims the right to unlink. False once the caller has stopped waiting. */
+    @Synchronized
+    fun begin(): Boolean = !abandoned
+
+    @Synchronized
+    fun abandon() {
+      abandoned = true
+    }
+  }
+
   // MARK: - Purge
 
   /**
@@ -1741,99 +2045,53 @@ class LogFileWriter internal constructor(
       degraded = LogDegradation.NONE
       stateLock.unlock()
 
+      // The whole sweep is ONE executor task, and that is what serialises it
+      // against a collect's publish — see the matching note in [buildBundle].
+      // Splitting it into several tasks would let a build's rename land in the
+      // middle of a deletion, publishing a bundle the purge has already walked
+      // past.
       var outcome = LogClearOutcome(0, emptyList(), durable = false)
       val done = CountDownLatch(1)
 
       try {
         executor.execute {
           try {
-            closeCurrentStream()
-
-            // An unreadable directory is NOT an empty one. Sweeping an empty
-            // list would report a durable purge while every artifact sat
-            // untouched behind a permissions or I/O failure — the worst
-            // possible lie for this particular call to tell. `list()` returns
-            // null for both "not a directory" and "could not read it", so
-            // absence has to be established separately.
-            val names = directory.list()
-            val directoryAbsent =
-              names == null && platform.lookup(directory) == PlatformIo.Presence.ABSENT
-            if (names == null && !directoryAbsent) {
-              outcome = LogClearOutcome(0, listOf(directory.absolutePath), durable = false)
-              return@execute
-            }
-
-            var deleted = 0
-            val failures = mutableListOf<String>()
-            for (name in (names ?: emptyArray())) {
-              if (!isArtifactName(name, baseName)) continue
-              val target = File(directory, name)
-              if (target.delete()) {
-                deleted += 1
-                continue
-              }
-              // `delete()` said no. Only a platform that positively reports the
-              // path as gone lets this count as deleted — something else removed
-              // it between the listing and here. `File.exists()` cannot make
-              // that distinction: it returns false for an absent file and for
-              // one behind a permissions or I/O failure alike, and treating the
-              // second as the first is how a purge reports `durable = true` over
-              // artifacts still sitting on disk. For this call, of every lie
-              // available, that is the worst one.
-              if (platform.lookup(target) == PlatformIo.Presence.ABSENT) {
-                deleted += 1
-              } else {
-                // The path is this package's own artifact name, not user
-                // content.
-                failures.add(target.absolutePath)
-              }
-            }
-
-            if (failures.isNotEmpty()) {
-              outcome = LogClearOutcome(deleted, failures, durable = false)
-              return@execute
-            }
-
-            // `delete()` returning true only means the change is in the
-            // directory's in-memory state. Until the directory itself is
-            // synced, a crash or a power loss can bring every one of those
-            // names back — and this call exists precisely to promise they are
-            // gone.
-            if (!directoryAbsent && !platform.syncDirectory(directory)) {
-              outcome = LogClearOutcome(deleted, listOf(directory.absolutePath), durable = false)
-              return@execute
-            }
-
-            val current = stateLock.withLock { generation }
-            if (current != fenced) {
-              outcome = LogClearOutcome(deleted, emptyList(), durable = false)
-              return@execute
-            }
-
-            currentFileSize = 0
-            currentFileStart = clock()
-            // The purge took the sidecar with everything else, so a rotation
-            // that never managed to record its time has nothing left to
-            // reconcile: the file that follows is new, not rotated.
-            pendingFileStart = null
-            // Deletion succeeded whether or not a fresh file could be opened,
-            // and `durable` describes the deletion — that is what a compliance
-            // caller asked about. Whether the writer is usable again is a
-            // separate fact, reported separately, because a handle that rebinds
-            // onto a writer with no stream would accept records and lose them.
-            //
-            // A purge that lands after the close barrier still deletes — that
-            // is the whole point of the call — but it must not reopen.
-            outcome = LogClearOutcome(
-              deletedCount = deleted,
-              failedPaths = emptyList(),
-              durable = true,
-              rebound = if (terminated) false else reopen()
-            )
+            outcome = sweepArtifacts(fenced, reopenIfClean = !terminated)
           } finally {
             done.countDown()
           }
         }
+      } catch (_: RejectedExecutionException) {
+        // The executor is shut down, which only [close] does. The deletion
+        // still has to happen — that is the whole point of this call, and a
+        // compliance purge that silently did nothing because the destination
+        // had just been disposed is the worst version of this failing. It runs
+        // inline instead, once the executor is provably finished.
+        //
+        // Through 0.2.0 this branch deleted nothing and reported
+        // `durable = false`, which contradicted the comment two screens up
+        // saying a purge landing after the close barrier still deletes. iOS
+        // already behaved as documented, because its block was on the queue
+        // before the barrier rather than refused by it.
+        //
+        // Its own `try`, and not a reliance on the `catch (Exception)` below:
+        // an exception raised inside a `catch` block does **not** flow into a
+        // sibling clause of the same `try`. Without this, a throwing
+        // `directory.list()`, `delete()` or `syncDirectory` would escape
+        // `clearLogs` entirely — where the very same failure on the executor
+        // path stays inside the task, leaves `outcome` at its non-durable
+        // initial value, and returns normally. A purge that throws on one path
+        // and returns on the other is the divergence this whole item is about.
+        return try {
+          purgeInline(fenced, expiry)
+        } catch (_: Exception) {
+          // Named, not empty. A sweep that died partway cannot say what it
+          // removed, and "as far as this call can tell the artifacts are still
+          // there" is the fail-closed answer every other refusal here gives.
+          // `Error` is deliberately not caught: a linkage failure or an OOM is
+          // not a purge that declined.
+          LogClearOutcome(0, listOf(file.absolutePath), durable = false)
+        } to fenced
       } catch (_: Exception) {
         return LogClearOutcome(0, listOf(file.absolutePath), durable = false) to fenced
       }
@@ -1855,6 +2113,134 @@ class LogFileWriter internal constructor(
     }
   }
 
+  /**
+   * The purge itself: close the stream, delete every artifact, sync, and — only
+   * on a clean sweep, and only if [reopenIfClean] — open a fresh file.
+   *
+   * Extracted rather than inlined in the executor task because there are now
+   * two callers, the task and [purgeInline], and they must not drift. The
+   * difference between them is one parameter; everything a compliance caller
+   * is told comes from here.
+   *
+   * **Runs with exactly one mutator, always.** On the executor path that is the
+   * executor. On the inline path it is the calling thread, after
+   * `awaitTermination` has established that no task can ever run again.
+   */
+  private fun sweepArtifacts(fenced: Long, reopenIfClean: Boolean): LogClearOutcome {
+    closeCurrentStream()
+
+    // An unreadable directory is NOT an empty one. Sweeping an empty list would
+    // report a durable purge while every artifact sat untouched behind a
+    // permissions or I/O failure — the worst possible lie for this particular
+    // call to tell. `list()` returns null for both "not a directory" and "could
+    // not read it", so absence has to be established separately.
+    val names = directory.list()
+    val directoryAbsent =
+      names == null && platform.lookup(directory) == PlatformIo.Presence.ABSENT
+    if (names == null && !directoryAbsent) {
+      return LogClearOutcome(0, listOf(directory.absolutePath), durable = false)
+    }
+
+    var deleted = 0
+    val failures = mutableListOf<String>()
+    for (name in (names ?: emptyArray())) {
+      if (!isArtifactName(name, baseName)) continue
+      val target = File(directory, name)
+      if (target.delete()) {
+        deleted += 1
+        continue
+      }
+      // `delete()` said no. Only a platform that positively reports the path as
+      // gone lets this count as deleted — something else removed it between the
+      // listing and here. `File.exists()` cannot make that distinction: it
+      // returns false for an absent file and for one behind a permissions or
+      // I/O failure alike, and treating the second as the first is how a purge
+      // reports `durable = true` over artifacts still sitting on disk. For this
+      // call, of every lie available, that is the worst one.
+      if (platform.lookup(target) == PlatformIo.Presence.ABSENT) {
+        deleted += 1
+      } else {
+        // The path is this package's own artifact name, not user content.
+        failures.add(target.absolutePath)
+      }
+    }
+
+    if (failures.isNotEmpty()) {
+      return LogClearOutcome(deleted, failures, durable = false)
+    }
+
+    // `delete()` returning true only means the change is in the directory's
+    // in-memory state. Until the directory itself is synced, a crash or a power
+    // loss can bring every one of those names back — and this call exists
+    // precisely to promise they are gone.
+    if (!directoryAbsent && !platform.syncDirectory(directory)) {
+      return LogClearOutcome(deleted, listOf(directory.absolutePath), durable = false)
+    }
+
+    val current = stateLock.withLock { generation }
+    if (current != fenced) {
+      return LogClearOutcome(deleted, emptyList(), durable = false)
+    }
+
+    currentFileSize = 0
+    currentFileStart = clock()
+    // The purge took the sidecar with everything else, so a rotation that never
+    // managed to record its time has nothing left to reconcile: the file that
+    // follows is new, not rotated.
+    pendingFileStart = null
+    // Deletion succeeded whether or not a fresh file could be opened, and
+    // `durable` describes the deletion — that is what a compliance caller asked
+    // about. Whether the writer is usable again is a separate fact, reported
+    // separately, because a handle that rebinds onto a writer with no stream
+    // would accept records and lose them.
+    //
+    // A purge that lands after the close barrier still deletes — that is the
+    // whole point of the call — but it must not reopen.
+    return LogClearOutcome(
+      deletedCount = deleted,
+      failedPaths = emptyList(),
+      durable = true,
+      rebound = if (reopenIfClean) reopen() else false
+    )
+  }
+
+  /**
+   * The purge for a writer whose executor is gone.
+   *
+   * Reached only when [close] has already shut the executor down, so the
+   * submission in [clearLogs] was refused. `awaitTermination` is the
+   * serialisation point and it is a strong one: `shutdown()` does not discard
+   * queued tasks, it refuses new ones and lets the queue drain, so a `true`
+   * return means every task has completed AND the worker has exited. Because
+   * `ThreadPoolExecutor` signals termination under its own lock, that also
+   * establishes a happens-before edge from the last task to this thread —
+   * every field the executor owns is visible here, and no thread can ever
+   * mutate them again. That is a stronger guarantee than the executor gave
+   * while it was alive.
+   *
+   * **Never reopens.** This path is post-close by construction, so `rebound` is
+   * unconditionally false. It deliberately does not consult `terminated`: a
+   * close whose own barrier submission was rejected leaves that flag false over
+   * a dead executor, and reopening then would leak a descriptor for the life of
+   * the process and leave an empty file where a purge had just promised none.
+   */
+  private fun purgeInline(fenced: Long, expiry: Long): LogClearOutcome {
+    val settled = try {
+      executor.awaitTermination(remaining(expiry), TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+      false
+    }
+    // Not settled means work may still be moving these files. Nothing durable
+    // can be claimed about a directory something else is still writing to, and
+    // the sweep must not start — this is the one thing standing between the
+    // inline path and two mutators.
+    if (!settled) {
+      return LogClearOutcome(0, listOf(file.absolutePath), durable = false)
+    }
+    return sweepArtifacts(fenced, reopenIfClean = false)
+  }
+
   /** The generation a handle must rebind to after a durable purge. */
   val currentGeneration: Long get() = stateLock.withLock { generation }
 
@@ -1862,25 +2248,28 @@ class LogFileWriter internal constructor(
 
   // MARK: - Test support
 
-  private fun onExecutor(block: () -> Unit) {
-    if (Thread.currentThread() === writerThread) {
-      block()
-      return
-    }
-    val done = CountDownLatch(1)
-    executor.execute {
-      try {
-        block()
-      } finally {
-        done.countDown()
-      }
-    }
-    try {
-      done.await()
-    } catch (_: InterruptedException) {
-      Thread.currentThread().interrupt()
-    }
-  }
+  /**
+   * Runs [block] on the executor and waits for it, bounded.
+   *
+   * **Test support only** since the open sweep stopped waiting — its callers
+   * are `settleForTesting`, `closeStreamForTesting` and the three `*ForTesting`
+   * getters, and no production path waits on the executor through here any
+   * more.
+   *
+   * The bound is the whole reason this is not just `onExecutorBounded`'s job
+   * spelled out again: an unbounded wait in a test helper is a CI run that
+   * hangs rather than fails, and a hung run says less and says it far later.
+   * `MAX_DEADLINE_MS` rather than a fresh number, so there is nothing here that
+   * can drift away from the clamp everything else is measured against. Nothing
+   * asserts the value: it is a hang-guard, not a contract.
+   *
+   * Returns false if the executor never got there — including
+   * `RejectedExecutionException`, so a helper called on an already-closed
+   * writer is inert rather than explosive. Callers ignore it, because a false
+   * means the test is already failing for some other reason.
+   */
+  private fun onExecutor(block: () -> Unit): Boolean =
+    onExecutorBounded(MAX_DEADLINE_MS, block)
 
   /**
    * Runs [block] on the executor and waits at most [budgetMs] for it.
@@ -1930,6 +2319,23 @@ class LogFileWriter internal constructor(
   fun shutdownExecutorForTesting() {
     executor.shutdownNow()
   }
+
+  /**
+   * Makes the close barrier throw, standing in for an `Error` escaping the
+   * stream close.
+   *
+   * There is no natural way to produce one from a test: `closeCurrentStream`
+   * catches `Exception` around the only call that can fail, and the stream is a
+   * plain `FileOutputStream`. This hook runs exactly where an escaping
+   * `Throwable` would — after the stream is shut, before the claim goes back —
+   * so a test using it proves the `finally` returns the claim, not that the hook
+   * works.
+   *
+   * Set it and the writer's worker thread dies on the next close. Nothing resets
+   * it; a test that sets it is finished with that writer.
+   */
+  @Volatile
+  var closeFaultForTesting: (() -> Unit)? = null
 
   /** Blocks the executor until the returned lambda is called. */
   fun stallForTesting(): () -> Unit {

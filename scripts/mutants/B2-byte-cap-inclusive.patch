@@ -1,0 +1,13 @@
+diff --git a/src/destinations/Batcher.ts b/src/destinations/Batcher.ts
+index e101296..4a12aba 100644
+--- a/src/destinations/Batcher.ts
++++ b/src/destinations/Batcher.ts
+@@ -266,7 +266,7 @@ export class Batcher {
+     }
+     if (
+       this.pending.length >= this.maxPendingEntries ||
+-      this.pendingBytes + bytes > this.maxPendingBytes
++      this.pendingBytes + bytes >= this.maxPendingBytes
+     ) {
+       this.dropped(record, bytes);
+       this.ensureTimer();

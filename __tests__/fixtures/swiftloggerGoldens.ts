@@ -2,9 +2,15 @@
  * SwiftLogger JSON goldens — GENERATED, do not edit by hand.
  *
  * Produced by `scripts/GenGoldens.swift` running against SwiftLogger's own
- * `JSONLogFormatter`. A golden someone typed out is a record of what they
- * believed the Swift side does, which is the thing under test. See
- * `scripts/README.md` to regenerate.
+ * `JSONLogFormatter`, at commit `670e183`. A golden someone typed out is a
+ * record of what they believed the Swift side does, which is the thing under
+ * test. See `scripts/README.md` to regenerate.
+ *
+ * The revision is written here as well as in `docs/PARITY.md` because it is
+ * the only property of this file that cannot be recovered by reading it. Two
+ * corpora generated from different SwiftLogger revisions are
+ * indistinguishable once they are in this form, and "byte-identical" says
+ * nothing without naming what to.
  *
  * Kept as a TypeScript module rather than a data file the test reads at
  * runtime: this package targets Hermes and its tsconfig deliberately carries

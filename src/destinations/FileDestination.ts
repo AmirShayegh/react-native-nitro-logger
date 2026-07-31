@@ -36,6 +36,12 @@ export interface FileSinkLike {
    * and report what went in. See {@link FileDestination.collectForSupport}.
    */
   collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
+  /**
+   * Delete the bundle `collectLogs` produced and its staging leftovers, and
+   * report whether none of the three remains. See
+   * {@link FileDestination.deleteSupportBundle}.
+   */
+  deleteSupportBundle(deadlineMs: number): boolean;
   flush(deadlineMs: number): FlushOutcome;
   close(deadlineMs: number): FlushOutcome;
   getLogFilePaths(): string[];
@@ -172,6 +178,22 @@ const LOSS_MESSAGE = 'log entries were dropped';
 const OVERSIZE_MESSAGE = 'a log entry was too large to record';
 
 /**
+ * A record and the size of *that* record.
+ *
+ * Not exported: this is how rendering hands its own measurement forward so the
+ * batcher does not repeat it, and the pair exists only because the two things
+ * must not be separated. `bytes` always describes `record` — never an earlier
+ * string that rendering looked at and rejected on the way to it.
+ *
+ * Excludes the newline the batcher frames records with, which is the batcher's
+ * to add and therefore the batcher's to count.
+ */
+interface Rendered {
+  readonly record: string;
+  readonly bytes: number;
+}
+
+/**
  * Writes formatted records to a native file sink, batched and backpressured.
  *
  * The division of labour is the whole design: this side decides what to write
@@ -196,8 +218,9 @@ const OVERSIZE_MESSAGE = 'a log entry was too large to record';
  * generation is stale — someone purged the file underneath it — the buffer is
  * discarded rather than replayed into the new file, and the destination
  * disables itself. Pre-purge records must not reappear after a compliance
- * deletion. The handle that invoked the purge rebinds; any other one does
- * not, and reacquisition is the native registry's job.
+ * deletion. The handle that invoked the purge rebinds; any other one does not,
+ * and stays fenced until someone calls {@link FileDestination.reopen} — the
+ * fence is permanent by design, but no longer permanent in practice.
  */
 export class FileDestination implements LogDestination {
   readonly label: string;
@@ -208,8 +231,22 @@ export class FileDestination implements LogDestination {
   private readonly batcher: Batcher;
   private readonly maxEntryBytes: number;
   private readonly path: string;
-  /** Held for the M5 registry's reacquisition path, which needs the same
-   * config the handle was opened with. */
+  /**
+   * A **copy** of the rotation config, held so {@link FileDestination.reopen}
+   * can acquire the new handle with what the first one was opened with.
+   *
+   * Copied rather than kept by reference because the caller owns the object it
+   * passed and may go on mutating it, and a reopen has to reproduce the
+   * original acquisition rather than whatever the object says later. The
+   * native registry compares policies to decide whether a second handle on a
+   * file may share the writer, so a drifted config is not a quiet difference —
+   * it is a `CONFIG_CONFLICT` against a sibling handle that is still open, and
+   * the reopen fails.
+   *
+   * Read once, here, before the sink is opened: a config assembled from
+   * getters is evaluated at construction, which is the moment the caller
+   * chose, and a throwing one fails the constructor before any handle exists.
+   */
   private readonly rotation: RotationConfig | undefined;
 
   private fenced = false;
@@ -226,7 +263,10 @@ export class FileDestination implements LogDestination {
     );
     this.path =
       options.path ?? `${sink.defaultLogDirectory}/${DEFAULT_FILENAME}`;
-    this.rotation = options.rotation;
+    this.rotation =
+      options.rotation === undefined
+        ? undefined
+        : Object.freeze({ ...options.rotation });
 
     this.batcher = new Batcher(sink, {
       renderNotice: (lost) => this.renderLossNotice(lost),
@@ -264,9 +304,24 @@ export class FileDestination implements LogDestination {
 
   write(entry: LogEntry): void {
     if (!this.isEnabled) return;
-    const record = this.renderRecord(entry);
-    if (record === undefined) return;
-    this.batcher.add(record);
+    // Asked before rendering, because rendering is the expensive half of
+    // writing a log line and a full buffer will drop whatever comes out of it.
+    // Under sustained backpressure that is the difference between formatting
+    // every record for the wastebasket and formatting none of them.
+    //
+    // The record is still counted — it was a real entry that did not reach the
+    // file — but with no byte count, because producing one means rendering it.
+    // See {@link LossCounts}, where that asymmetry is the documented contract.
+    if (!this.batcher.hasRoom()) {
+      this.batcher.noteLoss(1, 0);
+      return;
+    }
+    const rendered = this.renderRecord(entry);
+    if (rendered === undefined) return;
+    // The byte count travels with the record. Enforcing `maxEntryBytes` means
+    // this side has already measured whatever it is handing over, and letting
+    // the batcher measure it again is a second full pass over every record.
+    this.batcher.add(rendered.record, rendered.bytes);
   }
 
   /**
@@ -417,6 +472,59 @@ export class FileDestination implements LogDestination {
     return outcome;
   }
 
+  /**
+   * Delete the bundle {@link collectForSupport} produced, once it has been
+   * uploaded.
+   *
+   * The third step of a support flow: collect, upload, delete. Skipping it
+   * leaves a gzipped copy of the whole log on the device until a
+   * {@link purge} or the next collect replaces it — outside the retention
+   * budget `rotation` configures, and deliberately skipped by the native
+   * orphan sweep, which keeps a finished bundle precisely because somebody may
+   * still be uploading it. On a device holding patient data that copy is the
+   * one artifact retention never reclaims.
+   *
+   * Deletes exactly the bundle and its staging leftovers, never a log file.
+   * This is not a smaller `purge()` and must not be used as one.
+   *
+   * `true` means no bundle artifact remained when the call ran — including
+   * vacuously, for a destination that never opened. It describes that instant
+   * and promises nothing about the next: a collect started afterwards writes a
+   * new bundle, and sequencing the two is the caller's job.
+   *
+   * `false` is the whole of the rest, and deliberately not a list of causes:
+   * the deletion was refused, timed out, threw, or could not be *durably*
+   * confirmed gone. It does not assert that anything survived — a refusal
+   * establishes nothing about the directory — so read it as "assume a copy may
+   * still be there" and retry through a live, current destination.
+   *
+   * A fenced or disposed destination refuses, and unlike
+   * {@link getLogFilePaths} — which still answers after `dispose()` — that is
+   * the right answer here. Reading a directory this destination no longer owns
+   * is harmless; deleting from one is not. With the handle gone there is no
+   * generation left to check, so another destination may own that path now and
+   * be mid-publish in it, and the `.support.gz` removed would be *its* bundle,
+   * whose path it has already handed to a caller. A fence says the same thing
+   * one step earlier: a purge moved the writer on, which is the reason
+   * {@link collectForSupport} declines to pack those files too.
+   *
+   * So **delete before disposing**, or through a fresh destination on the same
+   * path — either gives a live handle on a current generation, which is what
+   * makes the deletion safe rather than merely willing.
+   */
+  deleteSupportBundle(deadlineMs: number = DEFAULT_DEADLINE_MS): boolean {
+    if (!this.isEnabled) return false;
+    try {
+      return this.sink.deleteSupportBundle(deadlineMs);
+    } catch {
+      // A native throw is `false`, not a rethrow. The caller is a support flow
+      // finishing an upload; it needs to know the copy may still be there, and
+      // there is nothing it could do with a native error object that it cannot
+      // do with that fact.
+      return false;
+    }
+  }
+
   /** Losses with no notice in the file yet. */
   unreportedLoss(): LossCounts {
     return this.batcher.unreported();
@@ -445,9 +553,9 @@ export class FileDestination implements LogDestination {
    * written into the window where deletion is in flight; the JS buffer is
    * discarded rather than flushed, because flushing it would write pre-purge
    * records into the file a moment before deleting it — or worse, a moment
-   * after. Only a durable deletion lifts the fence. A partial or timed-out
-   * one leaves this handle disabled until an explicit retry, so a late
-   * deletion can never race a fresh write.
+   * after. Only a durable deletion lifts the fence. A partial or timed-out one
+   * leaves this handle disabled until {@link FileDestination.reopen}, so a
+   * late deletion can never race a fresh write.
    *
    * Discarded counts come back here rather than going into a loss notice: a
    * "4,182 entries dropped" line at the top of a file that was just cleared
@@ -496,7 +604,7 @@ export class FileDestination implements LogDestination {
     // `durable` alone resumes writing into a handle the sink never rebound —
     // every record accepted, rejected as `staleGeneration`, and dropped. The
     // deletion is still complete and still reported as such; the destination
-    // just stays disabled until an explicit retry gets a live file back.
+    // just stays disabled until `reopen()` gets a live file back.
     //
     // `=== true`, not `!== false`. An absent field is not a promise, and the
     // sink most likely to omit it is one that predates it — including a native
@@ -521,6 +629,82 @@ export class FileDestination implements LogDestination {
       discardedEntries: discarded.entries,
       discardedBytes: discarded.bytes,
     };
+  }
+
+  /**
+   * The way back from a fence: close this handle and open a fresh one.
+   *
+   * A fence is deliberately permanent until something asks for a retry, and
+   * until 0.3.0 nothing could. `purge` says so twice — "disabled until an
+   * explicit retry" — and there was no retry to make; a destination fenced by
+   * another handle's purge, or by a purge that deleted durably and could not
+   * reopen, was dead for the life of the process.
+   *
+   * Constructing a replacement was the only recourse, and it is a poor one
+   * rather than an impossible one. On the same canonical path a second handle
+   * is eligible to share the writer when the rotation policy and framing
+   * match; differing ones are a `CONFIG_CONFLICT`. Matching them is not a
+   * promise of success either — an acquisition still fails on a previous
+   * writer that is still closing, or on the filesystem, or on the lock. And
+   * whichever way it goes, the fenced destination is still alive: holding its
+   * retain on the writer, still registered with whatever logger it was given
+   * to, until someone disposes it.
+   *
+   * Returns whether this destination can write when the call returns.
+   *
+   * - Disposed → `false`. The sink is closed and the handle is gone; a
+   *   disposed destination is finished, not resting, and reopening one would
+   *   resurrect an object its owner has already released.
+   * - Not fenced → `true`, having touched nothing. Closing a live handle to
+   *   prove it can be reopened would throw away the buffer and the file
+   *   position for a question already answered.
+   * - Otherwise the sink is closed and reopened with the same path, rotation
+   *   and framing it was constructed with. On success the fence lifts and the
+   *   batcher rebinds to the new generation; on failure it stays fenced and
+   *   the destination is exactly as dead as it was, which is the only safe
+   *   direction for this to fail in.
+   *
+   * `deadlineMs` bounds the close, the only half that waits — it drains and
+   * fsyncs a handle that may have a queue behind it. `open` does not take one.
+   * A close that throws is swallowed rather than reported: this handle is
+   * fenced, so there was nothing worth draining, and whether the reopen worked
+   * is the question the return value answers.
+   *
+   * **What `true` does not claim.** It says a handle was acquired, not that
+   * the file behind it is the one this destination was writing to before.
+   * Reopening after another handle's purge lands on a fresh, empty file —
+   * which is the point of the purge — and nothing here can or should undo
+   * that.
+   *
+   * **The new file does not open with a notice about the old one**, and that
+   * falls out of two decisions rather than a rule written here. `Batcher.fence`
+   * clears the owed delta on the way in, because a notice about deliberately
+   * deleted data would describe the deletion; and `write` above refuses while
+   * fenced, so nothing accumulates behind the fence either. A reopened
+   * destination starts clean. What `Batcher.rebind` preserves is the loss
+   * accounting of a batcher driven directly — this destination cannot reach
+   * that state, and the reason is the `isEnabled` guard, not luck.
+   */
+  reopen(deadlineMs: number = DEFAULT_DEADLINE_MS): boolean {
+    if (this.disposed) return false;
+    if (!this.fenced) return true;
+
+    try {
+      this.sink.close(deadlineMs);
+    } catch {
+      // Nothing was drainable behind a fence. If the handle is still open the
+      // `open` below fails as a config conflict, which is the honest answer.
+    }
+
+    try {
+      this.sink.open(this.path, this.rotation, this.lineFramed);
+    } catch {
+      return false;
+    }
+
+    this.fenced = false;
+    this.batcher.rebind();
+    return true;
   }
 
   /** Idempotent: flush what is buffered, release the timer, close the sink. */
@@ -548,8 +732,16 @@ export class FileDestination implements LogDestination {
    * Returns undefined when nothing writable came out; the loss is recorded
    * before returning, so an entry is either in the file or in the counters
    * and never in neither.
+   *
+   * The byte count comes back **with** the record, and it is the count of the
+   * record being returned — never of the one that was measured on the way to
+   * it. That distinction is the whole reason this returns a pair rather than
+   * letting the caller reuse `bytes`: on the oversize path the returned string
+   * is a notice, a different and much shorter string than the entry whose size
+   * put it there, and handing the batcher the original number would inflate
+   * every pending-byte total in the pipeline.
    */
-  private renderRecord(entry: LogEntry): string | undefined {
+  private renderRecord(entry: LogEntry): Rendered | undefined {
     const record = this.formatOrUndefined(entry);
     if (record === undefined) {
       this.batcher.noteLoss(1, 0);
@@ -561,15 +753,18 @@ export class FileDestination implements LogDestination {
     // counters and the notice have to carry — not the size of whatever
     // undersized floor the formatter came back with instead.
     const bytes = utf8Length(record);
-    if (bytes <= this.maxEntryBytes) return record;
+    if (bytes <= this.maxEntryBytes) return { record, bytes };
 
     // Structural shedding first: a formatter that knows its own shape can
     // drop whole fields and truncate one at code-point boundaries, and what
     // comes back is still valid in that format.
     if (this.formatter.formatWithin) {
       const shorter = this.formatWithinOrUndefined(entry);
-      if (shorter !== undefined && utf8Length(shorter) <= this.maxEntryBytes) {
-        return shorter;
+      if (shorter !== undefined) {
+        const shorterBytes = utf8Length(shorter);
+        if (shorterBytes <= this.maxEntryBytes) {
+          return { record: shorter, bytes: shorterBytes };
+        }
       }
       // Still over: a record has a floor below which it identifies nothing.
     }
@@ -583,12 +778,17 @@ export class FileDestination implements LogDestination {
   }
 
   private renderLossNotice(lost: LossCounts): string | undefined {
+    // A string, not a `Rendered`, and nothing is lost by that: a loss notice
+    // goes straight into an outgoing batch rather than into the pending
+    // buffer, so no byte count is ever wanted for it. `renderNotice` is also a
+    // public `BatcherOptions` field, and widening its return type would be a
+    // break bought for nothing.
     return this.boundedNotice(
       noticeEntry(Date.now(), LOSS_MESSAGE, {
         droppedEntries: lost.entries,
         droppedBytes: lost.bytes,
       })
-    );
+    )?.record;
   }
 
   /**
@@ -601,14 +801,18 @@ export class FileDestination implements LogDestination {
    * diagnostics jamming the pipeline. Returning undefined when nothing fits
    * leaves the loss counted and owed, which is the honest outcome.
    */
-  private boundedNotice(entry: LogEntry): string | undefined {
+  private boundedNotice(entry: LogEntry): Rendered | undefined {
     const text = this.formatOrUndefined(entry);
     if (text === undefined) return undefined;
-    if (utf8Length(text) <= this.maxEntryBytes) return text;
+    const bytes = utf8Length(text);
+    if (bytes <= this.maxEntryBytes) return { record: text, bytes };
     if (this.formatter.formatWithin) {
       const shorter = this.formatWithinOrUndefined(entry);
-      if (shorter !== undefined && utf8Length(shorter) <= this.maxEntryBytes) {
-        return shorter;
+      if (shorter !== undefined) {
+        const shorterBytes = utf8Length(shorter);
+        if (shorterBytes <= this.maxEntryBytes) {
+          return { record: shorter, bytes: shorterBytes };
+        }
       }
     }
     return undefined;

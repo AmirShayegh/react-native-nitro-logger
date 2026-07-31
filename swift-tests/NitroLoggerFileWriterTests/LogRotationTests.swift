@@ -40,13 +40,56 @@ final class LogRotationTests: LogWriterTestCase {
       maxArchivedFilesCount: 5,
       maxFileAgeSeconds: 0.05
     )
-    let handle = try makeHandle(policy: policy)
+    let clock = WallClock()
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
     write(handle, "young\n")
     XCTAssertEqual(archiveNames().count, 0)
 
-    Thread.sleep(forTimeInterval: 0.2)
+    clock.advance(5)
     write(handle, "old enough\n")
     XCTAssertEqual(archiveNames().count, 1, "age rotates a file that never reached the size cap")
+  }
+
+  /// The file a rotation opens is new, and its age restarts — measured on the
+  /// clock the writer is actually using.
+  ///
+  /// The bug this pins is a mixed timebase, and it is invisible in
+  /// `testRotatesOnAge` because that test stops after the first rotation.
+  /// Rotation renames the old file away and opens a fresh one; if the fresh
+  /// file's age comes from the *filesystem* while the check compares against an
+  /// injected clock standing five seconds ahead, the new file is born five
+  /// seconds old. It is over the threshold before a byte reaches it, so the
+  /// next write rotates, and the one after that, until pruning has eaten every
+  /// archive holding real records.
+  ///
+  /// So the assertion is about what does *not* happen: no advance after the
+  /// first rotation, ten more writes, and still exactly one archive.
+  func testAFileOpenedByARotationIsNotBornExpired() throws {
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 50,
+      maxFileAgeSeconds: 0.05
+    )
+    let clock = WallClock()
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
+    write(handle, "young\n")
+
+    clock.advance(5)
+    write(handle, "old enough\n")
+    XCTAssertEqual(archiveNames().count, 1)
+
+    // The clock does not move again, so nothing here is old enough to rotate.
+    for index in 0..<10 { write(handle, "after \(index)\n") }
+
+    XCTAssertEqual(
+      archiveNames().count, 1,
+      "the file the rotation opened restarted its age; only the first rotation happened"
+    )
+    XCTAssertEqual(
+      contents(),
+      (0..<10).map { "after \($0)\n" }.joined(),
+      "every later record is still in the live file, not scattered across archives"
+    )
   }
 
   /// Rotation must only ever produce names the purge recognises. A file the
@@ -80,10 +123,11 @@ final class LogRotationTests: LogWriterTestCase {
       maxArchivedFilesCount: 5,
       maxFileAgeSeconds: 0.05
     )
-    let handle = try makeHandle(policy: policy)
+    let clock = WallClock()
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
     write(handle, "young\n")
 
-    Thread.sleep(forTimeInterval: 0.2)
+    clock.advance(5)
 
     // The control, and the point: the file is old enough to rotate and stays
     // put, because nothing has written to it. Without this assertion the one
@@ -103,7 +147,7 @@ final class LogRotationTests: LogWriterTestCase {
     write(handle, record) // rotation
     XCTAssertEqual(archiveNames().count, 1)
 
-    Thread.sleep(forTimeInterval: 0.3)
+    try backdateArchives(by: 5)
     XCTAssertEqual(archiveNames().count, 1, "retention does not sweep itself either")
 
     _ = handle.maintain(deadlineMs: 1000)
@@ -119,10 +163,11 @@ final class LogRotationTests: LogWriterTestCase {
       maxArchivedFilesCount: 5,
       maxFileAgeSeconds: 0.05
     )
-    let handle = try makeHandle(policy: policy)
+    let clock = WallClock()
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
     write(handle, "young\n")
 
-    Thread.sleep(forTimeInterval: 0.2)
+    clock.advance(5)
     XCTAssertTrue(handle.flush(deadlineMs: 1000).durable)
 
     XCTAssertEqual(archiveNames().count, 0, "flush drains the queue and moves no files")
@@ -137,11 +182,13 @@ final class LogRotationTests: LogWriterTestCase {
       maxFileAgeSeconds: 0.05,
       compressArchives: true
     )
-    let handle = try makeHandle(policy: policy, compressor: { _, _ in false })
+    let clock = WallClock()
+    let handle = try makeHandle(
+      policy: policy, compressor: { _, _ in false }, clock: { clock.now })
     write(handle, "young\n")
     XCTAssertEqual(handle.status().degraded & LogDegradation.gzip.rawValue, 0)
 
-    Thread.sleep(forTimeInterval: 0.2)
+    clock.advance(5)
     let status = handle.maintain(deadlineMs: 1000)
 
     XCTAssertNotEqual(
@@ -158,12 +205,15 @@ final class LogRotationTests: LogWriterTestCase {
       maxArchivedFilesCount: 5,
       maxFileAgeSeconds: 0.05
     )
-    let keeper = try makeHandle(policy: policy)
+    let clock = WallClock()
+    // Only the first call builds the writer, so only the first clock is the one
+    // in force — the second handle shares it, as it shares everything else.
+    let keeper = try makeHandle(policy: policy, clock: { clock.now })
     let released = try makeHandle(policy: policy)
     write(keeper, "young\n")
 
     _ = released.close(deadlineMs: 1000)
-    Thread.sleep(forTimeInterval: 0.2)
+    clock.advance(5)
 
     let status = released.maintain(deadlineMs: 1000)
     XCTAssertEqual(status.degraded, 0)
@@ -185,8 +235,8 @@ final class LogRotationTests: LogWriterTestCase {
     write(handle, record) // rotation
     XCTAssertEqual(archiveNames().count, 1)
 
+    try backdateArchives(by: 5)
     _ = handle.close(deadlineMs: 1000)
-    Thread.sleep(forTimeInterval: 0.3)
 
     // Straight at the writer: the handle refuses on its own, and the guard
     // under test is the one beneath it.
@@ -220,7 +270,8 @@ final class LogRotationTests: LogWriterTestCase {
     write(handle, record) // rotation 1
     XCTAssertEqual(archiveNames().count, 1)
 
-    Thread.sleep(forTimeInterval: 0.3)
+    // The first archive ages; the one rotation 2 is about to create does not.
+    try backdateArchives(by: 5)
     write(handle, record)
     write(handle, record) // rotation 2 sweeps the now-expired first archive
 
@@ -285,7 +336,24 @@ final class LogRotationTests: LogWriterTestCase {
   }
 
   /// A bigger archive beats a lost one.
+  ///
+  /// The control comes first, and it is what makes the last line mean
+  /// anything: `.gzip` is set from eleven places in the compression path, so
+  /// "the bit is up" is a claim about the whole path. The same policy with the
+  /// real compressor has to leave it down, or the injected failure is not what
+  /// this test is observing.
   func testGzipFailureKeepsThePlaintextArchiveAndReportsDegradation() throws {
+    let control = try makeHandle(
+      at: root.appendingPathComponent("control/app.log"),
+      policy: sizePolicy(bytes: 64, compress: true)
+    )
+    write(control, record)
+    write(control, record)
+    XCTAssertEqual(
+      control.status().degraded & LogDegradation.gzip.rawValue, 0,
+      "compression succeeds here, so the assertion below distinguishes something")
+    _ = control.close(deadlineMs: 1000)
+
     let handle = try makeHandle(
       policy: sizePolicy(bytes: 64, compress: true),
       compressor: { _, _ in false }
@@ -322,8 +390,12 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertFalse(LogWriter.isArchiveName(orphan.lastPathComponent, baseName: "app.log"))
     XCTAssertTrue(LogWriter.isArtifactName(orphan.lastPathComponent, baseName: "app.log"))
 
-    // The sweep runs at open.
+    // The sweep is submitted at open and runs on the writer's queue, so the
+    // assertions below have to cross a settle barrier rather than assuming it
+    // finished before `acquire` returned. It deliberately does not — see
+    // `LogWriter.init`.
     let handle = try makeHandle(policy: sizePolicy())
+    handle.writerForTesting.settleForTesting()
     XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
     XCTAssertFalse(handle.logFilePaths().contains(orphan.path))
   }

@@ -185,6 +185,24 @@ They are a control, not a proof. Analysis is per-file and stops at the module
 boundary: metadata assembled in another file and imported arrives opaque, and is
 reported as `unanalyzable` rather than approved.
 
+### A logger from a factory is checked, but never trusted
+
+`const Log = useLogger()` is followed as far as it can be. The rules cannot
+see through the call, so they fall back on the name: a binding spelled like a
+logger is treated as one that **might** be, and every rule applies at its call
+sites. Until 0.3.0 an unresolvable initializer switched all four rules off
+instead, which is the opposite of what a receiver nobody can rule out deserves.
+
+What it does not buy is trust. Such a receiver is `ambiguous`, never the
+singleton, so anything that depends on knowing *which* logger you have stays
+conservative — `no-derived-correlation` in particular will not assume the
+argument roles of `Log.scoped()` on a value whose provenance is unknown.
+
+Constructions are the deliberate exception. `new Widget()` was examined and
+found not to be a logger, and that is a decision rather than a shrug, so it
+still ends the analysis — which is what keeps `loggerClassNames` able to
+narrow anything.
+
 ### Loggers installed by a function call are not followed
 
 This is the one limitation worth knowing before you rely on these rules.
@@ -258,6 +276,74 @@ Object.assign(handlers, { emit: Log.info }); // Object.assign
 
 Those six forms are the supported set. Anything that hands the logger to a
 function and lets the function install it is not.
+
+Since 0.3.0 the same six forms are followed for the **receiver** as well as
+the method, which is a different question one level over:
+
+```js
+const holder = { audit: Log };
+holder.audit.info(`patient ${id} admitted`); // reported
+```
+
+Before 0.3.0 a receiver written as `container.property` was classified from
+the property NAME alone — the only signal available for `this.logger` or
+`deps.log` — so a field spelled anything else took its call site outside all
+four rules on the strength of its spelling, with the literal that settles the
+question sitting two lines above it.
+
+The literal wins over the spelling, in both directions. A field named
+`logger` that holds something else is **not** a logger call site:
+
+```js
+const deps = { logger: analytics };
+deps.logger.info(`user ${id}`); // NOT reported — the literal says it is not one
+```
+
+The property name is the fallback for when nothing in the file settles the
+question — `this.logger`, a parameter, an import from elsewhere — and reading
+it first would report ordinary code on the strength of a field's spelling.
+
+"Settles the question" means the value was understood, not merely found.
+`{ logger: getLogger() }` is a value this analysis can see and cannot
+classify, because a factory call is the boundary it stops at — and that is
+the shape a real logger most often arrives in, so the name still decides
+there:
+
+```js
+const deps = { logger: getLogger() };
+deps.logger.info(`patient ${id} admitted`); // still reported
+```
+
+A name that was looked at, or a construction that was examined and rejected,
+is an answer. A call, a conditional, or anything else opaque is not.
+It is also less precise: `{ logger: Log.scoped(…) }` read from the name is
+"some logger", read from the literal is a `ScopedLogger`, which takes no
+third-argument subsystem, so a warning about one would be about an argument
+the runtime never looks at.
+
+What this does **not** widen is trust. `holder.audit` is checked as a logger
+everywhere and is still not provably the singleton, so
+`Log.scoped(holder.audit.newCorrelationId())` is still a derived correlation
+ID. Widening what is checked is safe; widening what is trusted would launder
+any object's method into an approved ID generator.
+
+`this.<field>` is **not** followed, even when the field is initialized in the
+same class:
+
+```js
+class C {
+  audit = Log;
+  m() {
+    this.audit.info(`patient ${id}`); // NOT reported
+  }
+}
+```
+
+Resolving it means matching a class field against the instance a method runs
+on, which is the interprocedural analysis this plugin deliberately stops
+short of. `this.logger` and `this.log` are still checked, by the name hint.
+Both behaviours are pinned by fixtures, so restoring the analysis is a
+decision someone makes rather than a side effect of an unrelated change.
 
 **Which methods are checked.** The six level helpers (`verbose`, `debug`,
 `info`, `warning`, `error`, `todo`), plus `log` and `logMessage` — the latter

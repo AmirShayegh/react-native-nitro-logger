@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Text, View, StyleSheet } from 'react-native';
-import {
-  Log,
-  FileDestination,
-  createFileSink,
-} from 'react-native-nitro-logger';
+import { Log, FileDestination } from 'react-native-nitro-logger';
+// The raw sink, deliberately: this harness needs the handle itself, and the
+// directory it resolves, before any destination wraps it.
+import { createFileSink } from 'react-native-nitro-logger/unstable';
 
 /**
  * The C13 reload harness: a JavaScript runtime that opens a log file and then

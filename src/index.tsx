@@ -1,11 +1,14 @@
-import { NitroModules } from 'react-native-nitro-modules';
-import type { FileSink } from './specs/FileSink.nitro';
-import type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
+import { FileDestination } from './destinations/FileDestination';
+import type { FileDestinationOptions } from './destinations/FileDestination';
+import { NativeConsoleDestination } from './destinations/NativeConsoleDestination';
+import type { NativeConsoleDestinationOptions } from './destinations/NativeConsoleDestination';
+import { createFileSink, createNativeConsoleSink } from './unstable';
 
 // ── Public API ──────────────────────────────────────────────────────────────
 export { Log, Logger } from './Logger';
-export type { LogOptions } from './Logger';
+export type { DestinationStatus, LogOptions } from './Logger';
 export { ScopedLogger } from './ScopedLogger';
+export type { ScopedLogOptions } from './ScopedLogger';
 export type {
   LogLevel,
   LazyMessage,
@@ -91,6 +94,17 @@ export type {
   LossCounts,
 } from './destinations/Batcher';
 export { utf8Length } from './utf8';
+export {
+  DEGRADED_ROTATION,
+  DEGRADED_GZIP,
+  DEGRADED_PRUNE,
+  DEGRADED_SIDECAR,
+  DEGRADED_PROTECTION,
+  DEGRADED_EXCLUSIVITY,
+  describeDegradation,
+} from './degradation';
+export { levelAtLeast, LEVEL_ORDER } from './levels';
+export { PRIVATE_PLACEHOLDER } from './privacy';
 export type { LogFormatter } from './formatters/types';
 export { DefaultFormatter } from './formatters/DefaultFormatter';
 export { JsonLinesFormatter } from './formatters/JsonLinesFormatter';
@@ -99,11 +113,36 @@ export type {
   JsonLinesFormatterOptions,
 } from './formatters/JsonLinesFormatter';
 
-// ── Spike-era raw sink access ───────────────────────────────────────────────
-// Used by the example app's M0 harness; becomes internal once the
-// FileDestination (M4/M5) and NativeConsoleDestination (M6) wrap these.
+/**
+ * A `FileDestination` on the real native sink — the ordinary way to get one.
+ *
+ * `new FileDestination(createFileSink(), options)` says the same thing and
+ * makes a caller name a type it has no other reason to hold. The constructor
+ * stays public because a `FileSinkLike` double is how this is tested, and that
+ * is a legitimate thing to want.
+ *
+ * Throws what the constructor throws: a missing native module, an open
+ * failure, or a config conflict with a writer already open on that path. A
+ * file destination that silently writes nowhere is worse than one that refuses
+ * to be constructed.
+ */
+export function createFileDestination(
+  options: FileDestinationOptions = {}
+): FileDestination {
+  return new FileDestination(createFileSink(), options);
+}
+
+/** A `NativeConsoleDestination` on the real native sink. Same reasoning. */
+export function createNativeConsoleDestination(
+  options: NativeConsoleDestinationOptions = {}
+): NativeConsoleDestination {
+  return new NativeConsoleDestination(createNativeConsoleSink(), options);
+}
+
+// ── Native call results ─────────────────────────────────────────────────────
+// The shapes the native calls return, and the rotation config they take. Root
+// exports because a `FileSinkLike` implementation has to construct them.
 export type {
-  FileSink,
   RotationConfig,
   RejectReason,
   SinkStatus,
@@ -112,14 +151,10 @@ export type {
   ClearOutcome,
   CollectOutcome,
 } from './specs/FileSink.nitro';
-export type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
 
-export function createFileSink(): FileSink {
-  return NitroModules.createHybridObject<FileSink>('FileSink');
-}
-
-export function createNativeConsoleSink(): NativeConsoleSink {
-  return NitroModules.createHybridObject<NativeConsoleSink>(
-    'NativeConsoleSink'
-  );
-}
+// The raw sinks are NOT re-exported here. `createFileSink`,
+// `createNativeConsoleSink`, `FileSink` and `NativeConsoleSink` live at
+// `react-native-nitro-logger/unstable`, which is where a caller that wants the
+// layer below a destination imports them from — and where the hazards of doing
+// so are written down. Use `createFileDestination` above unless you have a
+// reason not to.

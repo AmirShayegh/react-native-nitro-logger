@@ -64,6 +64,10 @@ abstract class HybridFileSinkSpec: HybridObject() {
   
   @DoNotStrip
   @Keep
+  abstract fun deleteSupportBundle(deadlineMs: Double): Boolean
+  
+  @DoNotStrip
+  @Keep
   abstract fun clearLogs(deadlineMs: Double): ClearOutcome
 
   // Default implementation of `HybridObject.toString()`

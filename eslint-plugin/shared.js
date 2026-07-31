@@ -56,11 +56,16 @@ const LOG_METHODS = new Set([...LEVEL_METHODS, 'log', 'logMessage']);
 const CONFIG_METHODS = new Set(['subsystem', 'resetSubsystem']);
 
 /**
- * Methods whose second argument is a `LogOptions` object rather than metadata.
+ * Methods whose second argument is an options object rather than metadata.
  *
- * `Log.log` is only this shape when its receiver resolves to the Logger — a
- * ScopedLogger's `log` takes `(message, level, metadata)`. `logMessage` has no
- * such overload, so it is always the options shape.
+ * From 0.3.0 both `log`s agree: `ScopedLogger.log` takes
+ * `(message, ScopedLogOptions)` where it used to take
+ * `(message, level, metadata)`, so the second argument is an options object
+ * whichever receiver a call turns out to have, and the metadata question no
+ * longer needs the receiver resolved at all. What still differs is which
+ * fields that object may carry — a scope owns its subsystem and correlation,
+ * so those appear only in the Logger shape, which is what
+ * {@link logCallShape} is still consulted for.
  */
 const OPTIONS_METHODS = new Set(['log', 'logMessage']);
 
@@ -73,6 +78,16 @@ const OPTIONS_METHODS = new Set(['log', 'logMessage']);
  * the same pipeline unchecked.
  */
 const METADATA_OPTION_FIELDS = ['metadata', 'scopeMetadata'];
+
+/**
+ * The one metadata field a resolved `ScopedLogger` call cannot deliver.
+ *
+ * `ScopedLogger.log` reads `options.metadata` and supplies the scope's own
+ * defaults itself, so this property on a `ScopedLogOptions` is ignored. Named
+ * here rather than spelled inline at the filter, so the two lists cannot drift
+ * apart silently.
+ */
+const SCOPE_METADATA_FIELD = 'scopeMetadata';
 
 /** Every method whose arguments are public by contract. */
 const API_METHODS = new Set([...LOG_METHODS, ...CONFIG_METHODS, 'scoped']);
@@ -91,6 +106,7 @@ const LOGGER_OWN_METHODS = new Set([
   ...API_METHODS,
   'addDestination',
   'consoleLogging',
+  'destinations',
   'flush',
   'logMessage',
   'metadataKeyCatalog',
@@ -1582,7 +1598,32 @@ function classifyReceiver(context, node, seen = new Set()) {
       }
 
       const init = bindingInit(variable);
-      if (init) return classifyReceiver(context, init, seen);
+      if (init) {
+        const resolved = classifyReceiver(context, init, seen);
+        if (resolved !== null) return resolved;
+        // A `null` here used to end the classification, and that conflated
+        // two different answers.
+        //
+        // `new Widget()` is a null that was *decided*: `classifyConstruction`
+        // looked at the callee, found nothing logger-shaped, and said so.
+        // That is evidence, and `loggerClassNames` is how a project narrows
+        // what counts — so it has to keep meaning something.
+        //
+        // `useLogger()` is a null that is merely *undecided*: a factory this
+        // analysis cannot see through. Treating it as evidence switched every
+        // rule off at the call sites most likely to be real — `const Log =
+        // useLogger()` is the canonical spelling, bound to the documented
+        // name — and did it silently. That is rule 1 at the top of this file:
+        // a receiver that merely might be a logger is `'ambiguous'`, not
+        // discarded.
+        //
+        // So only the undecided case falls through to the name heuristic, and
+        // it widens to `'ambiguous'`, never `'logger'`. The distinction is
+        // provenance: what comes out of an opaque factory may behave like the
+        // singleton, but nothing here establishes that it IS the singleton,
+        // and correlation provenance must not assume it.
+        if (unwrap(init)?.type === 'NewExpression') return null;
+      }
 
       // A parameter, or a binding we cannot pin down. The name is a hint,
       // never proof.
@@ -1814,6 +1855,247 @@ function describeMethodReference(context, node, args) {
 }
 
 /**
+ * `holder.audit.info(…)` — the receiver is a property of a container this file
+ * can read.
+ *
+ * [classifyReceiver] answers a member-expression receiver from the property
+ * NAME alone, because for `this.logger.info(…)` and `deps.log.info(…)` that is
+ * all there is. But when the container is a literal or an assignment target in
+ * this file, the name is not all there is: `const holder = { audit: Log }`
+ * settles what `holder.audit` holds, and answering "the property is not called
+ * `logger`, so this is not a logger" over the top of it took a call site
+ * outside all four rules on the strength of its spelling.
+ *
+ * The machinery is [receiverPropertyCandidates], which the method path at
+ * `describeCall` has used since 0.2 for `handlers.emit(…)`. It is the same
+ * question one level over: there, which METHOD the property holds; here, which
+ * RECEIVER. Reusing it means the two agree about writes, `Object.assign`, and
+ * which of them can reach this call — and it means the same deliberate
+ * limitation applies to both. A container populated by a function call is not
+ * followed.
+ *
+ * ## Tri-state, and why it has to be
+ *
+ * `undefined` means "this container cannot be read here", which is a
+ * different answer from `null`, "it was read and it is not a logger" — and
+ * the caller must be able to tell them apart, because only the first one may
+ * fall back to the property name.
+ *
+ * Collapsing them puts the hint ahead of the evidence, which is a false
+ * positive rather than a missed one: `const deps = { logger: analytics }`
+ * would be reported as a logger call on the strength of the field's spelling,
+ * with the literal that disproves it one line above. Ordinary code being
+ * reported is how a lint rule gets switched off, and a rule that is switched
+ * off protects nothing.
+ *
+ * It costs precision in the other direction too. `{ logger: Log.scoped(…) }`
+ * classified from the name is `'ambiguous'`; read from the literal it is
+ * `'scoped'`, which is what makes the rules stop looking for a third-argument
+ * subsystem a `ScopedLogger` does not take.
+ *
+ * ## Which nulls count as an answer
+ *
+ * Reading the property is not the same as understanding what it holds.
+ * `{ logger: getLogger() }` resolves to a candidate and
+ * [classifyReceiver] returns `null` for it — not because the value is not a
+ * logger, but because it is a factory call at the interprocedural boundary
+ * this plugin stops at. Treating that as "read, and not a logger" would
+ * suppress the name hint and silence a real logger call that was checked
+ * before this walk existed. That is the *dangerous* direction: a false
+ * negative in a privacy rule looks exactly like compliance.
+ *
+ * So [classifyCandidate] separates the two: an identifier had the name
+ * heuristic applied and answered, a construction was examined and rejected,
+ * and anything else opaque — a call, a conditional, an `await` — was not
+ * understood. An undecided candidate makes this whole walk answer
+ * `undefined`, which hands the question back to the name.
+ *
+ * A candidate that is itself `container.property` is the same question one
+ * level further in, so it takes the same walk. Classifying it from its own
+ * property name would rebuild the defect this paragraph is about:
+ * `const inner = { audit: Log }; const holder = { logger: inner.audit }` is
+ * fully settled by the file, and reading `inner.audit` as "not spelled like a
+ * logger" would silence a call the outer name would otherwise have caught.
+ * `seen` is what makes the recursion terminate over containers that reference
+ * each other.
+ *
+ * ## What this deliberately does not reach
+ *
+ * `this.audit.info(…)`. `receiverPropertyCandidates` resolves a container
+ * through a variable binding, and `this` is not one — a class field would have
+ * to be matched against the instance the method runs on, which is a different
+ * analysis and one with the same interprocedural tail that was cut off the
+ * method path. It returns `undefined` there, so `this.logger` keeps the name
+ * hint and nothing more, pinned by fixtures so that changing it is a decision
+ * rather than a side effect.
+ */
+function classifyPropertyReceiver(context, node, callNode, seen = new Set()) {
+  const current = unwrap(node);
+  if (!current || current.type !== 'MemberExpression') return undefined;
+  // Containers that reference each other resolve to nothing rather than
+  // looping — the same treatment the constant resolver gives a cycle. `seen`
+  // carries both the member expressions and the variables already on THIS
+  // path; it is a stack, not a global visited set.
+  if (seen.has(current)) return undefined;
+  seen.add(current);
+
+  const name = staticPropertyName(context, current);
+  if (name === undefined || name === null) return undefined;
+
+  const candidates = receiverPropertyCandidates(
+    context,
+    current.object,
+    name,
+    callNode
+  );
+  if (candidates.length === 0) return undefined;
+
+  const classified = candidates.map((value) =>
+    // A copy per candidate. `seen` exists to stop one path revisiting itself;
+    // shared between siblings it would also let the first candidate mark a
+    // node the second legitimately needs to classify, and answer "opaque" for
+    // a value the walk can actually read.
+    classifyCandidate(context, value, callNode, new Set(seen))
+  );
+  const opaque = classified.filter((receiver) => receiver === undefined);
+
+  // Exactly one possible value: it is what the property holds, so its own
+  // classification stands — including `null`, which is the answer for
+  // `const deps = { analytics }; deps.analytics.info(x)` and has to stay one,
+  // and including `undefined`, which hands the question back to the name.
+  if (classified.length === 1) return classified[0];
+  // Several, and at least one is a logger — or at least one is unreadable,
+  // which cannot be ruled out as one. Which runs is unknowable, so the rules
+  // apply — but never as the singleton, whose provenance is exactly what is in
+  // doubt.
+  //
+  // No rule currently distinguishes the two: every consumer of the
+  // classification branches on `'scoped'` against everything else, and TRUST
+  // does not run through here at all — `isTrustedLogger` takes its own path
+  // and this function does not feed it, which is why
+  // `holder.audit.newCorrelationId()` is still a derived correlation ID. So
+  // this line is a forward constraint rather than a behaviour anything can
+  // observe today, and it is stated that way rather than credited with
+  // protection it does not currently provide.
+  return classified.some((receiver) => receiver != null) || opaque.length > 0
+    ? 'ambiguous'
+    : null;
+}
+
+/**
+ * One value a container property could hold: what it is, or `undefined` for
+ * "this was found and not understood".
+ *
+ * The distinction is the whole point, and it decides whether the property name
+ * one level up still gets a say. `classifyReceiver` returns `null` for both
+ * "looked at, not a logger" and "cannot see through this", and only the first
+ * is evidence:
+ *
+ *   - an **identifier** is the one that has to be unpicked. `classifyReceiver`
+ *     follows the binding, and when it cannot see through the initializer it
+ *     falls through to the name — so the `null` that comes back may be the
+ *     NAME's answer about a value nothing understood. `const value =
+ *     getLogger(); const holder = { logger: value }` is the factory case with
+ *     one alias in front of it, and reading that `null` as evidence puts it
+ *     straight back. So the binding decides: an initializer that is understood
+ *     and is not a logger is evidence, and an opaque one is not. Neither is a
+ *     boundary this analysis declines to cross: a parameter, an import, a
+ *     `let` assigned elsewhere. Each of those is a value from outside, which
+ *     is the same answer `deps.audit` gets and for the same reason.
+ *
+ *     An unresolved global is the one identifier whose `null` still stands,
+ *     and the difference is that it names no boundary at all. An import points
+ *     at a module the analysis chose not to follow; a bare global points at
+ *     nothing, so its spelling is the most anything can say about it, and
+ *     classifying bare names is what the heuristic is for. That is what keeps
+ *     `{ logger: analytics }` silent.
+ *   - a **construction** was examined by `classifyConstruction` and found not
+ *     to be a logger. `classifyReceiver` calls that evidence in as many words,
+ *     and `loggerClassNames` depends on it continuing to mean something.
+ *   - a **member expression** is another container property, so it takes the
+ *     same walk rather than being answered from its own spelling. If that walk
+ *     can read it, the answer is real; if it cannot, this is `undefined` — an
+ *     unresolvable `deps.audit` is not evidence about the field holding it.
+ *   - anything else — a call, a conditional, an `await`, a template — was not
+ *     understood. `getLogger()` is the canonical one, and it is exactly the
+ *     shape a real logger arrives in.
+ *
+ * Undecided is the safe answer to be wrong about: it costs a fallback to the
+ * name, which is what the analysis did before this walk existed.
+ */
+function classifyCandidate(context, value, callNode, seen) {
+  const current = unwrap(value);
+  if (!current) return undefined;
+
+  if (current.type === 'MemberExpression') {
+    const nested = classifyPropertyReceiver(context, current, callNode, seen);
+    if (nested !== undefined) return nested;
+    // Nothing readable behind it, so its own property name is all there is —
+    // and a name that says "not a logger" one level down says nothing about
+    // the field up here.
+    const hint = classifyReceiver(context, current);
+    return hint === null ? undefined : hint;
+  }
+
+  const receiver = classifyReceiver(context, current);
+  if (receiver !== null) return receiver;
+  if (current.type === 'NewExpression') return null;
+  if (current.type !== 'Identifier') return undefined;
+
+  const variable = resolveVariable(context, current);
+  // Nothing in this file to see through, so the name was the whole story and
+  // its `null` stands. This is what keeps `{ logger: analytics }` silent.
+  if (!variable) return null;
+  // An alias cycle is dead code, but "cannot see through this" is the safe
+  // thing to say about it.
+  if (seen.has(variable)) return undefined;
+  seen.add(variable);
+
+  // An import names a boundary this analysis does not cross, so it is a shrug
+  // for the same reason a parameter is. `import { audit } from './logger'`
+  // over a module that re-exports or wraps this package is ordinary, and "I
+  // did not look" is not "not a logger". A recognised package import, and an
+  // import whose name is logger-shaped, both classified positively above and
+  // never reach here.
+  const def = singleDef(variable);
+  if (def && def.type === 'ImportBinding') return undefined;
+
+  // A parameter, a `let` assigned elsewhere, a catch binding: the variable
+  // exists and there is nothing behind it to read. That is a shrug, not a
+  // denial. The value arrives from outside this scope exactly as `deps.audit`
+  // does, and the name it arrives under was chosen by whoever wrote the
+  // signature — `f(value)` says nothing about what `f(Log)` passes.
+  //
+  // Which is the line between this and the unresolved global above. That one
+  // IS the value's own name, at module scope, and classifying bare names is
+  // what the heuristic is for; this one is a local label. And silencing a
+  // call the name already caught is the regression this whole walk is under
+  // instruction not to cause.
+  const init = bindingInit(variable);
+  if (!init) return undefined;
+
+  // Otherwise the question is exactly this question, one alias in.
+  return classifyCandidate(context, init, callNode, seen);
+}
+
+/**
+ * The receiver of a member call, with the evidence ahead of the spelling.
+ *
+ * [classifyPropertyReceiver] first, and its answer taken whenever it has one
+ * — including `null`. A container this file can read settles what its
+ * property holds, and the property NAME is what is left when nothing does:
+ * `this.logger`, `deps.log`, a parameter, an import from elsewhere.
+ *
+ * The order is the whole point. With the hint first, `const deps = { logger:
+ * analytics }` is a logger because of how the field is spelled, and ordinary
+ * analytics code gets reported by four rules at once.
+ */
+function receiverOf(context, node, callNode) {
+  const resolved = classifyPropertyReceiver(context, node, callNode);
+  return resolved !== undefined ? resolved : classifyReceiver(context, node);
+}
+
+/**
  * Describe any call into the logger's public API — level helpers, `log`,
  * `scoped`, `subsystem`, `resetSubsystem` — normalizing away
  * `.call`/`.apply`/`.bind`, computed access, destructured methods and method
@@ -1836,7 +2118,7 @@ function describeCall(context, node) {
       if (inner && inner.type === 'MemberExpression') {
         const method = staticPropertyName(context, inner);
         if (method !== null && API_METHODS.has(method)) {
-          const receiver = classifyReceiver(context, inner.object);
+          const receiver = receiverOf(context, inner.object, node);
           if (receiver === null) return null;
           const args = outer === 'call' ? node.arguments.slice(1) : [];
           return {
@@ -1852,7 +2134,14 @@ function describeCall(context, node) {
     }
 
     const method = staticPropertyName(context, callee);
-    const receiver = classifyReceiver(context, callee.object);
+    // The container walk runs only when the method says this could be a
+    // logger call at all — `cache.get(key)` has no business paying for it —
+    // and `receiverOf` is where the precedence between the walk and the name
+    // hint lives.
+    const receiver =
+      method === null || API_METHODS.has(method)
+        ? receiverOf(context, callee.object, node)
+        : classifyReceiver(context, callee.object);
 
     if (method !== null && API_METHODS.has(method)) {
       if (receiver === null) return null;
@@ -2052,11 +2341,20 @@ function optionsProperty(context, node, name) {
 }
 
 /**
- * `Log.log(msg, options)` and `scope.log(msg, level, meta)` share a name.
- * When the receiver is ambiguous the second argument decides: a bare level
- * string means the ScopedLogger shape, an object literal means the Logger
- * shape, and anything else — including an omitted argument, since a scope's
- * level is defaulted — means both have to be checked.
+ * Which option fields a `log` call's second argument may actually carry.
+ *
+ * Both receivers take an options object there since 0.3.0, so this no longer
+ * decides *where* to look — only whether `subsystem` and `correlation` are
+ * fields the runtime would read. A `ScopedLogOptions` has neither: a scope
+ * owns both, and a call that spelled them would be handing the runtime
+ * properties it never looks at, so reporting one would be a warning about
+ * something that is not logged.
+ *
+ * When the receiver is ambiguous the second argument still offers a hint — a
+ * bare level string is the pre-0.3.0 scoped spelling and carries no fields
+ * either way — and anything unresolved means both interpretations are checked,
+ * which is the fail-loud direction for a rule about data that must not reach a
+ * log.
  */
 function logCallShape({ receiver, args, method }, context) {
   // `logMessage` exists only on the Logger and takes exactly one shape,
@@ -2067,8 +2365,15 @@ function logCallShape({ receiver, args, method }, context) {
   if (receiver === 'logger') return 'logger';
   const second = unwrap(args[1]);
   const level = staticStringValue(context, second);
+  // A bare level string is the pre-0.3.0 scoped spelling, and carries no
+  // option fields under any reading.
   if (level !== null && LEVEL_METHODS.has(level)) return 'scoped';
-  if (second && second.type === 'ObjectExpression') return 'logger';
+  // An object literal used to mean the Logger shape, because only the Logger
+  // took one. Since 0.3.0 both do, so it distinguishes nothing and saying
+  // 'logger' here would be certainty this function does not have. 'both' is
+  // the honest answer and the fail-loud one: a field that only the Logger
+  // reads is still reported, which is the right direction for a rule about
+  // data that must not reach a log.
   return 'both';
 }
 
@@ -2076,8 +2381,8 @@ function logCallShape({ receiver, args, method }, context) {
  * Every argument position carrying metadata for this call.
  *
  * `Log.<level>(message, metadata, subsystem)` · `scope.<level>(message,
- * metadata)` · `scope.log(message, level, metadata)` · `Log.log(message,
- * { metadata })`.
+ * metadata)` · `Log.log(message, { metadata })` · `scope.log(message,
+ * { metadata })` — the last two being the same position since 0.3.0.
  */
 function metadataArguments(context, call) {
   // Spread is handled by the rule, which has the call node to report on.
@@ -2087,16 +2392,29 @@ function metadataArguments(context, call) {
     return isOmitted(context, args[1]) ? [] : [found(args[1])];
   }
 
+  // `metadata` needs no shape check any more: both `log`s read it from the
+  // same field of the same argument since 0.3.0.
+  //
+  // `scopeMetadata` still does, for the reason `subsystem` and `correlation`
+  // do. `ScopedLogger.log` reads `options.metadata` and builds its own
+  // internal options with the scope's own defaults, so a `scopeMetadata`
+  // property on a `ScopedLogOptions` is dropped on the floor — reporting one
+  // would be a privacy warning about data that cannot reach a log, which is
+  // the kind of false positive that gets a rule switched off. Through the
+  // Logger, or through a receiver nobody could resolve, it is live: the field
+  // came off the public `LogOptions` in 0.3.0 and `logMessage` still reads it
+  // from whatever object arrives, which makes this rule the only thing left
+  // that would notice a patient name in it.
   const shape = logCallShape(call, context);
+  const fields =
+    shape === 'scoped'
+      ? METADATA_OPTION_FIELDS.filter((f) => f !== SCOPE_METADATA_FIELD)
+      : METADATA_OPTION_FIELDS;
+
   const results = [];
-  if (shape === 'scoped' || shape === 'both') {
-    if (!isOmitted(context, args[2])) results.push(found(args[2]));
-  }
-  if (shape === 'logger' || shape === 'both') {
-    for (const field of METADATA_OPTION_FIELDS) {
-      const property = optionsProperty(context, args[1], field);
-      if (property.kind !== 'absent') results.push(property);
-    }
+  for (const field of fields) {
+    const property = optionsProperty(context, args[1], field);
+    if (property.kind !== 'absent') results.push(property);
   }
   // One node, one result. An options object nobody can read is unreadable for
   // every field at once — a spread or a computed key makes `optionsProperty`

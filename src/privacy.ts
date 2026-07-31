@@ -39,7 +39,17 @@ const METADATA_KEY_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 /** Source text of the key rule, for callers that want their own RegExp. */
 export const METADATA_KEY_PATTERN_SOURCE = '^[A-Za-z0-9._-]{1,64}$';
 
-function isValidMetadataKey(key: string): boolean {
+/**
+ * Whether a key may carry a value at all.
+ *
+ * Exported module-to-module, **not** through the package barrel: the string
+ * form of the rule is the public surface ({@link METADATA_KEY_PATTERN_SOURCE}),
+ * and a shared predicate would be one more thing a consumer could come to
+ * depend on. `safeSnapshotMetadata` needs it so a scope snapshot can refuse a
+ * key before it reads the getter behind it — the same order `redactMetadata`
+ * keeps, and the reason that order is worth anything.
+ */
+export function isValidMetadataKey(key: string): boolean {
   return METADATA_KEY_PATTERN.test(key);
 }
 
@@ -326,7 +336,15 @@ function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
  * function exists to avoid: precedence is settled per key first, then the
  * winning key is validated, and only a key that survives has its value read.
  * A getter behind a malformed, reserved, or unapproved key therefore never
- * runs, and neither does a getter the call site overrode.
+ * runs *here*, and neither does a getter the call site overrode.
+ *
+ * Said precisely, because one of the two sources has already been through a
+ * snapshot: a getter behind a malformed or reserved key never runs at all —
+ * `safeSnapshotMetadata` applies the same key rule before it reads. A getter
+ * behind an *unapproved* key is different: the catalog can be tightened at any
+ * time, so it cannot be consulted at snapshot time, and a scope default the
+ * catalog later rejects has already been read once, at construction. Call-site
+ * metadata, which is never snapshotted, is unread in every one of those cases.
  *
  * Every rejection — bad key, throwing getter, unsupported value —
  * increments one count. The count is all that is reported: the diagnostic

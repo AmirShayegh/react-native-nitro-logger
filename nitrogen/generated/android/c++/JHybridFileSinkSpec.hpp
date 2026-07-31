@@ -62,6 +62,7 @@ namespace margelo::nitro::nitrologger {
     std::vector<std::string> getLogFilePaths() override;
     SinkStatus maintain(double deadlineMs) override;
     CollectOutcome collectLogs(double deadlineMs, double maxTotalBytes) override;
+    bool deleteSupportBundle(double deadlineMs) override;
     ClearOutcome clearLogs(double deadlineMs) override;
 
   private:

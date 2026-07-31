@@ -1,0 +1,13 @@
+diff --git a/src/destinations/FileDestination.ts b/src/destinations/FileDestination.ts
+index de5e759..46342e6 100644
+--- a/src/destinations/FileDestination.ts
++++ b/src/destinations/FileDestination.ts
+@@ -870,7 +870,5 @@ function positive(value: number | undefined, fallback: number): number {
+ }
+ 
+ function count(value: number): number {
+-  return typeof value === 'number' && Number.isFinite(value) && value > 0
+-    ? Math.floor(value)
+-    : 0;
++  return value;
+ }

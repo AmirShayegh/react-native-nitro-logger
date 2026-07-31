@@ -1,5 +1,6 @@
 package com.margelo.nitro.nitrologger
 
+import android.os.Process
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
@@ -160,4 +161,47 @@ object AndroidPlatformIo : PlatformIo {
    * it as authoritative.
    */
   override fun creationTimeMillis(file: File): Long? = null
+
+  /**
+   * `Os.rename` — API 21, and the raw `rename(2)`, which is what the contract
+   * on [PlatformIo.renameReplacing] describes: it replaces an existing
+   * destination atomically, and on failure it does not touch it.
+   *
+   * `Files.move` would say the same thing but is API 26; `File.renameTo`
+   * reaches the same syscall on Linux but promises none of it. There is no
+   * delete-then-rename fallback here on purpose — one would reintroduce
+   * exactly the window this call exists to close, and would run precisely when
+   * the rename is failing, which is the worst moment to be holding no bundle.
+   */
+  override fun renameReplacing(from: File, to: File): Boolean = try {
+    Os.rename(from.absolutePath, to.absolutePath)
+    true
+  } catch (_: ErrnoException) {
+    false
+  }
+
+  /**
+   * One notch below default, on whichever thread calls this.
+   *
+   * `THREAD_PRIORITY_LESS_FAVORABLE` is +1, and the sum is nice 1 — still in
+   * the foreground cgroup. `THREAD_PRIORITY_BACKGROUND` (10) would be the
+   * obvious choice and is the wrong one: at 10 and above Android moves the
+   * thread into a background cgroup capped at a few percent of a core while
+   * anything foreground runs, and a `flush` on the crash path blocks on this
+   * thread with a deadline it has already promised the caller.
+   *
+   * Swallows failure. This is a scheduling hint; a sink that refused to log
+   * because it could not lower its own priority would be worse than one that
+   * logs at the wrong priority.
+   */
+  override fun deprioritizeCurrentThread() {
+    try {
+      Process.setThreadPriority(
+        Process.THREAD_PRIORITY_DEFAULT + Process.THREAD_PRIORITY_LESS_FAVORABLE
+      )
+    } catch (_: RuntimeException) {
+      // SecurityException on a locked-down runtime, IllegalArgumentException if
+      // the constants ever stop summing to something legal.
+    }
+  }
 }

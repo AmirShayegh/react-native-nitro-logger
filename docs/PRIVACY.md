@@ -273,6 +273,28 @@ original did.
 the rule exists to prevent, so the generator has to be traceable to an import
 of this package.
 
+**Where the bytes come from, and what that is worth.** `newCorrelationId()`
+draws from `crypto.getRandomValues` where the platform provides it and from
+`Math.random` where it does not — resolved on first successful use, and never
+decided permanently at import, because on React Native a `crypto` polyfill
+routinely installs after this module is first imported. The fallback is
+unconditional: an ID names a unit of work, and failing the call that asked for
+one fails whatever was being logged.
+
+`Math.random` is not only the no-`crypto` path. Bytes that would bias the
+alphabet are discarded, and a draw that leaves fewer than eight usable ones is
+topped up from `Math.random` — a case with a probability well under one in a
+trillion, but a real one, so the accurate description is "crypto, with a
+bounded `Math.random` remainder" rather than one source or the other.
+
+Read that as hardening, not as a fix for a leak. The privacy requirement here
+is provenance, and `Math.random` satisfied it completely — an ID it produced
+was never derived from anything about a patient. What the change buys is
+same-session unpredictability: `Math.random` is a PRNG whose state another
+caller in the same JavaScript context can narrow, so IDs drawn from it are
+guessable by anything already running inside the app. Correlation IDs are not
+secrets and grant no access, so that is a small thing. It is also a free one.
+
 ---
 
 ## The compliance boundary
@@ -305,14 +327,37 @@ That is the point of a debug build, and it is why the boundary is stated as a
 rule about data rather than a rule about builds: the enforcement is that reveal
 cannot reach production, not that reveal cannot exist.
 
-If you run a debug build against real regulated data, understand what can and
-cannot be undone. `FileDestination.purge()` removes the file sink's artifacts —
-that is the recoverable part. Everything the same entry handed to `os_log` or
-`logcat` is **not** recoverable: those are the operating system's stores, this
-library has no delete API for them, and on iOS the unified log is readable from
-a connected Mac. There is no call in this package that clears them. The only
-reliable control over that copy is not producing it in the first place, which is
-what the boundary above is for.
+### What `os_log` and `logcat` keep, in every build
+
+This one is not about debug builds, and putting it under that heading was
+misleading. `NativeConsoleDestination` writes to the operating system's own log
+store on both platforms, and **nothing in this package can take those entries
+back** — in a debug build, in a release build, ever.
+
+`FileDestination.purge()` removes the file sink's artifacts. That is the whole
+of what is recoverable. The same entry handed to `os_log` or `logcat` is in a
+store this library does not own and has no delete API for; on iOS the unified
+log is readable from a connected Mac, and on Android the buffer is readable by
+`adb logcat` and by anything holding `READ_LOGS`.
+
+What differs between builds is only *what the entry contains*. In a release
+build a private value has already been reduced to `<private>` before any
+destination sees it, so what reaches the system store is redacted — which is a
+much smaller problem, not the absence of one: public metadata is still public,
+and it is still outside this library's reach.
+
+"Outside its reach" rather than "permanent", because the accurate claim is about
+control, not lifetime. Both stores are retention-bounded and rotate — logcat is
+a ring buffer, and the unified log ages out on its own schedule — but neither
+schedule is one this package sets, observes, or can shorten. The entry is gone
+when the operating system decides it is, which is not something an app can offer
+a user as a deletion.
+
+So the control that actually works is choosing not to produce the copy. If an
+app handles regulated data, the question to answer at startup is whether
+`NativeConsoleDestination` should be configured at all, or configured with a
+`minimumLevel` that keeps the detailed entries out of it. A purge cannot fix
+this afterwards, and neither can a privacy profile.
 
 ### Logs on disk
 
@@ -408,8 +453,8 @@ generation so nothing in flight can write into the fresh file, and `fsync`s the
 directory so the removals survive a crash.
 
 Its reach is the file sink. It does not and cannot clear what other
-destinations did with the same entry; see the paragraph above on `os_log` and
-`logcat`.
+destinations did with the same entry — see
+[What `os_log` and `logcat` keep, in every build](#what-os_log-and-logcat-keep-in-every-build).
 
 One file in the log directory is deliberately not an artifact and survives a
 purge: `<logfile>.lock`, the empty file the writer holds an exclusive lock on so
@@ -541,3 +586,35 @@ be worse than saying so.
 
 Out of scope: cross-process access to the log directory (there is no extension
 use case), and an attacker with root on the device.
+
+### Two exposures worth naming, because neither is a bug
+
+**Crash-reporting SDKs read your log calls.** Sentry, Firebase Crashlytics,
+Bugsnag and the rest install breadcrumb collectors that patch `console.*`, and
+`ConsoleDestination` writes through exactly those functions — `console.error`
+for `error` and `todo`, `console.warn` for `warning`, `console.log` for the
+rest. So an entry that reaches that destination can be copied into a crash
+report and uploaded to a third party —
+by a library this one cannot see, on a path it does not control. Redaction still
+applies, so in a release build the breadcrumb carries `<private>` rather than
+the payload; public metadata travels in full. If that is not acceptable, the
+answer is not to configure `ConsoleDestination` in the builds that ship, which
+is also the ordinary configuration.
+
+**iOS file protection is `CompleteUntilFirstUserAuthentication`, deliberately.**
+Every artifact gets that class rather than the stricter `Complete`, and the
+difference is narrower than the names suggest.
+
+Both classes keep the files unreadable between boot and the **first** unlock, so
+neither lets this library log in that window — a boot-time crash before anyone
+touches the device leaves no file entry, and that is true either way. What
+`CompleteUntilFirstUserAuthentication` adds is everything *after* that first
+unlock: the files stay accessible while the device is subsequently locked, which
+is when backgrounded work runs and when most crash-and-restart cycles happen.
+`Complete` would make them unreadable every time the screen locks, so the logger
+would go silent for the majority of a device's day and the crash-tail recovery
+would have nothing to recover.
+
+That is the standard trade for background-capable storage. It is written down
+here so it is a decision the reader can disagree with rather than an assumption.
+Android has no per-file equivalent; see [Logs on disk](#logs-on-disk).

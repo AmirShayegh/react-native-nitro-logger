@@ -1,0 +1,13 @@
+diff --git a/src/destinations/FileDestination.ts b/src/destinations/FileDestination.ts
+index de5e759..d8d5c68 100644
+--- a/src/destinations/FileDestination.ts
++++ b/src/destinations/FileDestination.ts
+@@ -753,7 +753,7 @@ export class FileDestination implements LogDestination {
+     // counters and the notice have to carry — not the size of whatever
+     // undersized floor the formatter came back with instead.
+     const bytes = utf8Length(record);
+-    if (bytes <= this.maxEntryBytes) return { record, bytes };
++    if (bytes < this.maxEntryBytes) return { record, bytes };
+ 
+     // Structural shedding first: a formatter that knows its own shape can
+     // drop whole fields and truncate one at code-point boundaries, and what
