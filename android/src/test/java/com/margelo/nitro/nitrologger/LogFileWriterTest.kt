@@ -320,15 +320,32 @@ class LogFileWriterTest {
   @Test
   fun `archives are pruned to the count cap`() {
     val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 16.0, maxArchivedFilesCount = 2.0))
+
+    // Sampled after every rotation rather than once at the end, and that is
+    // the whole point of the shape.
+    //
+    // The prune runs on each rotation, so a writer that keeps one *fewer*
+    // than the cap does not settle — it oscillates: prune to 1, rotate to 2,
+    // no prune (2 is not > 2), rotate to 3, prune to 1. A single count taken
+    // at the end therefore passes or fails on the parity of the loop, and ten
+    // rotations happen to land such a writer on 2. Verified: `take(cap - 1)`
+    // survives `assertEquals(2, ...)` after this loop.
+    //
+    // What is actually promised is that the count reaches the cap and stays
+    // there, which no oscillation satisfies.
+    val counts = mutableListOf<Int>()
     repeat(10) {
       w.write("0123456789012345\n")
       now += 1_000
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      counts.add(directory.list()!!.count { LogFileWriter.isArchiveName(it, "app.log") })
     }
-    w.flush(1, 1000.0)
-    w.settleForTesting()
 
-    val archives = directory.list()!!.filter { LogFileWriter.isArchiveName(it, "app.log") }
-    assertTrue("expected at most 2 archives, saw ${archives.size}", archives.size <= 2)
+    // The first two rotations are still filling up to the cap; from the third
+    // on it binds, and every sample after that is the cap exactly.
+    assertEquals(listOf(1, 2), counts.take(2))
+    assertEquals(List(8) { 2 }, counts.drop(2))
   }
 
   @Test
@@ -670,8 +687,60 @@ class LogFileWriterTest {
       repeat(5) { w.write("0123456789\n") }
       w.flush(1, 1000.0)
       w.settleForTesting()
-      val attempts = w.rotationAttemptsForTesting
-      assertTrue("expected the backoff to bound retries, saw $attempts", attempts <= 2)
+
+      // Exactly one. An 11-byte record over an 8-byte threshold means the
+      // first write already wants to rotate; it fails, which opens the window,
+      // and `steady` never advances, so the window absorbs writes two through
+      // five. `<= 2` was satisfied by a writer that retried once more than it
+      // should — which is precisely the behaviour a backoff exists to prevent,
+      // so it was the one value the assertion had to exclude.
+      assertEquals(1, w.rotationAttemptsForTesting)
+    } finally {
+      directory.setWritable(true, true)
+    }
+  }
+
+  /**
+   * The window is a window, not a latch.
+   *
+   * Its sibling above proves a failed rotation stops retrying. On its own that
+   * is also satisfied by a writer that gives up on rotation permanently after
+   * one failure — which would leave a log file growing without bound past a
+   * transient fault, the opposite of what a backoff is for. What separates the
+   * two is whether attempts resume once the window expires, and only a test
+   * that moves the clock can ask.
+   *
+   * Swift has this test; Kotlin had the injected clock and no test using it
+   * for rotation. The asymmetry is the reason it is here.
+   */
+  @Test
+  fun `a rotation retries once the backoff window expires`() {
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 8.0))
+    w.settleForTesting()
+
+    directory.setWritable(false, false)
+    try {
+      assumeDirectoryRefusesWrites()
+
+      w.write("0123456789\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      assertEquals(1, w.rotationAttemptsForTesting)
+
+      // Still inside the window: no further attempt, however many writes.
+      repeat(4) { w.write("0123456789\n") }
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+      assertEquals(1, w.rotationAttemptsForTesting)
+
+      // Past it on the only clock the backoff reads. Nothing else changed —
+      // the fault is still in force and the file is still over its threshold.
+      steady += LogFileWriterConstants.ROTATION_BACKOFF_MS + 1
+      w.write("0123456789\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+
+      assertEquals(2, w.rotationAttemptsForTesting)
     } finally {
       directory.setWritable(true, true)
     }
@@ -2088,4 +2157,17 @@ object LogFileWriterConstants {
 
   /** Mirrors the writer's private `REOPEN_BACKOFF_MS`. */
   const val REOPEN_BACKOFF_MS = 1_000L
+
+  /**
+   * Mirrors the writer's private `ROTATION_BACKOFF_MS`.
+   *
+   * A hand-copied constant drifts, and it is worth being exact about which
+   * direction goes unnoticed. A test advances the clock by this plus one, so
+   * a production window that *grows* past the mirror leaves the window shut
+   * and the test red — caught. One that *shrinks* is still cleared by an
+   * over-long advance, so the test stays green having proved the weaker
+   * statement that the window reopens eventually. Both are worth having;
+   * only the first is guarded.
+   */
+  const val ROTATION_BACKOFF_MS = 5_000L
 }
