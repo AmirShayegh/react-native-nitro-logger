@@ -5,6 +5,7 @@ import { ConsoleDestination } from './destinations/ConsoleDestination';
 import { resolveSubsystemLevel } from './config';
 import { levelAtLeast } from './levels';
 import { startDeadline } from './deadline';
+import { newCorrelationId } from './correlation';
 import {
   buildCatalog,
   normalizePrivacyDefault,
@@ -287,10 +288,17 @@ export class Logger {
 
   // ── Scopes & correlation ────────────────────────────────────────────────
 
-  /** Short-lived random correlation ID — the encouraged way to correlate.
-   * Never derive correlation IDs from patient/visit/record identifiers. */
+  /**
+   * Short-lived random correlation ID — the encouraged way to correlate.
+   * Never derive correlation IDs from patient/visit/record identifiers.
+   *
+   * Drawn from `crypto.getRandomValues` where the platform has it, and from
+   * `Math.random` where it does not — see `src/correlation.ts` for why that
+   * fallback is unconditional and why the choice is made per call rather than
+   * once at import.
+   */
   newCorrelationId(): string {
-    return Math.random().toString(36).slice(2, 10);
+    return newCorrelationId();
   }
 
   /** A scoped logger tagging every message with a correlation ID, optional

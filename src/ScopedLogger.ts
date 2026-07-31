@@ -39,8 +39,14 @@ export class ScopedLogger {
       subsystem: this.subsystem,
       // Handed over unmerged: redaction settles precedence per key and
       // validates the winner BEFORE reading it, so a getter behind a
-      // rejected key — or one the call site overrode — never runs. Merging
-      // here would read every value first and defeat that.
+      // rejected key — or one the call site overrode — is not run here.
+      // Merging would read every value first and defeat that.
+      //
+      // For this scope's own defaults the guarantee is one step weaker, and
+      // the weakness is structural: `safeSnapshotMetadata` already applied the
+      // key rule at construction, but not the catalog, which tightens at any
+      // time. A default behind an unapproved key was therefore read once, when
+      // the scope was built. Call-site metadata has no such step.
       scopeMetadata: this.metadata,
       metadata,
       correlation: this.correlation,

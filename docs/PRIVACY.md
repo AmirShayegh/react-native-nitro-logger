@@ -273,6 +273,28 @@ original did.
 the rule exists to prevent, so the generator has to be traceable to an import
 of this package.
 
+**Where the bytes come from, and what that is worth.** `newCorrelationId()`
+draws from `crypto.getRandomValues` where the platform provides it and from
+`Math.random` where it does not — resolved on first successful use, and never
+decided permanently at import, because on React Native a `crypto` polyfill
+routinely installs after this module is first imported. The fallback is
+unconditional: an ID names a unit of work, and failing the call that asked for
+one fails whatever was being logged.
+
+`Math.random` is not only the no-`crypto` path. Bytes that would bias the
+alphabet are discarded, and a draw that leaves fewer than eight usable ones is
+topped up from `Math.random` — a case with a probability well under one in a
+trillion, but a real one, so the accurate description is "crypto, with a
+bounded `Math.random` remainder" rather than one source or the other.
+
+Read that as hardening, not as a fix for a leak. The privacy requirement here
+is provenance, and `Math.random` satisfied it completely — an ID it produced
+was never derived from anything about a patient. What the change buys is
+same-session unpredictability: `Math.random` is a PRNG whose state another
+caller in the same JavaScript context can narrow, so IDs drawn from it are
+guessable by anything already running inside the app. Correlation IDs are not
+secrets and grant no access, so that is a small thing. It is also a free one.
+
 ---
 
 ## The compliance boundary
