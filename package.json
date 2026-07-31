@@ -69,7 +69,7 @@
   },
   "scripts": {
     "test": "jest",
-    "test:coverage": "jest --coverage",
+    "test:coverage": "jest --coverage && ./scripts/check-coverage-groups.sh",
     "example": "yarn workspace react-native-nitro-logger-example",
     "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build lib",
     "prepare": "bob build",
@@ -89,7 +89,8 @@
     "changeset": "changeset",
     "check-podspec-tag": "./scripts/check-podspec-tag.sh",
     "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish",
-    "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag"
+    "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag",
+    "check-coverage-groups": "./scripts/check-coverage-groups.sh"
   },
   "keywords": [
     "react-native",

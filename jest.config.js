@@ -29,6 +29,11 @@ module.exports = {
    * the published entry point — but neither of those is a coverage gate, and
    * a `.nitro.ts` file that grows a constant is a case to notice in review.
    */
+  // `text` for a human reading CI output, `json-summary` because
+  // `check-coverage-groups.sh` reads the file list back out of it — see there
+  // for why it reads jest's own output rather than re-deriving the glob set.
+  coverageReporters: ['text', 'json-summary'],
+
   collectCoverageFrom: [
     'src/**/*.{ts,tsx}',
     '!src/specs/*.nitro.ts',
@@ -79,7 +84,11 @@ module.exports = {
    *     Every `src/` file matches one of the keys below, so `global` is
    *     computed over the whole library, not over nothing. A mutation test
    *     covers this: raising the global numbers above the measured aggregate
-   *     must fail, and would not if the group were empty.
+   *     must fail, and would not if the group were empty. `global` therefore
+   *     depends on every file matching a narrower key, which is a property of
+   *     the tree rather than of this file — add `src/new-area/` and it stops
+   *     holding, silently. `scripts/check-coverage-groups.sh` is what makes
+   *     that fail instead, and `yarn test:coverage` runs it.
    *   - a key that matches no file at all is an ERROR ("Coverage data for X
    *     was not found"), not a skip. That is what stops a renamed directory
    *     from turning its threshold into decoration.

@@ -107,6 +107,10 @@ jobs:
       # globally, because a global number lets one well-covered area pay for
       # an untested one. Runs the suite a second time — a couple of seconds,
       # and worth not folding into the run above, whose job is the count.
+      #
+      # `yarn test:coverage` is two things: the thresholds, and
+      # check-coverage-groups.sh behind them. The second is what stops the
+      # first from quietly changing meaning — see its header.
       - name: Check coverage has not drained out of a directory
         run: yarn test:coverage
 
