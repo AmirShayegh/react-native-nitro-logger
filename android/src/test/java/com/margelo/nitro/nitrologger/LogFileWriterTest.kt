@@ -274,6 +274,62 @@ class LogFileWriterTest {
     assertTrue("expected several short writes, saw $chunks", chunks > 1)
   }
 
+  // The tracked counter behind `trackedFileSizeForTesting` is what the size
+  // trigger in `rotateIfNeeded` reads, and it is the append path's fallback
+  // answer for "where does a failed batch roll back to" when `channel.size()`
+  // itself throws. A counter that drifts from the true size rotates at the
+  // wrong moment at best and truncates somebody else's bytes at worst — so it
+  // is pinned to the file at every moment its value changes hands.
+  @Test
+  fun `the tracked size agrees with the file through open, append and rotation`() {
+    // Opened onto existing bytes, the counter must start at the true size. A
+    // writer that assumed zero would place its first record boundary inside
+    // the records that were already there.
+    File(directory, "app.log").writeText("existing\n")
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 32.0))
+    assertEquals(9L, w.trackedFileSizeForTesting)
+
+    w.write("0123456789\n")
+    w.flush(1, 1000.0)
+    assertEquals(20L, w.trackedFileSizeForTesting)
+
+    // Two more pushes it past 32: rotation archives the file, reopens a fresh
+    // one, and the counter must restart from the fresh file's true size.
+    repeat(2) { w.write("0123456789\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    assertEquals(0L, w.trackedFileSizeForTesting)
+    assertEquals(File(directory, "app.log").length(), w.trackedFileSizeForTesting)
+  }
+
+  @Test
+  fun `the tracked size returns to the record boundary after a rolled-back write`() {
+    var failNext = false
+    val w = writer(rawWrite = { stream, data, offset, length ->
+      if (failNext) {
+        stream.write(data, offset, length / 2)
+        throw java.io.IOException("injected")
+      }
+      stream.write(data, offset, length)
+      length
+    })
+
+    w.write("first\n")
+    w.flush(1, 1000.0)
+    assertEquals(6L, w.trackedFileSizeForTesting)
+
+    failNext = true
+    w.write("second-and-then-some\n")
+    w.flush(1, 1000.0)
+
+    // Not `6 + length/2`, and not the optimistic `6 + length` a writer that
+    // counts what it tried to write would report: the rollback truncated to
+    // the record boundary, and the counter must say so.
+    assertEquals(6L, w.trackedFileSizeForTesting)
+    assertEquals(6L, File(directory, "app.log").length())
+  }
+
   // MARK: - Crash-tail recovery
 
   @Test
