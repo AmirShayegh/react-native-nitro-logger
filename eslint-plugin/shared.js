@@ -1874,20 +1874,40 @@ function describeMethodReference(context, node, args) {
  * limitation applies to both. A container populated by a function call is not
  * followed.
  *
+ * ## Tri-state, and why it has to be
+ *
+ * `undefined` means "this container cannot be read here", which is a
+ * different answer from `null`, "it was read and it is not a logger" — and
+ * the caller must be able to tell them apart, because only the first one may
+ * fall back to the property name.
+ *
+ * Collapsing them puts the hint ahead of the evidence, which is a false
+ * positive rather than a missed one: `const deps = { logger: analytics }`
+ * would be reported as a logger call on the strength of the field's spelling,
+ * with the literal that disproves it one line above. Ordinary code being
+ * reported is how a lint rule gets switched off, and a rule that is switched
+ * off protects nothing.
+ *
+ * It costs precision in the other direction too. `{ logger: Log.scoped(…) }`
+ * classified from the name is `'ambiguous'`; read from the literal it is
+ * `'scoped'`, which is what makes the rules stop looking for a third-argument
+ * subsystem a `ScopedLogger` does not take.
+ *
  * ## What this deliberately does not reach
  *
  * `this.audit.info(…)`. `receiverPropertyCandidates` resolves a container
  * through a variable binding, and `this` is not one — a class field would have
  * to be matched against the instance the method runs on, which is a different
  * analysis and one with the same interprocedural tail that was cut off the
- * method path. It keeps the name hint and nothing more, pinned by fixtures so
- * that changing it is a decision rather than a side effect.
+ * method path. It returns `undefined` there, so `this.logger` keeps the name
+ * hint and nothing more, pinned by fixtures so that changing it is a decision
+ * rather than a side effect.
  */
 function classifyPropertyReceiver(context, node, callNode) {
   const current = unwrap(node);
-  if (!current || current.type !== 'MemberExpression') return null;
+  if (!current || current.type !== 'MemberExpression') return undefined;
   const name = staticPropertyName(context, current);
-  if (name === null) return null;
+  if (name === undefined || name === null) return undefined;
 
   const candidates = receiverPropertyCandidates(
     context,
@@ -1895,7 +1915,7 @@ function classifyPropertyReceiver(context, node, callNode) {
     name,
     callNode
   );
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) return undefined;
 
   const classified = candidates.map((value) =>
     classifyReceiver(context, value)
@@ -1917,6 +1937,23 @@ function classifyPropertyReceiver(context, node, callNode) {
   // observe today, and it is stated that way rather than credited with
   // protection it does not currently provide.
   return classified.some((value) => value !== null) ? 'ambiguous' : null;
+}
+
+/**
+ * The receiver of a member call, with the evidence ahead of the spelling.
+ *
+ * [classifyPropertyReceiver] first, and its answer taken whenever it has one
+ * — including `null`. A container this file can read settles what its
+ * property holds, and the property NAME is what is left when nothing does:
+ * `this.logger`, `deps.log`, a parameter, an import from elsewhere.
+ *
+ * The order is the whole point. With the hint first, `const deps = { logger:
+ * analytics }` is a logger because of how the field is spelled, and ordinary
+ * analytics code gets reported by four rules at once.
+ */
+function receiverOf(context, node, callNode) {
+  const resolved = classifyPropertyReceiver(context, node, callNode);
+  return resolved !== undefined ? resolved : classifyReceiver(context, node);
 }
 
 /**
@@ -1942,9 +1979,7 @@ function describeCall(context, node) {
       if (inner && inner.type === 'MemberExpression') {
         const method = staticPropertyName(context, inner);
         if (method !== null && API_METHODS.has(method)) {
-          const receiver =
-            classifyReceiver(context, inner.object) ??
-            classifyPropertyReceiver(context, inner.object, node);
+          const receiver = receiverOf(context, inner.object, node);
           if (receiver === null) return null;
           const args = outer === 'call' ? node.arguments.slice(1) : [];
           return {
@@ -1960,15 +1995,16 @@ function describeCall(context, node) {
     }
 
     const method = staticPropertyName(context, callee);
-    let receiver = classifyReceiver(context, callee.object);
+    // The container walk runs only when the method says this could be a
+    // logger call at all — `cache.get(key)` has no business paying for it —
+    // and `receiverOf` is where the precedence between the walk and the name
+    // hint lives.
+    const receiver =
+      method === null || API_METHODS.has(method)
+        ? receiverOf(context, callee.object, node)
+        : classifyReceiver(context, callee.object);
 
     if (method !== null && API_METHODS.has(method)) {
-      // Only once the method says this could be a logger call at all. The
-      // container walk is not free, and `cache.get(key)` has no business
-      // paying for it.
-      if (receiver === null) {
-        receiver = classifyPropertyReceiver(context, callee.object, node);
-      }
       if (receiver === null) return null;
       return {
         method,

@@ -291,6 +291,22 @@ the property NAME alone — the only signal available for `this.logger` or
 four rules on the strength of its spelling, with the literal that settles the
 question sitting two lines above it.
 
+The literal wins over the spelling, in both directions. A field named
+`logger` that holds something else is **not** a logger call site:
+
+```js
+const deps = { logger: analytics };
+deps.logger.info(`user ${id}`); // NOT reported — the literal says it is not one
+```
+
+The property name is the fallback for when nothing in the file settles the
+question — `this.logger`, a parameter, an import from elsewhere — and reading
+it first would report ordinary code on the strength of a field's spelling.
+It is also less precise: `{ logger: Log.scoped(…) }` read from the name is
+"some logger", read from the literal is a `ScopedLogger`, which takes no
+third-argument subsystem, so a warning about one would be about an argument
+the runtime never looks at.
+
 What this does **not** widen is trust. `holder.audit` is checked as a logger
 everywhere and is still not provably the singleton, so
 `Log.scoped(holder.audit.newCorrelationId())` is still a derived correlation

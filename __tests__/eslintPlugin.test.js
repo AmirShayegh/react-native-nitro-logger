@@ -138,6 +138,19 @@ describe('no-dynamic-message', () => {
       // stays silent. The container walk added in 0.3.0 answers "what does
       // this property hold", and `analytics` is an answer, not a shrug.
       'const deps = { audit: analytics }; deps.audit.info(`user ${id}`);',
+      // And that holds even when the field is spelled like a logger. This is
+      // the case that decides the ORDER of the two analyses: the property
+      // name is a hint and the literal is evidence, so a hint consulted first
+      // would report ordinary analytics code on the strength of a field name,
+      // with the line that disproves it directly above.
+      'const deps = { logger: analytics }; deps.logger.info(`user ${id}`);',
+      'const deps = { logger: analytics }; deps.logger.info.call(null, `user ${id}`);',
+      // Reading the literal is also more precise, not merely safer. Classified
+      // from the name this is `ambiguous` and the third argument is checked as
+      // a Logger subsystem; read from the literal it is a ScopedLogger, which
+      // has no third parameter — so reporting one would warn about an argument
+      // the runtime never looks at.
+      `${IMPORT_LOG} const holder = { logger: Log.scoped('c') }; holder.logger.info('m', {}, sub);`,
       // KNOWN LIMITATION, pinned: `this.<field>` is not followed even when
       // the field initializer is in the same class. Resolving it means
       // matching a class field against the instance a method runs on, which
@@ -598,6 +611,12 @@ describe('no-dynamic-message', () => {
       },
       {
         code: `${IMPORT_LOG} const holder = { audit: Log.scoped('c', 'net') }; holder.audit.info(patientName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // Through `.call`, which normalizes to the same shape and takes the
+      // same walk.
+      {
+        code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info.call(null, patientName);`,
         errors: [{ messageId: 'dynamic' }],
       },
       // Assigned rather than in the literal, and through `Object.assign` —
@@ -1298,6 +1317,14 @@ describe('literal-subsystem', () => {
       // widen.
       {
         code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info('m', {}, dynamicName);`,
+        errors: [{ messageId: 'dynamic' }],
+      },
+      // A logger-spelled field holding the real Logger still takes a third
+      // argument, which is the other half of the scoped fixture in the valid
+      // list: the walk decides which shape the call has, and it is right in
+      // both directions rather than merely quiet in one.
+      {
+        code: `${IMPORT_LOG} const holder = { logger: Log }; holder.logger.info('m', {}, dynamicName);`,
         errors: [{ messageId: 'dynamic' }],
       },
       // Computed method access must read as dot access.
