@@ -11,17 +11,18 @@ import XCTest
 /// one file rather than in three hand-written suites that drifted apart on four
 /// rows without anyone noticing.
 ///
+/// Every answer below is produced by calling `FileSinkAnswers`, which is the
+/// object `HybridFileSink` delegates to for all nine of these ops.
+///
 /// ## What this does NOT prove
 ///
-/// That `HybridFileSink` answers this way. Every nitrogen value type is a
-/// C++-backed typealias behind `import NitroModules`, so that file cannot join
-/// this target and nothing here executes a line of it. `answer(for:)` below
-/// derives each answer from `FileSinkLifecycle` the way `HybridFileSink` does —
-/// deliberately through the same `snapshot()` / `artifactSource()` calls, so
-/// that a change to the lifecycle's verdict breaks this suite — but the
-/// marshalling in between is out of reach until the `FileSinkAnswers`
-/// extraction lands. At that point `answer(for:)` delegates instead of
-/// deriving, and these same rows start pinning the adapter.
+/// That the `Wire*`-to-nitrogen copy in `HybridFileSink` is faithful. Every
+/// nitrogen value type is a C++-backed typealias behind `import NitroModules`,
+/// so that file still cannot join this target. What it now contains is a
+/// field-for-field copy and nothing else — `PackageManifestTests` pins that
+/// with a line ceiling and a ban on `lifecycle.` calls — and the copy itself is
+/// covered end to end only by the min-rn smoke jobs. A real reduction of the
+/// gap, not its elimination.
 final class FileSinkLifecycleRowsTests: LogWriterTestCase {
 
   // MARK: - Loading
@@ -81,8 +82,8 @@ final class FileSinkLifecycleRowsTests: LogWriterTestCase {
   // MARK: - The two modes
 
   /// A sink that was never opened: no handle, and nothing can exist yet.
-  private func neverOpened() -> FileSinkLifecycle {
-    FileSinkLifecycle()
+  private func neverOpened() -> FileSinkAnswers {
+    FileSinkAnswers(registry: registry)
   }
 
   /// A sink that opened, wrote, and closed: no handle, and files may exist.
@@ -91,19 +92,15 @@ final class FileSinkLifecycleRowsTests: LogWriterTestCase {
   /// directory rather than remembering a list, so a mode that deleted its file
   /// would answer `pathCount: 0` and agree with the never-opened row for a
   /// reason the table does not describe.
-  private func openedThenClosed() throws -> FileSinkLifecycle {
-    let lifecycle = FileSinkLifecycle()
-    XCTAssertEqual(lifecycle.beginOpen(), .granted)
-    let handle = try makeHandle()
-    XCTAssertEqual(lifecycle.finishOpen(handle), .installed)
-    _ = handle.appendBatch("{\"m\":1}\n", entryCount: 1)
-    let detached = lifecycle.beginClose()
-    _ = detached.handle?.close(deadlineMs: 1000)
-    XCTAssertNil(lifecycle.current(), "the mode is defined by having no handle")
-    return lifecycle
+  private func openedThenClosed() throws -> FileSinkAnswers {
+    let answers = FileSinkAnswers(registry: registry)
+    try answers.open(path: logURL.path, policy: LogRotationPolicy(), lineFramed: true)
+    _ = answers.appendBatch(batch: "{\"m\":1}\n", entryCount: 1)
+    XCTAssertTrue(answers.close(deadlineMs: 1000).durable)
+    return answers
   }
 
-  private func lifecycle(for mode: String) throws -> FileSinkLifecycle {
+  private func sink(for mode: String) throws -> FileSinkAnswers {
     switch mode {
     case "neverOpened": return neverOpened()
     case "openedThenClosed": return try openedThenClosed()
@@ -117,78 +114,97 @@ final class FileSinkLifecycleRowsTests: LogWriterTestCase {
 
   // MARK: - The dispatcher
 
-  /// Each case is the body `HybridFileSink` runs when its handle is `nil`,
-  /// reading the same lifecycle calls in the same order.
+  /// Calls `FileSinkAnswers` and renders the answer's fields to strings.
   ///
-  /// Returns `nil` for an op this target does not implement, which the guard
-  /// below turns into a failure.
-  private func answer(for op: String, _ lifecycle: FileSinkLifecycle) -> [String: String]? {
+  /// It does not decide anything: every value below comes back from the object
+  /// under test. Returns `nil` for an op this target does not implement, which
+  /// the caller turns into a failure.
+  private func answer(for op: String, _ answers: FileSinkAnswers) -> [String: String]? {
     switch op {
     case "appendBatch":
-      guard lifecycle.current() == nil else { return nil }
+      let r = answers.appendBatch(batch: "{\"m\":2}\n", entryCount: 1)
       return [
-        "accepted": "false", "rejectReason": "closed", "queuedBytes": "0",
-        "lostBytes": "0", "lostEntries": "0", "degraded": "0",
+        "accepted": String(r.accepted),
+        // The raw value, not a default: an implementation that refused without
+        // saying why would be reporting something the table does not describe.
+        "rejectReason": r.rejectReason?.rawValue ?? "<absent>",
+        "queuedBytes": Self.number(r.queuedBytes),
+        "lostBytes": Self.number(r.lostBytes),
+        "lostEntries": Self.number(r.lostEntries),
+        "degraded": Self.number(r.degraded),
       ]
 
-    case "getStatus", "maintain":
-      guard lifecycle.current() == nil else { return nil }
-      return ["queuedBytes": "0", "lostBytes": "0", "lostEntries": "0", "degraded": "0"]
+    case "getStatus":
+      return Self.status(answers.getStatus())
+
+    case "maintain":
+      return Self.status(answers.maintain(deadlineMs: 1000))
 
     case "collectLogs":
-      guard lifecycle.current() == nil else { return nil }
+      let o = answers.collectLogs(deadlineMs: 1000, maxTotalBytes: 1_000_000)
       return [
-        "path": "", "byteCount": "0", "sourceFileCount": "0",
-        "complete": "true", "truncated": "false",
+        "path": o.path,
+        "byteCount": Self.number(o.byteCount),
+        "sourceFileCount": Self.number(o.sourceFileCount),
+        "complete": String(o.complete),
+        "truncated": String(o.truncated),
       ]
 
     case "flush":
-      let (live, durableWithoutHandle) = lifecycle.snapshot()
-      guard live == nil else { return nil }
-      return Self.noHandleFlush(durable: durableWithoutHandle)
+      return Self.flush(answers.flush(deadlineMs: 1000))
 
     case "close":
-      let first = lifecycle.beginClose()
-      guard first.handle == nil else { return nil }
-      let second = lifecycle.beginClose()
-      XCTAssertEqual(
-        first.durableWithoutHandle, second.durableWithoutHandle,
-        "closing twice must answer what the first close answered")
-      return Self.noHandleFlush(durable: second.durableWithoutHandle)
+      let first = answers.close(deadlineMs: 1000)
+      let second = answers.close(deadlineMs: 1000)
+      // Idempotence is a relation between two calls, so it cannot be a row.
+      // The table pins what the answer *is*; this pins that asking twice does
+      // not change it.
+      XCTAssertEqual(first, second, "closing twice must answer what the first close answered")
+      return Self.flush(second)
 
     case "clearLogs":
-      let (live, durableWithoutHandle) = lifecycle.snapshot()
-      guard live == nil else { return nil }
+      let o = answers.clearLogs(deadlineMs: 1000)
       return [
-        "deletedCount": "0", "failedPathCount": "0",
-        "durable": String(durableWithoutHandle), "rebound": "false",
+        "deletedCount": Self.number(o.deletedCount),
+        "failedPathCount": String(o.failedPaths.count),
+        "durable": String(o.durable),
+        "rebound": String(o.rebound),
       ]
 
     case "deleteSupportBundle":
-      // `snapshot()`, not `artifactSource()`. A sink that opened and closed
-      // knows where its bundle would be but cannot confirm it is gone, and
-      // `true` there deletes the caller's obligation to retry. This is the one
-      // row that was wrong in shipped code, and it was found by review rather
-      // than by a test because no test could reach the file.
-      let (live, durableWithoutHandle) = lifecycle.snapshot()
-      guard live == nil else { return nil }
-      return ["deleted": String(durableWithoutHandle)]
+      return ["deleted": String(answers.deleteSupportBundle(deadlineMs: 1000))]
 
     case "getLogFilePaths":
-      let (live, path) = lifecycle.artifactSource()
-      guard live == nil else { return nil }
-      guard let path else { return ["pathCount": "0"] }
-      return ["pathCount": String(LogWriter.artifactPaths(at: URL(fileURLWithPath: path)).count)]
+      return ["pathCount": String(answers.getLogFilePaths().count)]
 
     default:
       return nil
     }
   }
 
-  private static func noHandleFlush(durable: Bool) -> [String: String] {
+  /// `Double` renders as `0.0`, and the table says `0`. Integral values only,
+  /// which every field here is — a fractional byte count would fail loudly
+  /// rather than being rounded into agreement.
+  private static func number(_ value: Double) -> String {
+    guard value == value.rounded(), let exact = Int(exactly: value.rounded()) else {
+      return String(value)
+    }
+    return String(exact)
+  }
+
+  private static func status(_ s: WireSinkStatus) -> [String: String] {
     [
-      "durable": String(durable), "timedOut": "false", "pendingBytes": "0",
-      "queuedBytes": "0", "lostBytes": "0", "lostEntries": "0", "degraded": "0",
+      "queuedBytes": number(s.queuedBytes), "lostBytes": number(s.lostBytes),
+      "lostEntries": number(s.lostEntries), "degraded": number(s.degraded),
+    ]
+  }
+
+  private static func flush(_ o: WireFlushOutcome) -> [String: String] {
+    [
+      "durable": String(o.durable), "timedOut": String(o.timedOut),
+      "pendingBytes": number(o.pendingBytes), "queuedBytes": number(o.queuedBytes),
+      "lostBytes": number(o.lostBytes), "lostEntries": number(o.lostEntries),
+      "degraded": number(o.degraded),
     ]
   }
 
@@ -266,7 +282,7 @@ final class FileSinkLifecycleRowsTests: LogWriterTestCase {
           XCTFail("row `\(row.op)` has no answer for mode `\(mode)`")
           continue
         }
-        guard let actual = answer(for: row.op, try lifecycle(for: mode)) else {
+        guard let actual = answer(for: row.op, try sink(for: mode)) else {
           XCTFail("no dispatcher for `\(row.op)`, or it found a live handle in `\(mode)`")
           continue
         }

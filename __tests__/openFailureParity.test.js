@@ -18,15 +18,16 @@ const path = require('path');
  *
  * That either list is *reached*. It parses declarations, so a constant that no
  * throw site uses still matches its twin perfectly. Each platform's own suite
- * covers use: `FileSinkMessagesTest` on Kotlin drives the mapper, and the Swift
- * side's messages are exercised through `FileSinkLifecycleTests`.
+ * covers use: `FileSinkMessagesTest` on Kotlin drives the mapper, and
+ * `FileSinkAnswersTests` on Swift drives its twin — including that the mapper
+ * is on the open path rather than merely correct in isolation.
  *
  * It also does not prove the strings are *good* — only that they are the same.
  * Two identically unhelpful messages pass.
  */
 
 const ROOT = path.resolve(__dirname, '..');
-const SWIFT = path.join(ROOT, 'ios/HybridFileSink.swift');
+const SWIFT = path.join(ROOT, 'ios/FileSinkMessages.swift');
 const KOTLIN = path.join(
   ROOT,
   'android/src/main/java/com/margelo/nitro/nitrologger/FileSinkMessages.kt'
@@ -58,10 +59,13 @@ describe('open-failure message parity', () => {
   const swiftSource = fs.readFileSync(SWIFT, 'utf8');
   const kotlinSource = fs.readFileSync(KOTLIN, 'utf8');
 
-  // Scoped to the `enum Message { ... }` block so a stray string literal
-  // elsewhere in the adapter cannot join the comparison.
+  // Scoped to the `enum FileSinkMessages { ... }` block so a stray string
+  // literal elsewhere in the file cannot join the comparison. The Swift list
+  // moved out of `HybridFileSink.swift` when the adapter's decisions did: a
+  // list whose whole purpose is to be compared across platforms should not
+  // live in the one file neither platform's tests can build.
   const messageBlock = swiftSource.match(
-    /\n {2}enum Message \{\n([\s\S]*?)\n {2}\}\n/
+    /\nenum FileSinkMessages \{\n([\s\S]*?)\n\}\n/
   );
   const swift = declarations(
     messageBlock ? messageBlock[1] : '',
