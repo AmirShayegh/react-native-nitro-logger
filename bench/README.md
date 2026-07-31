@@ -44,6 +44,30 @@ automates the Android run end to end, harvesting one JSON line per case from
 logcat. Any finding gated on Hermes behaviour (B1, B6 in the 0.4.0 audit) is
 decided by that run, never by the Node one.
 
+### What the first two-engine run said
+
+The 0.4.0 baseline (this laptop's V8 against one emulator's Hermes — one
+machine, one device, indicative and not authoritative) found the gap
+between the engines is not uniform, and the pattern is the useful part:
+
+| shape                                | Hermes ÷ V8 |
+| ------------------------------------ | ----------- |
+| `utf8Length`, batcher bookkeeping    | 10–50×      |
+| logger hot path                      | 2–40×       |
+| formatters (`JSON.stringify`-heavy)  | 1–5×        |
+
+Hermes charges dearly for **interpreted JavaScript** — character loops,
+per-call bookkeeping, small allocations — and comparatively little for
+work that lands in a **built-in** (`JSON.stringify`, `toISOString`). The
+extreme is `utf8Length` on a 163-byte ASCII record: 406 ns on V8, 4.5 µs
+on Hermes, which is ~94% of a batcher `add` there against ~85% on V8.
+
+So the ranking of an optimisation can differ by engine, and the rule of
+thumb is: **removing a hand-written loop is worth more on the engine that
+ships than the V8 numbers suggest; avoiding a built-in call is worth
+less.** Any item whose whole case rests on that distinction (B1, B6) is
+adopted or declined on a Hermes measurement, never a V8 one.
+
 ## The native harnesses
 
 - **Swift**: `LogPerfTests.swift` in `swift-tests/`, `measure {}` around the
