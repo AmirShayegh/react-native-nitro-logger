@@ -25,6 +25,42 @@ npm install react-native-nitro-logger react-native-nitro-modules
 `react-native-nitro-modules` is a required peer — this library is built on
 [Nitro Modules][nitro].
 
+## Setup
+
+Autolinking does the wiring; what it cannot do is any of the four things below,
+and each of them fails in a way that looks like something else.
+
+- **`react-native-nitro-modules` is a peer, not a dependency.** It is not
+  installed for you, and it is where the `createHybridObject` runtime lives.
+  Without it the JavaScript resolves and the first file destination throws.
+- **New Architecture only.** There is no bridge fallback: on an app with the
+  old architecture the Hybrid Object is never registered, so the failure is at
+  the first sink construction rather than at build time. React Native 0.76 and
+  later default to New Architecture; below that, turn it on explicitly.
+- **iOS: `cd ios && pod install`** after installing. The pods carry the
+  vendored Swift writer and the generated Nitro bindings; a stale `Podfile.lock`
+  builds an app whose binary does not contain them.
+- **Android: JDK 17.** The Gradle module targets it, and an older JDK fails in
+  the Kotlin compile with a class-version error that names a file in this
+  library rather than the JDK.
+
+A linking failure reads like this. The JavaScript resolved, so it is a runtime
+error at the first call that asks for the native object — `createFileDestination()`
+— and not a red screen at startup:
+
+```
+Cannot create an instance of HybridObject "FileSink" - It has not yet been
+registered in the Nitro Modules HybridObjectRegistry! Suggestions:
+...
+- All registered HybridObjects: [...]
+```
+
+All four causes above produce that one message, which is why they are worth
+working through in order rather than guessing. The bracketed list at the end is
+the useful part: if it is empty, Nitro itself never initialised — the peer
+dependency or the New Architecture. If it has entries but not `FileSink`, this
+library's native side did not build in, which is the pods or the JDK.
+
 ## Quick start
 
 ```ts
@@ -335,12 +371,49 @@ into crash-tail trimming.
 
 | | Supported | Verified |
 | --- | --- | --- |
-| iOS | React Native ≥ 0.78 | CI builds, launches and exercises a pristine 0.78 consumer app |
-| Android | React Native at the example's version; **≥ 0.78 experimental**. minSdk 24 | CI runs the writer's unit suite and builds the example; no minimum-version consumer job exists yet |
+| iOS | React Native ≥ 0.78 | `min-rn-ios` packs a tarball into a pristine 0.78 app, builds it Release, launches it on a simulator and reads a run-ID-matched verdict out of the app container |
+| Android | React Native ≥ 0.78, minSdk 24 | `min-rn-android` does the same into a pristine 0.78 app, builds it Release for the emulator's ABI, launches it on API 34 and reads the verdict off the `ReactNativeJS` logcat tag |
 
 New Architecture only. The compatibility claims are split per platform on
 purpose — see [docs/PARITY.md](docs/PARITY.md) for what backs each one, and for
 where the two native writers genuinely differ.
+
+**Read the "Verified" column as the whole of the claim.** "Supported" is a
+statement of intent; only the right-hand column is a statement about something
+that ran, and both rows now point at a job that installs this package the way a
+consumer would — from a packed tarball into an app generated from the community
+template — rather than at a build of the example.
+
+The one difference between them is how the verdict leaves the app: iOS reads a
+file the library itself wrote, Android reads what the app said about itself over
+logcat. Reading the file on Android would need `run-as` and therefore a
+debuggable build, and a debug build is not what the job exists to verify — R8,
+the bundled JavaScript and the packaged `.so` set are precisely what differ in
+release. [docs/PARITY.md](docs/PARITY.md#compatibility-per-platform) has the
+rest, including where the two native writers genuinely differ.
+
+## Threading and builds
+
+Every public method on `Logger`, `ScopedLogger` and the destinations is
+synchronous and safe to call from any thread. What is *not* synchronous is the
+I/O: `Log.info(…)` renders the entry, hands it to each destination and returns,
+and the file destination buffers it. Records reach the disk when the buffer
+fills, when a timer expires, or when you call `flush(deadlineMs)` — which is the
+only call that waits for them.
+
+That matters in three places:
+
+- **Before the process ends.** `flushOnBackground()` covers the ordinary
+  backgrounding case. A crash is covered by the crash-tail recovery on the next
+  open, not by a flush, because there is nothing left to run one.
+- **Around `purge()`.** It is synchronous and deadline-bounded on purpose: a
+  compliance deletion that returned before finishing would be worth nothing.
+- **In a debug build.** The reveal branch is `__DEV__`-gated, so a debug build
+  writes private payloads in the clear to every destination — including the
+  file, where they outlive the session.
+  [docs/PRIVACY.md](docs/PRIVACY.md#the-compliance-boundary) is the contract;
+  the short version is that a build where reveal is possible is a build for
+  synthetic data only.
 
 ## Documentation
 

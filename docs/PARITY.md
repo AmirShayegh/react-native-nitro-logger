@@ -16,6 +16,17 @@ Nothing here is aspirational. Every "identical" row is covered by a golden;
 every difference is either enforced by a test or unreachable through the
 public API, and the table says which.
 
+**What holds that revision in place is documentation, not a gate, and that is
+worth saying plainly.** The goldens are checked in as a generated TypeScript
+module, and CI asserts this package still matches them — so a change *here*
+that breaks byte-parity fails. What no job can check is that the corpus still
+corresponds to `670e183`, because SwiftLogger is not a dependency of this
+package and nothing in CI holds a checkout of it. If SwiftLogger's formatter
+changes, this suite stays green and the claim silently becomes a claim about a
+past revision. The revision is therefore recorded in three places — here, the
+generated module's own header, and `scripts/README.md` — so that regenerating
+is a deliberate act with a number attached rather than a refresh.
+
 ## How much of this is actually enforced
 
 <!-- test-counts: js=1108/26 swift=247/12 kotlin=240/11 -->

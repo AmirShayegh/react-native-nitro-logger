@@ -420,9 +420,76 @@ a gzipped copy of the log behind would not be a deletion. It is excluded from
 Nothing is uploaded and nothing is encrypted by this library. `docs/PRIVACY.md`
 records why both are the app's call.
 
-`FileDestinationOptions`, beyond the common `label`/`minimumLevel`/`formatter`:
-`path`, `rotation`, `maxEntryBytes`, `batchBytes`, `flushIntervalMs`,
-`maxPendingEntries`, `maxPendingBytes`, `watermarkBytes`.
+**The support flow is three steps, not two.**
+
+```ts
+import { createFileDestination } from 'react-native-nitro-logger';
+
+declare function uploadToSupport(path: string): Promise<void>;
+
+async function sendDiagnostics(file: ReturnType<typeof createFileDestination>) {
+  // 1. collect — a gzipped copy of the log, beside the log files.
+  const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+  if (!bundle.complete || bundle.path === '') return; // nothing to send
+
+  // 2. upload — yours. Nothing here transmits or encrypts.
+  await uploadToSupport(bundle.path);
+
+  // 3. delete — also yours, and the step that is easy to forget.
+  file.deleteSupportBundle();
+}
+```
+
+Step 3 is not tidiness. Retention deliberately keeps a *finished* bundle,
+because the sweep cannot know whether an upload is still reading it — so a
+bundle nobody deletes sits outside the rotation budget the app configured,
+indefinitely, as a gzipped copy of the whole log. On a device holding regulated
+data that is the one artifact retention never comes back for.
+
+Two ordering rules, both of which return `false` rather than guessing:
+
+- **Delete before `dispose()`.** A released handle no longer knows whether the
+  bundle at that path is still its own — another destination may have opened the
+  same directory and be mid-publish — so a disposed destination refuses.
+- **Sequence collect and delete yourself.** `true` means no bundle artifact
+  remained at the instant of the call. A collect started afterwards writes a new
+  one.
+
+`false` is deliberately not a list of causes — refused, timed out, threw, or
+absence could not be *durably* confirmed. Read it as "assume a copy may still be
+there" and retry rather than branching on why.
+
+**`FileDestinationOptions`, and what happens if you pass nothing.**
+
+Every option has a working default, and the defaults are worth reading rather
+than inferring — two of them decide behaviour people expect to be automatic.
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `label` | `'file'` | Identifies the destination in loss notices. |
+| `formatter` | `new JsonLinesFormatter()` | Line-framed, so crash-tail trimming is on. |
+| `path` | `<sink default dir>/app.log` | `noBackupFilesDir` on Android, `Library/Logs` on iOS. |
+| `minimumLevel` | none | Falls through to the logger's. |
+| `rotation` | **none** | No rotation, no retention, no size cap. See below. |
+| `maxEntryBytes` | 64 KiB | One entry over this is truncated, not dropped. |
+| `batchBytes` | 4 KiB | Soft target for one native `appendBatch`. |
+| `flushIntervalMs` | 100 ms | The timer that pushes a partial batch. |
+| `maxPendingEntries` | 1000 | Buffer ceiling by count; over it, records are dropped and counted. |
+| `maxPendingBytes` | 512 KiB | The same ceiling by size. |
+| `watermarkBytes` | 256 KiB | Backpressure point, below the ceiling. |
+
+**`rotation` defaulting to none is the one to notice.** Omit it and the file
+grows without bound: no size threshold, no archive count, no
+`maxTotalLogBytes`. That is deliberate — a library that silently started
+deleting an app's log data would be making a retention decision that belongs to
+the app — but it means a long-lived app that never configures rotation has a
+file that only `purge()` ever shortens. The Quick start passes a rotation block
+for that reason.
+
+The second is `maxEntryBytes`: an entry above it is **truncated to fit**, not
+discarded, and formatters that implement `formatWithin` are asked to do the
+truncation so the result is still valid for the format. A dropped entry is a
+different event with a different count.
 
 <!-- api: FileDestination, FileDestinationOptions, PurgeOutcome, CollectForSupportOptions, CollectOutcome -->
 

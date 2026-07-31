@@ -13,6 +13,14 @@ definitions on purpose. Nothing in the test tree should need `fs`.
 so that checking parity never requires leaving a stray target behind in a
 project this one only reads.
 
+**The corpus in the tree was generated at SwiftLogger commit `670e183`.**
+Regenerating replaces a claim about that revision with a claim about whatever
+is checked out, so it is a deliberate act: note the new revision, and update it
+in the generated module's header and in `docs/PARITY.md`, which are the other
+two places it is written down. Nothing enforces this — SwiftLogger is not a
+dependency of this package and no CI job holds a checkout of it — so the number
+staying true is a matter of updating it when the corpus changes.
+
 ```sh
 SWIFT_LOGGER=~/Developer/logger   # wherever the SwiftLogger checkout lives
 

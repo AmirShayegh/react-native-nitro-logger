@@ -327,14 +327,30 @@ That is the point of a debug build, and it is why the boundary is stated as a
 rule about data rather than a rule about builds: the enforcement is that reveal
 cannot reach production, not that reveal cannot exist.
 
-If you run a debug build against real regulated data, understand what can and
-cannot be undone. `FileDestination.purge()` removes the file sink's artifacts —
-that is the recoverable part. Everything the same entry handed to `os_log` or
-`logcat` is **not** recoverable: those are the operating system's stores, this
-library has no delete API for them, and on iOS the unified log is readable from
-a connected Mac. There is no call in this package that clears them. The only
-reliable control over that copy is not producing it in the first place, which is
-what the boundary above is for.
+### What `os_log` and `logcat` keep, in every build
+
+This one is not about debug builds, and putting it under that heading was
+misleading. `NativeConsoleDestination` writes to the operating system's own log
+store on both platforms, and **nothing in this package can take those entries
+back** — in a debug build, in a release build, ever.
+
+`FileDestination.purge()` removes the file sink's artifacts. That is the whole
+of what is recoverable. The same entry handed to `os_log` or `logcat` is in a
+store this library does not own and has no delete API for; on iOS the unified
+log is readable from a connected Mac, and on Android the buffer is readable by
+`adb logcat` and by anything holding `READ_LOGS`.
+
+What differs between builds is only *what the entry contains*. In a release
+build a private value has already been reduced to `<private>` before any
+destination sees it, so what reaches the system store is redacted — which is a
+much smaller problem, not the absence of one: public metadata is still public,
+and it is still permanent.
+
+So the control that actually works is choosing not to produce the copy. If an
+app handles regulated data, the question to answer at startup is whether
+`NativeConsoleDestination` should be configured at all, or configured with a
+`minimumLevel` that keeps the detailed entries out of it. A purge cannot fix
+this afterwards, and neither can a privacy profile.
 
 ### Logs on disk
 
@@ -430,8 +446,8 @@ generation so nothing in flight can write into the fresh file, and `fsync`s the
 directory so the removals survive a crash.
 
 Its reach is the file sink. It does not and cannot clear what other
-destinations did with the same entry; see the paragraph above on `os_log` and
-`logcat`.
+destinations did with the same entry — see
+[What `os_log` and `logcat` keep, in every build](#what-os_log-and-logcat-keep-in-every-build).
 
 One file in the log directory is deliberately not an artifact and survives a
 purge: `<logfile>.lock`, the empty file the writer holds an exclusive lock on so
@@ -563,3 +579,30 @@ be worse than saying so.
 
 Out of scope: cross-process access to the log directory (there is no extension
 use case), and an attacker with root on the device.
+
+### Two exposures worth naming, because neither is a bug
+
+**Crash-reporting SDKs read your log calls.** Sentry, Firebase Crashlytics,
+Bugsnag and the rest install breadcrumb collectors that patch `console.*`, and
+`ConsoleDestination` writes through exactly those functions — `console.error`
+for `error` and `todo`, `console.warn` for `warning`, `console.log` for the
+rest. So an entry that reaches that destination can be copied into a crash
+report and uploaded to a third party —
+by a library this one cannot see, on a path it does not control. Redaction still
+applies, so in a release build the breadcrumb carries `<private>` rather than
+the payload; public metadata travels in full. If that is not acceptable, the
+answer is not to configure `ConsoleDestination` in the builds that ship, which
+is also the ordinary configuration.
+
+**iOS file protection is `CompleteUntilFirstUserAuthentication`, deliberately.**
+Every artifact gets that class rather than the stricter `Complete`. The
+difference is real: after the user unlocks the device once following a boot, the
+files stay readable even while the device is subsequently locked. `Complete`
+would make them unreadable whenever the screen locks — and would also make the
+logger unable to write during backgrounded work, on device boot before first
+unlock, and in exactly the crash-and-restart windows the crash-tail recovery
+exists for. A logger that cannot log when the screen is off is not a logger.
+This is the standard trade for background-capable storage, and it is written
+down here so it is a decision the reader can disagree with rather than an
+assumption. Android has no per-file equivalent; see
+[Logs on disk](#logs-on-disk).

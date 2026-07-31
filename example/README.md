@@ -1,97 +1,83 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# The device harness
 
-# Getting Started
+This is not a demo app. It is the part of the test suite that only a device can
+run, and `src/App.tsx` is the harness rather than a showcase.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+Everything else in this repository tests the library somewhere convenient. The
+Swift and Kotlin suites run the two native writers on a Mac and a desktop JVM in
+a couple of seconds each; the Jest suite runs the TypeScript core in Node. All
+three deliberately avoid the device. What none of them can answer is whether the
+same code works **through Hermes and the Nitro bridge**, against the real
+`Library/Logs` / `noBackupFilesDir`, under iOS data protection, and into the
+unified log where Console.app can actually see it.
 
-## Step 1: Start Metro
+So the harness drives the real pipeline —
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
-
-To start the Metro dev server, run the following command from the root of your React Native project:
-
-```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
+```
+Log → FileDestination → Batcher → Nitro → LogWriter        (the file leg)
+Log → NativeConsoleDestination → Nitro → os_log / logcat   (the console leg)
 ```
 
-## Step 2: Build and run your app
+— runs on mount, and prints one greppable verdict line so a pass can be driven
+from a shell instead of by tapping. Tapping **Run again** re-runs it.
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
-```
-
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+## Running it
 
 ```sh
-bundle install
+yarn                      # from the repository root
+yarn example start        # Metro
+yarn example ios          # or: yarn example android
 ```
 
-Then, and every time you update your native dependencies, run:
+iOS needs pods the first time and after any native change:
 
 ```sh
-bundle exec pod install
+cd example/ios && bundle install && bundle exec pod install
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+The verdict is on screen, and also in the platform log. Reading it from the
+shell is the point:
 
 ```sh
-# Using npm
-npm run ios
+# iOS — the os_log leg, which is the only way to prove it from outside the app
+xcrun simctl spawn <udid> log show --last 2m \
+  --predicate 'subsystem == "nitrologger.example.harness"'
 
-# OR using Yarn
-yarn ios
+# Android — Hermes routes console.log to the `ReactNativeJS` tag, so filter on
+# the tag and grep for the sentinel, not the other way round
+adb logcat -d -s ReactNativeJS:V | grep NITRO_M6
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+A line starting `PASS` means every step passed; each step is also listed on
+screen with its own detail, so a failure names itself.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+## The sentinels, and what checks them
 
-## Step 3: Modify your app
+Three constants in `src/App.tsx` are load-bearing, and two of them are checked
+by a script rather than by the app — because the app cannot check them about
+itself:
 
-Now that you have successfully run the app, let's make changes!
+- `NITRO_PRIVACY_SENTINEL_9f3a` is written through `priv()`. In a **release**
+  bundle that string must not reach the log file; `<private>` must be there
+  instead. `scripts/check-release-bundle.sh` is what asserts it, by building a
+  release bundle and inspecting it.
+- `NITRO_ERROR_SENTINEL_7c21` is thrown through the real `ErrorUtils` hook.
+  Neither it nor its custom class name may appear in the log in **any** build —
+  the sanitiser strips both regardless of `__DEV__`.
+- `NITRO_M6` is the verdict prefix the commands above grep for.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+Changing a sentinel here means changing it there. They are asserted equal
+between the two, so a rename fails rather than silently disarming a check.
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+## `C13ReloadHarness.tsx`
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+A second, narrower harness for one specific failure: what happens to an open
+file handle across a Fast Refresh reload, when JavaScript state is discarded but
+the native writer is not. `scripts/check-android-reload.sh` drives it.
 
-## Congratulations! :tada:
+## If it does not launch
 
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+The four setup requirements in the [root README](../README.md#setup) — the
+`react-native-nitro-modules` peer, New Architecture, `pod install`, JDK 17 —
+produce the same runtime error here as in any consumer app. That section has the
+message and how to tell the causes apart.
