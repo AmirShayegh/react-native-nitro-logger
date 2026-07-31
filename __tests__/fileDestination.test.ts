@@ -1144,31 +1144,24 @@ describe('FileDestination — through the Logger', () => {
 });
 
 /**
- * The double, against the table both native adapters implement.
+ * The double, on the questions the shared table does not ask.
  *
- * Every row here is a question asked with **no live handle**, which is the
- * whole of `FileSinkLifecycle`'s no-handle contract: what a sink answers when
- * it was never opened, and what it answers once it has been closed. The two
- * differ on exactly one bit — whether files may exist — and both adapters
- * derive every answer below from it.
- *
- * This double had drifted from that table on four rows: it accepted batches on
+ * The no-handle rows themselves moved to `spec/file-sink-lifecycle.rows.json`
+ * and are asserted by `__tests__/fileSinkLifecycleRows.test.ts` alongside the
+ * two native suites that read the same file. They used to live here, in a
+ * `describe.each` that could agree with a table nobody else was reading — and
+ * this double had in fact drifted from it on four rows: it accepted batches on
  * a sink that was never opened, reported an unfinished collect where the
  * natives report a finished one with nothing in it, drained on a flush after
  * close, and named a `failedPath` for a deletion nobody attempted. None was
- * reachable through `FileDestination`, which short-circuits first — which is
- * exactly why they survived. A double is only worth having if it answers the
- * way the real thing answers, including on the paths today's callers guard.
+ * reachable through `FileDestination`, which short-circuits first, which is
+ * exactly why they survived.
  *
- * ## What these do NOT prove
- *
- * That the natives answer this way. Nothing in a Jest process can execute
- * Swift or Kotlin. These pin the double against the table as read; the paired
- * native suites pin each adapter against the same table, and until W3's
- * `FileSinkAnswers` extraction lands the adapters' own answers are reachable
- * only through the min-rn smoke jobs.
+ * What stays here is everything the table's shape cannot carry: a third
+ * lifecycle state, the hostile hatch, and the aliasing rule. The table is a
+ * map of op and mode to an answer; these are not answers.
  */
-describe('MemoryFileSink — the no-handle rows both adapters implement', () => {
+describe('MemoryFileSink — beyond the shared no-handle table', () => {
   /** A sink that was never opened: no handle, and nothing can exist yet. */
   function neverOpened(): MemoryFileSink {
     return new MemoryWriter().attach();
@@ -1183,95 +1176,20 @@ describe('MemoryFileSink — the no-handle rows both adapters implement', () => 
     return sink;
   }
 
-  describe.each([
-    ['never opened', neverOpened, true],
-    ['opened then closed', openedThenClosed, false],
-  ])('%s', (_label, make, vacuous) => {
-    test('refuses a batch as closed, with a zeroed status', () => {
-      const result = make().appendBatch('{"m":2}\n', 1);
-
-      expect(result.accepted).toBe(false);
-      expect(result.rejectReason).toBe('closed');
-      // Zeroed, not the last status the handle had. There is no handle to ask.
-      expect(result.queuedBytes).toBe(0);
-      expect(result.degraded).toBe(0);
-    });
-
-    test('reports a zeroed status', () => {
-      expect(make().getStatus()).toEqual({
-        queuedBytes: 0,
-        lostBytes: 0,
-        lostEntries: 0,
-        degraded: 0,
-      });
-    });
-
-    test('sweeps nothing and says so', () => {
-      const sink = make();
-      expect(sink.maintain(1000)).toEqual({
-        queuedBytes: 0,
-        lostBytes: 0,
-        lostEntries: 0,
-        degraded: 0,
-      });
-      // The sweep belongs to whoever holds the writer now. It must not run.
-      expect(sink.maintainCalls).toEqual([1000]);
-    });
-
-    test('has finished collecting, with nothing to collect', () => {
-      const outcome = make().collectLogs(1000, 1_000_000);
-
-      expect(outcome.path).toBe('');
-      expect(outcome.byteCount).toBe(0);
-      // The row that matters: `true`. A support flow that treated this as a
-      // failure would show an error for an app that simply has no logs yet.
-      expect(outcome.complete).toBe(true);
-      expect(outcome.truncated).toBe(false);
-    });
-
-    test(`flushes without draining, durable=${vacuous}`, () => {
-      const outcome = make().flush(1000);
-
-      expect(outcome.durable).toBe(vacuous);
-      expect(outcome.timedOut).toBe(false);
-      expect(outcome.pendingBytes).toBe(0);
-    });
-
-    test('closes idempotently, with the same answer', () => {
-      const sink = make();
-      const first = sink.close(1000);
-      const second = sink.close(1000);
-
-      expect(second).toEqual(first);
-      expect(second.durable).toBe(vacuous);
-    });
-
-    test(`purges vacuously=${vacuous}, attempting nothing`, () => {
-      const outcome = make().clearLogs(1000);
-
-      expect(outcome.durable).toBe(vacuous);
-      expect(outcome.deletedCount).toBe(0);
-      // Nothing was attempted, so nothing failed. A path here reports a
-      // deletion failure for a file no one tried to delete.
-      expect(outcome.failedPaths).toEqual([]);
-      // Nothing to rebind onto, whichever side of the bit this is.
-      expect(outcome.rebound).toBe(false);
-    });
-  });
-
   /**
-   * Closing releases a handle. It does not delete files, and the paths have to
-   * keep coming back — `[]` from a closed sink tells a support-upload flow
-   * there is nothing to collect over logs still sitting on the device.
+   * The table's `getLogFilePaths` row pins a *count*, because the natives
+   * enumerate a real directory and a literal path is not portable across the
+   * three targets. A count alone would let a closed double hand back one
+   * entirely wrong path, so the identity of the path stays asserted here.
    */
-  test('a closed sink still lists what it left behind', () => {
+  test('a closed sink still lists exactly what it left behind', () => {
     expect(openedThenClosed().getLogFilePaths()).toEqual([
       '/memory/logs/app.log',
     ]);
     expect(neverOpened().getLogFilePaths()).toEqual([]);
   });
 
-  test('and lists archives when a test stages them', () => {
+  test('lists archives when a test stages them', () => {
     const sink = openedThenClosed();
     sink.artifactPaths = [
       '/memory/logs/app.log',
