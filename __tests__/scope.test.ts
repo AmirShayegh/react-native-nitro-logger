@@ -248,4 +248,54 @@ describe('ScopedLogger.log — options rather than positionals', () => {
       correlation: 'owned',
     });
   });
+
+  /**
+   * The call-site twin of this lives in `logger.test.ts`, and it does not
+   * cover this path.
+   *
+   * Scope metadata is snapshotted at construction by `safeSnapshotMetadata`,
+   * which builds its own null-prototype object; call-site metadata is never
+   * snapshotted and reaches `redactMetadata` directly. Two objects, two
+   * `Object.create(null)` calls, and only one of them was pinned — so a plain
+   * `{}` here would route `__proto__` through the legacy setter on
+   * `Object.prototype`, silently losing the value and letting a caller reshape
+   * the snapshot every later message is built from.
+   */
+  test('a __proto__ key in scope metadata is stored as data, not routed to a setter', () => {
+    const { logger, dest } = makeLogger();
+    // `JSON.parse`, not a literal: an object literal's `__proto__` is the
+    // prototype-setting form and would never become an own property, so the
+    // test would be staging a case the hazard does not arise from.
+    const hostile = JSON.parse(
+      '{"__proto__":"value","ok":"yes"}'
+    ) as LogMetadata;
+    const scope = logger.scoped('s', undefined, hostile);
+
+    scope.info('m');
+    const metadata = dest.entries[0]!.metadata!;
+
+    expect(Object.keys(metadata).sort()).toEqual(['__proto__', 'ok']);
+    // An own data property, and specifically not something reached through the
+    // prototype chain.
+    expect(Object.getOwnPropertyDescriptor(metadata, '__proto__')?.value).toBe(
+      'value'
+    );
+    // And the snapshot did not become somebody's prototype.
+    expect(Object.getPrototypeOf(metadata)).toBe(null);
+  });
+
+  test('the scope snapshot is taken at construction, not read at emit', () => {
+    const { logger, dest } = makeLogger();
+    const live: LogMetadata = { state: 'running' };
+    const scope = logger.scoped('s', undefined, live);
+
+    // The caller still owns the object it passed and may keep using it. A
+    // scope that read it at emit would let a mutation after construction
+    // change what every earlier-configured message carries — and would re-run
+    // getters that were already read once.
+    live.state = 'mutated';
+    scope.info('m');
+
+    expect(dest.entries[0]!.metadata).toEqual({ state: 'running' });
+  });
 });

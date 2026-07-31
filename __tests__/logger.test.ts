@@ -1,4 +1,5 @@
 import { Logger } from '../src/Logger';
+import { ConsoleDestination } from '../src/destinations/ConsoleDestination';
 import { TestDestination } from './helpers/TestDestination';
 import type { LogDestination } from '../src/destinations/types';
 import type { LogLevel } from '../src/types';
@@ -744,5 +745,166 @@ describe('Logger.destinations', () => {
       .addDestination(new TestDestination('b'));
     logger.removeDestination('a');
     expect(logger.destinations()).toEqual([{ label: 'b', enabled: true }]);
+  });
+});
+
+/**
+ * The auto-disable threshold, approached from both sides and from both
+ * readings of "five failures".
+ *
+ * The block above drives destinations past the limit with a deliberately
+ * round six, which is the right shape for tests about what a *disabled*
+ * destination does and the wrong one for tests about where the line is. Six
+ * failures disable a destination whether the threshold is the fifth or the
+ * sixth, and whether the policy counts consecutive failures or cumulative
+ * ones — so none of those distinctions is pinned by it.
+ */
+describe('Logger — the auto-disable policy', () => {
+  /** Silences the fixed warning the threshold emits, and restores after. */
+  function quietly(body: () => void): void {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      body();
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  test('four consecutive failures leave it enabled; the fifth disables it', () => {
+    quietly(() => {
+      const logger = makeLogger();
+      const bad = new TestDestination('bad');
+      bad.throwOnWrite = true;
+      logger.addDestination(bad);
+
+      for (let i = 0; i < 4; i += 1) logger.info(`f${i}`);
+      // Both sides, in one test, because either alone is satisfied by an
+      // off-by-one in the direction it does not check.
+      expect(logger.destinations()[0]!.enabled).toBe(true);
+
+      logger.info('the fifth');
+      expect(logger.destinations()[0]!.enabled).toBe(false);
+    });
+  });
+
+  test('a success between failures resets the count — consecutive, not cumulative', () => {
+    quietly(() => {
+      const logger = makeLogger();
+      const bad = new TestDestination('bad');
+      logger.addDestination(bad);
+
+      // Four failures, one success, four more. Eight failures in total, and
+      // never five in a row.
+      for (let round = 0; round < 2; round += 1) {
+        bad.throwOnWrite = true;
+        for (let i = 0; i < 4; i += 1) logger.info('fails');
+        bad.throwOnWrite = false;
+        logger.info('lands');
+      }
+
+      // A cumulative counter would have cut this destination off during the
+      // second round. The policy is that a destination which is working again
+      // has stopped failing, and only an unbroken run means it is gone.
+      expect(logger.destinations()[0]!.enabled).toBe(true);
+      expect(bad.messages).toEqual(['lands', 'lands']);
+    });
+  });
+
+  test('a failing eligibility getter counts toward the same threshold', () => {
+    quietly(() => {
+      const logger = makeLogger();
+      const hostile = new TestDestination('hostile');
+      Object.defineProperty(hostile, 'isEnabled', {
+        get() {
+          throw new Error('scripted getter failure');
+        },
+      });
+      logger.addDestination(hostile);
+
+      // Never reaches `write`, so this is the other call site of the counter.
+      // A policy that only counted write failures would leave a destination
+      // whose getter throws every time enabled forever.
+      for (let i = 0; i < 4; i += 1) logger.info(`f${i}`);
+      expect(logger.destinations()[0]!.enabled).toBe(true);
+
+      logger.info('the fifth');
+      expect(logger.destinations()[0]!.enabled).toBe(false);
+    });
+  });
+
+  test('a disabled destination stops being written to at all', () => {
+    quietly(() => {
+      const logger = makeLogger();
+      const bad = new TestDestination('bad');
+      bad.throwOnWrite = true;
+      logger.addDestination(bad);
+      for (let i = 0; i < 5; i += 1) logger.info('fails');
+      expect(logger.destinations()[0]!.enabled).toBe(false);
+
+      // The point of cutting it off. `enabled: false` that still called
+      // `write` on every record would cost exactly what the breaker exists to
+      // save, and the count above would go on climbing.
+      bad.throwOnWrite = false;
+      logger.info('after the cutoff');
+      expect(bad.messages).toEqual([]);
+    });
+  });
+});
+
+describe('Logger.consoleLogging', () => {
+  /**
+   * The default `console` destination this suite's `makeLogger` removes.
+   *
+   * `consoleLogging` reaches only `ConsoleDestination` instances, so a test
+   * driving it needs a real one; `TestDestination` would be silently skipped
+   * and every assertion below would pass against a method that does nothing.
+   */
+  function withConsole() {
+    const logger = new Logger();
+    const printed: string[] = [];
+    const console2 = new ConsoleDestination();
+    console2.outputSink = (line) => printed.push(line);
+    logger.removeDestination('console').addDestination(console2);
+    return { logger, console2, printed };
+  }
+
+  test('it is fluent, and toggles printing on the console destination', () => {
+    const { logger, console2 } = withConsole();
+
+    expect(logger.consoleLogging(false)).toBe(logger);
+    expect(console2.printEnabled).toBe(false);
+    expect(logger.consoleLogging(true)).toBe(logger);
+    expect(console2.printEnabled).toBe(true);
+  });
+
+  test('a test sink keeps receiving lines while printing is off', () => {
+    const { logger, printed } = withConsole();
+    logger.consoleLogging(false);
+
+    logger.info('still captured');
+
+    // The documented split: turning printing off silences the platform
+    // console, not the destination. A sink that went quiet too would make the
+    // toggle unusable in the tests that rely on it.
+    expect(printed).toHaveLength(1);
+    expect(printed[0]).toContain('still captured');
+  });
+
+  test('it leaves destinations that are not consoles alone', () => {
+    const { logger } = withConsole();
+    const file = new TestDestination('file');
+    logger.addDestination(file);
+
+    logger.consoleLogging(false);
+
+    // Asserted on the property, not on the messages. A toggle that dropped the
+    // `instanceof` guard and assigned to every destination would leave this one
+    // delivering anyway — nothing here reads `printEnabled` — so a
+    // messages-only assertion passes against exactly the mutant it looks like
+    // it is catching. What is wrong with that mutant is that it writes a field
+    // it does not own onto an object it does not understand.
+    expect('printEnabled' in file).toBe(false);
+    logger.info('to the file');
+    expect(file.messages).toEqual(['to the file']);
   });
 });
