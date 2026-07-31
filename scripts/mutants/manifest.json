@@ -141,6 +141,16 @@
       }
     },
     {
+      "id": "P4-catalog-admits-invalid-key",
+      "patch": "P4-catalog-admits-invalid-key.patch",
+      "target": "src/privacy.ts",
+      "claim": "buildCatalog is fail-closed, so catalog membership implies the key rule \u2014 which is what lets redaction skip the regex for a catalogued key.",
+      "expect_red": {
+        "suite": "__tests__/privacy.test.ts",
+        "test": "a rejected key never reaches an entry, catalog or not"
+      }
+    },
+    {
       "id": "E1-factory-binding-silenced",
       "patch": "E1-factory-binding-silenced.patch",
       "target": "eslint-plugin/shared.js",

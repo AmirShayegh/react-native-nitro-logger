@@ -344,8 +344,28 @@ function admitKey(
   requireCatalog: boolean,
   settings: PrivacySettings
 ): boolean {
-  if (key === DROPPED_COUNT_KEY || !isValidMetadataKey(key)) return false;
-  if (catalog !== undefined ? !catalog.has(key) : requireCatalog) return false;
+  // The reserved key first, always: it satisfies the key rule and could sit
+  // in a catalog, so no later branch may be reached with it.
+  if (key === DROPPED_COUNT_KEY) return false;
+
+  if (catalog !== undefined) {
+    // Membership IS the key check. `buildCatalog` is fail-closed — one entry
+    // that fails the rule empties the whole catalog — and `metadataKeyCatalog`
+    // only ever intersects, so a key that is in a catalog has already passed
+    // `isValidMetadataKey`. Re-testing it here is a second evaluation of a
+    // regex against a string that provably matches.
+    //
+    // That "provably" is load-bearing, and it is pinned rather than assumed:
+    // `privacy.test.ts` asserts the invariant directly, and
+    // `scripts/mutants/P4-catalog-admits-invalid-key.patch` makes
+    // `buildCatalog` skip bad entries instead of emptying — the exact future
+    // edit that would let an unapproved key reach a log with no regex left
+    // to stop it — and the suite has to catch it.
+    if (!catalog.has(key)) return false;
+  } else {
+    if (requireCatalog) return false;
+    if (!isValidMetadataKey(key)) return false;
+  }
 
   // Only now — after the key has earned it — is the value touched.
   let raw: unknown;

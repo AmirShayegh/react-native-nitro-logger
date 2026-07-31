@@ -321,3 +321,68 @@ describe('privacy markers', () => {
     });
   });
 });
+
+/**
+ * Catalog membership implies the key rule — the invariant redaction now
+ * relies on, pinned so it cannot quietly stop being true.
+ *
+ * Since 0.4.0 a key found in a configured catalog is admitted WITHOUT
+ * re-testing it against `METADATA_KEY_PATTERN`, because `buildCatalog` is
+ * fail-closed: one entry that fails the rule empties the whole catalog, and
+ * `metadataKeyCatalog` only ever intersects, so nothing invalid can be in
+ * there to find. That is a real property of the current code and a
+ * completely reasonable thing for a future edit to break — "skip the bad
+ * entry instead of throwing away fifty good ones" is an obvious kindness
+ * that would put an unapproved key into the catalog with no regex left
+ * downstream to stop it.
+ *
+ * So the invariant is asserted directly here, and
+ * `scripts/mutants/P4-catalog-admits-invalid-key.patch` makes exactly that
+ * edit and requires this suite to notice.
+ */
+describe('the metadata key catalog cannot hold a key the rule rejects', () => {
+  const REJECTED = [
+    'has space',
+    'sql;drop',
+    '',
+    'x'.repeat(65),
+    'emoji\u{1F600}',
+    'semi:colon',
+    'slash/slash',
+    'new\nline',
+  ];
+
+  for (const bad of REJECTED) {
+    test(`one rejected entry (${JSON.stringify(bad)}) approves nothing`, () => {
+      globalThis.__DEV__ = false;
+      const { logger, dest } = makeLogger();
+      logger.metadataKeyCatalog(['good', bad, 'alsoGood']);
+      logger.info('m', { good: 'x', alsoGood: 'y' });
+      // Fail-closed: the whole catalog is empty, so even the valid keys drop.
+      expect(md(dest)).toEqual({ [DROPPED_COUNT_KEY]: 2 });
+    });
+  }
+
+  test('a rejected key never reaches an entry, catalog or not', () => {
+    globalThis.__DEV__ = false;
+    const { logger, dest } = makeLogger();
+    // The catalog names it explicitly. It must still not appear: either the
+    // catalog is empty (today) or the key rule stops it (if that ever
+    // changes) — but never both absent.
+    logger.metadataKeyCatalog(['ok', 'has space']);
+    logger.info('m', { 'ok': 'kept?', 'has space': 'must never appear' });
+    const rendered = JSON.stringify(md(dest));
+    expect(rendered).not.toContain('has space');
+    expect(rendered).not.toContain('must never appear');
+  });
+
+  test('an intersection cannot introduce a key neither call approved', () => {
+    globalThis.__DEV__ = false;
+    const { logger, dest } = makeLogger();
+    logger.metadataKeyCatalog(['a', 'b']);
+    logger.metadataKeyCatalog(['b', 'c']);
+    logger.info('m', { a: 1, b: 2, c: 3 });
+    // Only the overlap survives; a and c are dropped and counted.
+    expect(md(dest)).toEqual({ b: 2, [DROPPED_COUNT_KEY]: 2 });
+  });
+});
