@@ -85,12 +85,34 @@ unit compiled into both platforms' binaries, so iOS and Android cannot disagree
 about which methods a prototype has. Construction is unaffected —
 `NitroModules.createHybridObject('FileSink')` passes a name and nothing else,
 with no JS-side spec to check a shape against, and TypeScript types are erased
-by then. So a 0.2 binary yields a working sink whose prototype simply has no
-`deleteSupportBundle`; the call fails at invocation, inside the wrapper's own
-`try`, and the caller gets `false`. **What was not done: an on-device run of 0.3
-JavaScript against separately built 0.2 iOS and Android binaries.** The above is
-read off the generated registration code and nitro-modules 0.36.3's runtime, not
-measured on a device, and it is recorded that way rather than as a tested
-guarantee.
+by then. So a 0.2 binary should yield a working sink whose prototype simply has no
+`deleteSupportBundle`; the call should fail at invocation, inside the wrapper's
+own `try`, and the caller should get `false`.
 
-Floors: JS 976 → 985, Swift 214 → 221, Kotlin 209 → 215.
+**That is now measured rather than reasoned.** Both platforms were run with 0.3
+JavaScript over a native binary built from the `react-native-nitro-logger@0.2.0`
+tag — a pristine consumer app on RN 0.85, the library installed from a 0.2.0
+`yarn pack` tarball, and the run refused to start unless the compiled spec did
+*not* register the method and the JavaScript about to load *did* contain the
+wrapper. The probe made three calls: construct, invoke the missing method, and
+then a method 0.2 does register, the last of these as a control so that "the
+call failed" could not be satisfied by a sink that never worked at all.
+
+| | construct | `deleteSupportBundle` | control |
+| --- | --- | --- | --- |
+| iOS | ok | returned `false` | flush durable, 1 file |
+| Android | ok | returned `false` | flush durable, 1 file |
+
+Identical on both, which is what the shared `HybridFileSinkSpec.cpp` predicted.
+The delivery differed by platform and is worth stating: iOS ran a Release build
+with `main.jsbundle` replaced inside the built `.app`, Android a Debug build
+with Metro serving the new JavaScript. Neither rebuilt native code.
+
+Two things this does not say. It is a statement about the **native** boundary
+only — 0.3 also carries four breaking JavaScript changes, listed above, so an
+app shipping 0.3 JS over a 0.2 binary still has to fix its own call sites, and
+the preflight caught exactly that when its first probe imported `createFileSink`
+from the root export 0.3 removed. And it is one nitro-modules version (0.36.3)
+on one RN version (0.85.0) on a simulator and an emulator; a different Nitro
+could resolve an unregistered method differently, and nothing here constrains
+that.
