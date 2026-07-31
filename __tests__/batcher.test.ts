@@ -971,3 +971,120 @@ describe('Batcher.add — a caller-supplied byte count', () => {
     expect(other.batcher.unreported()).toEqual(batcher.unreported());
   });
 });
+
+/**
+ * What a nonsense option does, and what an absent one does.
+ *
+ * Every numeric option goes through one guard that takes anything not a
+ * finite positive number and substitutes the default. Nothing exercised it,
+ * which mattered most in one direction: a cap of `0` — from a config file, a
+ * division, a `parseInt` of an empty string — would otherwise be honoured, and
+ * a batcher whose pending cap is zero accepts no records at all. Logging would
+ * stop, silently, and the loss counters would be the only sign.
+ */
+describe('Batcher — option validation', () => {
+  /** A batcher with a working buffer accepts a record; a broken one does not. */
+  function accepts(overrides: Partial<BatcherOptions>): boolean {
+    const { batcher } = build({ batchBytes: 1024, ...overrides });
+    batcher.add(record(10));
+    return batcher.bufferedBytes() > 0;
+  }
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('a %s pending-entry cap falls back to the default', (_name, value) => {
+    // Infinity is in here for a different reason from the rest: it is not a
+    // usable cap either, and accepting it would remove the bound entirely
+    // rather than disable the buffer.
+    expect(accepts({ maxPendingEntries: value })).toBe(true);
+  });
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+  ])('a %s pending-byte cap falls back to the default', (_name, value) => {
+    expect(accepts({ maxPendingBytes: value })).toBe(true);
+  });
+
+  test('a fractional cap is floored rather than rejected', () => {
+    // 2.9 is a usable count, unlike the values above — it is just not an
+    // integer. Flooring keeps the caller's intent; falling back to 1000 would
+    // discard a bound they asked for.
+    const { batcher } = build({ maxPendingEntries: 2.9, batchBytes: 100_000 });
+    batcher.add(record(1));
+    batcher.add(record(1));
+    batcher.add(record(1));
+
+    // The third is refused, so the cap was 2 and not 3.
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 2 });
+  });
+
+  test('the defaults are the documented ones', () => {
+    const { batcher, sink } = build({
+      batchBytes: undefined,
+      flushIntervalMs: undefined,
+      watermarkBytes: undefined,
+    });
+
+    // 4096 is the documented batch threshold. 40 records of 101 bytes is
+    // 4040 — under it — and the forty-first crosses.
+    for (let i = 0; i < 40; i += 1) batcher.add(record(100));
+    expect(sink.appendCalls).toHaveLength(0);
+    batcher.add(record(100));
+    expect(sink.appendCalls).toHaveLength(1);
+  });
+});
+
+/**
+ * Sink counters are monotonic per handle, and this is what happens when one
+ * says otherwise.
+ *
+ * The sink is across a bridge. A counter that goes backwards, arrives
+ * negative, or arrives as `NaN` is a bug somewhere this code cannot see, and
+ * the batcher's job is to stay arithmetically sane rather than to trust it —
+ * a delta driven negative would cancel a real loss and a notice that was owed
+ * would never be written.
+ */
+describe('Batcher — hostile sink counters', () => {
+  test('a counter that goes backwards does not shrink a loss already seen', () => {
+    const { batcher, sink, writer } = build({ batchBytes: 1024 });
+    writer.injectLoss(sink.id, 5, 500);
+    batcher.observeStatus(sink.getStatus());
+    expect(batcher.unreported()).toEqual({ entries: 5, bytes: 500 });
+
+    // The sink now claims it only ever lost one. Nothing acknowledged the five
+    // — no notice has been written — so this is a live loss being revised
+    // downwards, and the maximum-seen rule is what refuses the revision.
+    //
+    // Deliberately observed while the loss is still owed rather than after a
+    // notice settles it: once it is acknowledged, `delta()`'s own `Math.max(0,
+    // …)` floors the result at zero either way, and a test written that way
+    // cannot tell the two rules apart — which is how the first draft of this
+    // one passed against a plain assignment.
+    sink.hostileStatus = { lostEntries: 1, lostBytes: 100 };
+    batcher.observeStatus(sink.getStatus());
+
+    expect(batcher.unreported()).toEqual({ entries: 5, bytes: 500 });
+  });
+
+  test('NaN and negative counters are read as zero, not propagated', () => {
+    const { batcher, sink } = build({ batchBytes: 1024 });
+    sink.hostileStatus = {
+      lostEntries: Number.NaN,
+      lostBytes: -50,
+      degraded: Number.NaN,
+    };
+
+    batcher.add(record(10));
+    batcher.flush(1000);
+
+    // A NaN that reached the counters would make every later comparison false
+    // and every reported number NaN — including the one an app alerts on.
+    expect(batcher.unreported()).toEqual({ entries: 0, bytes: 0 });
+    expect(batcher.degradation()).toBe(0);
+  });
+});
