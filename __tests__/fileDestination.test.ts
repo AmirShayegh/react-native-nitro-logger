@@ -579,6 +579,64 @@ describe('FileDestination — oversized entries', () => {
     ).toBeGreaterThan(5000);
   });
 
+  /**
+   * The size that travels to the batcher is the size of what it is given.
+   *
+   * `write` now hands the batcher the byte count rendering already computed,
+   * so the count is not measured twice per record. The trap is on this path:
+   * the string that reaches the batcher on an oversize entry is the *notice*,
+   * a couple of hundred bytes, while the number in scope a line earlier is the
+   * five-kilobyte entry that caused it. Handing over that number would inflate
+   * the batcher's pending total by twenty times per oversize record, which
+   * would then flush early, refuse records it had room for, and report a
+   * buffered figure that matches nothing on disk.
+   *
+   * Buffered bytes are the assertion because they are the batcher's own
+   * arithmetic — the one number that comes from what it was told rather than
+   * from what it can see.
+   */
+  test('an oversize entry buffers the notice size, not the entry size', () => {
+    // `maxPendingBytes` is the instrument: 1000 is roomy for the notice, which
+    // fits inside `maxEntryBytes` by construction, and far too small for the
+    // 5 KB entry. So if the entry's size were the number handed over, the
+    // batcher would believe its buffer had just overflowed and drop the notice
+    // — and the file would end up with nothing in it at all.
+    const { destination, writer } = build({
+      maxEntryBytes: 220,
+      maxPendingBytes: 1000,
+    });
+    destination.write(
+      entry({ message: 'x'.repeat(5000), correlation: 'c'.repeat(300) })
+    );
+    destination.flush(1000);
+
+    const [written] = records(writer);
+    expect(written!.message).toBe('a log entry was too large to record');
+    // One loss — the entry — not two.
+    expect(destination.unreportedLoss().entries).toBe(0);
+  });
+
+  test('a shortened entry buffers its shortened size', () => {
+    // The same hazard one branch over: `formatWithin` got under the limit, so
+    // what reaches the batcher is the shortened record — not the original that
+    // was measured before shortening was attempted.
+    const { destination, writer } = build({
+      maxEntryBytes: 400,
+      maxPendingBytes: 1000,
+    });
+    destination.write(entry({ message: 'x'.repeat(5000) }));
+    destination.flush(1000);
+
+    // Asserting on the CONTENT, not the line count. Overstate the size and the
+    // batcher drops the record as an overflow — then writes a loss notice
+    // about it, which is also one line and also parses. A count would be
+    // satisfied by exactly the failure this test exists to catch.
+    const written = records(writer);
+    expect(written).toHaveLength(1);
+    expect(written[0]!.message).toMatch(/^x+/);
+    expect(destination.unreportedLoss()).toEqual({ entries: 0, bytes: 0 });
+  });
+
   test('an entry inside the limit is left exactly alone', () => {
     const { destination, writer } = build({ maxEntryBytes: 64 * 1024 });
     destination.write(entry({ message: 'small' }));

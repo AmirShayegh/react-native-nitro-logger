@@ -172,6 +172,22 @@ const LOSS_MESSAGE = 'log entries were dropped';
 const OVERSIZE_MESSAGE = 'a log entry was too large to record';
 
 /**
+ * A record and the size of *that* record.
+ *
+ * Not exported: this is how rendering hands its own measurement forward so the
+ * batcher does not repeat it, and the pair exists only because the two things
+ * must not be separated. `bytes` always describes `record` — never an earlier
+ * string that rendering looked at and rejected on the way to it.
+ *
+ * Excludes the newline the batcher frames records with, which is the batcher's
+ * to add and therefore the batcher's to count.
+ */
+interface Rendered {
+  readonly record: string;
+  readonly bytes: number;
+}
+
+/**
  * Writes formatted records to a native file sink, batched and backpressured.
  *
  * The division of labour is the whole design: this side decides what to write
@@ -264,9 +280,12 @@ export class FileDestination implements LogDestination {
 
   write(entry: LogEntry): void {
     if (!this.isEnabled) return;
-    const record = this.renderRecord(entry);
-    if (record === undefined) return;
-    this.batcher.add(record);
+    const rendered = this.renderRecord(entry);
+    if (rendered === undefined) return;
+    // The byte count travels with the record. Enforcing `maxEntryBytes` means
+    // this side has already measured whatever it is handing over, and letting
+    // the batcher measure it again is a second full pass over every record.
+    this.batcher.add(rendered.record, rendered.bytes);
   }
 
   /**
@@ -548,8 +567,16 @@ export class FileDestination implements LogDestination {
    * Returns undefined when nothing writable came out; the loss is recorded
    * before returning, so an entry is either in the file or in the counters
    * and never in neither.
+   *
+   * The byte count comes back **with** the record, and it is the count of the
+   * record being returned — never of the one that was measured on the way to
+   * it. That distinction is the whole reason this returns a pair rather than
+   * letting the caller reuse `bytes`: on the oversize path the returned string
+   * is a notice, a different and much shorter string than the entry whose size
+   * put it there, and handing the batcher the original number would inflate
+   * every pending-byte total in the pipeline.
    */
-  private renderRecord(entry: LogEntry): string | undefined {
+  private renderRecord(entry: LogEntry): Rendered | undefined {
     const record = this.formatOrUndefined(entry);
     if (record === undefined) {
       this.batcher.noteLoss(1, 0);
@@ -561,15 +588,18 @@ export class FileDestination implements LogDestination {
     // counters and the notice have to carry — not the size of whatever
     // undersized floor the formatter came back with instead.
     const bytes = utf8Length(record);
-    if (bytes <= this.maxEntryBytes) return record;
+    if (bytes <= this.maxEntryBytes) return { record, bytes };
 
     // Structural shedding first: a formatter that knows its own shape can
     // drop whole fields and truncate one at code-point boundaries, and what
     // comes back is still valid in that format.
     if (this.formatter.formatWithin) {
       const shorter = this.formatWithinOrUndefined(entry);
-      if (shorter !== undefined && utf8Length(shorter) <= this.maxEntryBytes) {
-        return shorter;
+      if (shorter !== undefined) {
+        const shorterBytes = utf8Length(shorter);
+        if (shorterBytes <= this.maxEntryBytes) {
+          return { record: shorter, bytes: shorterBytes };
+        }
       }
       // Still over: a record has a floor below which it identifies nothing.
     }
@@ -583,12 +613,17 @@ export class FileDestination implements LogDestination {
   }
 
   private renderLossNotice(lost: LossCounts): string | undefined {
+    // A string, not a `Rendered`, and nothing is lost by that: a loss notice
+    // goes straight into an outgoing batch rather than into the pending
+    // buffer, so no byte count is ever wanted for it. `renderNotice` is also a
+    // public `BatcherOptions` field, and widening its return type would be a
+    // break bought for nothing.
     return this.boundedNotice(
       noticeEntry(Date.now(), LOSS_MESSAGE, {
         droppedEntries: lost.entries,
         droppedBytes: lost.bytes,
       })
-    );
+    )?.record;
   }
 
   /**
@@ -601,14 +636,18 @@ export class FileDestination implements LogDestination {
    * diagnostics jamming the pipeline. Returning undefined when nothing fits
    * leaves the loss counted and owed, which is the honest outcome.
    */
-  private boundedNotice(entry: LogEntry): string | undefined {
+  private boundedNotice(entry: LogEntry): Rendered | undefined {
     const text = this.formatOrUndefined(entry);
     if (text === undefined) return undefined;
-    if (utf8Length(text) <= this.maxEntryBytes) return text;
+    const bytes = utf8Length(text);
+    if (bytes <= this.maxEntryBytes) return { record: text, bytes };
     if (this.formatter.formatWithin) {
       const shorter = this.formatWithinOrUndefined(entry);
-      if (shorter !== undefined && utf8Length(shorter) <= this.maxEntryBytes) {
-        return shorter;
+      if (shorter !== undefined) {
+        const shorterBytes = utf8Length(shorter);
+        if (shorterBytes <= this.maxEntryBytes) {
+          return { record: shorter, bytes: shorterBytes };
+        }
       }
     }
     return undefined;

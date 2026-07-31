@@ -875,3 +875,99 @@ describe('Batcher — conservation', () => {
     conserves(seed);
   });
 });
+
+/**
+ * `add(record, bytes)` and `add(record)` must be the same call.
+ *
+ * The second argument is an optimisation: the caller that rendered a record
+ * has already measured it, and letting the batcher measure it again is a
+ * second full pass over every record that reaches the file. An optimisation
+ * that changes an answer is a bug, so every assertion here is a differential
+ * one — the same input driven both ways, compared on what the batcher does
+ * rather than on what it was told.
+ *
+ * ## What these do NOT prove
+ *
+ * **That it is faster.** Nothing here times anything. The claim being defended
+ * is only that taking the shortcut cannot change the outcome; whether the
+ * shortcut is worth taking is a judgement about how often `write` runs, not
+ * something a test can settle.
+ */
+describe('Batcher.add — a caller-supplied byte count', () => {
+  /** Everything observable about a batcher after the same records went in. */
+  function drive(
+    texts: readonly string[],
+    supply: (text: string) => number | undefined
+  ) {
+    const { batcher, sink, writer } = build({ batchBytes: 1024 });
+    for (const text of texts) batcher.add(text, supply(text));
+    const buffered = batcher.bufferedBytes();
+    batcher.flush(1000);
+    return {
+      buffered,
+      lines: writer.lines(),
+      unreported: batcher.unreported(),
+      appended: sink.appendCalls.map((call) => call.entryCount),
+    };
+  }
+
+  const CORPUS = [
+    'plain ascii record',
+    '',
+    'a',
+    'naïve café résumé',
+    '日本語のログ',
+    '🙂 emoji at the front',
+    'emoji at the back 🙂',
+    'a🙂b',
+    // A lone high surrogate: three bytes, and the character after it still
+    // counts. This is the input a naive counter gets wrong.
+    'torn \ud83d tail',
+    '\ude42 lone low',
+    `${'x'.repeat(2000)}🙂`,
+  ];
+
+  test('supplying the count changes nothing about the outcome', () => {
+    const measured = drive(CORPUS, (text) => utf8Length(text));
+    const unmeasured = drive(CORPUS, () => undefined);
+    expect(measured).toEqual(unmeasured);
+  });
+
+  test('a count that cannot be a length at all is recomputed', () => {
+    // Note what this does NOT say: that a wrong count is caught. `add(r, 1)`
+    // for a ten-byte record is trusted, and has to be — detecting it would
+    // mean measuring, which is the whole thing being avoided. What the guard
+    // rejects is a value that is not a length in the first place, so nonsense
+    // cannot propagate into the pending total from a mis-typed call site.
+    const honest = drive(CORPUS, () => undefined);
+    for (const impossible of [
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 2,
+    ]) {
+      expect(drive(CORPUS, () => impossible)).toEqual(honest);
+    }
+  });
+
+  test('a count of zero is honoured, because zero is a real length', () => {
+    // The guard rejects what is not a usable count. Zero IS one — an empty
+    // record is a newline — so it must not be swept up with the nonsense
+    // above and silently recomputed.
+    const { batcher } = build({ batchBytes: 1024 });
+    batcher.add('', 0);
+    expect(batcher.bufferedBytes()).toBe(1);
+  });
+
+  test('a dropped record is still counted with the supplied size', () => {
+    const { batcher } = build({ maxPendingBytes: 8, batchBytes: 1024 });
+    const text = '🙂🙂🙂🙂'; // 16 bytes, over the pending cap
+    batcher.add(text, utf8Length(text));
+    expect(batcher.unreported()).toEqual({ entries: 1, bytes: 17 });
+
+    const other = build({ maxPendingBytes: 8, batchBytes: 1024 });
+    other.batcher.add(text);
+    expect(other.batcher.unreported()).toEqual(batcher.unreported());
+  });
+});

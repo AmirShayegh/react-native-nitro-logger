@@ -10,10 +10,24 @@
  * An unpaired surrogate counts as 3, matching every standard encoder: it has
  * no UTF-8 form of its own, so encoders substitute U+FFFD, which is three
  * bytes.
+ *
+ * The leading run of ASCII is counted by *skipping* it rather than by adding
+ * one per character. Log text is overwhelmingly ASCII — level tags, timestamps,
+ * subsystem names, metadata keys, and most messages — and this function runs
+ * once per record per destination, so the common case is worth a cheaper loop.
+ * Where the scan stops, the general loop resumes from exactly that index with
+ * the count already correct, which is what makes this byte-neutral rather than
+ * an approximation: the SwiftLogger golden fixtures run unchanged as the proof.
  */
 export function utf8Length(text: string): number {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i += 1) {
+  const length = text.length;
+
+  let i = 0;
+  while (i < length && text.charCodeAt(i) < 0x80) i += 1;
+  if (i === length) return length;
+
+  let bytes = i;
+  for (; i < length; i += 1) {
     const code = text.charCodeAt(i);
     if (code < 0x80) {
       bytes += 1;

@@ -211,13 +211,39 @@ export class Batcher {
    * Buffer one formatted record. Never performs I/O beyond handing a full
    * batch to the sink, and never throws: a logging call must not fail the
    * code that made it.
+   *
+   * `recordBytes` is the record's own UTF-8 length, **without** the framing
+   * newline this adds. It is an optimisation and nothing else: the caller that
+   * rendered the record has usually just measured it — `FileDestination` must,
+   * to enforce `maxEntryBytes` — and measuring it a second time here is a full
+   * second pass over every record that reaches the file. Omit it and this
+   * measures for itself; the answer is identical either way, which is what the
+   * differential test in `batcher.test.ts` pins.
+   *
+   * **A supplied count is trusted, and the check below does not change that.**
+   * It rejects what cannot be a length at all — a fraction, a negative, a
+   * `NaN`, a number past `Number.MAX_SAFE_INTEGER` — and recomputes instead of
+   * propagating nonsense into the pending total. It cannot tell that `1` is
+   * the wrong length for a ten-byte record, and nothing short of measuring
+   * could, which would be the optimisation undone. So the contract on this
+   * parameter is exact measurement or nothing: `FileDestination` is the only
+   * caller that supplies it, `utf8Length` is what it supplies, and a caller
+   * that passes a plausible wrong number gets a pending-byte total that drifts
+   * from what is actually buffered.
    */
-  add(record: string): void {
+  add(record: string, recordBytes?: number): void {
+    const measured =
+      recordBytes !== undefined &&
+      Number.isSafeInteger(recordBytes) &&
+      recordBytes >= 0
+        ? recordBytes
+        : utf8Length(record);
+    const bytes = measured + 1; // the record's own newline
+
     if (this.disposed || this.fenced) {
-      this.dropped(record);
+      this.dropped(record, bytes);
       return;
     }
-    const bytes = utf8Length(record) + 1; // the record's own newline
     if (
       this.pending.length >= this.maxPendingEntries ||
       this.pendingBytes + bytes > this.maxPendingBytes
