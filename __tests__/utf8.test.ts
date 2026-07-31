@@ -117,9 +117,10 @@ describe('utf8Length agrees with the platform encoder', () => {
   });
 
   test('a lone surrogate past the gate is found by the same rule', () => {
-    // The `u`-less regex matches code UNITS, so an unpaired surrogate is
-    // where ASCII stops — the same answer the charCodeAt loop gives. A `u`
-    // flag here would make the two paths disagree on exactly this input.
+    // An unpaired surrogate is a unit above 0x7F, so it is where ASCII stops
+    // for `search` exactly as it is for the charCodeAt loop, and the general
+    // loop resumes there and counts it as the three bytes of U+FFFD. Past the
+    // gate so this goes through the search handover rather than the prefix.
     for (const lone of ['\ud83d', '\ude42']) {
       const text = `${'a'.repeat(50)}${lone}${'b'.repeat(10)}`;
       expect(utf8Length(text)).toBe(reference(text));

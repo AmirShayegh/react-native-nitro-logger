@@ -28,12 +28,14 @@
 /**
  * The first unit that is not ASCII, for the engine to find instead of a loop.
  *
- * **No `u` flag, deliberately.** Without it this matches UTF-16 code UNITS,
- * which is what `charCodeAt` below iterates: a lone surrogate is one unit
- * above 0x7F and both agree it is where ASCII stopped. With `u` the pattern
- * would match code POINTS, and the two halves of this function would disagree
- * about a string containing an unpaired surrogate — the one input this file
- * has a whole describe block about.
+ * All it has to find is the first UTF-16 position holding a unit above 0x7F,
+ * which is exactly where the loop below would have stopped. No Unicode
+ * semantics are wanted or needed: `search` reports a code-UNIT index either
+ * way, so the handover index is the same whether or not the pattern is in
+ * Unicode mode — including for unpaired surrogates, which this file has a
+ * whole describe block about. The `u` flag is omitted because nothing here
+ * asks for it, and the surrogate cases in `__tests__/utf8.test.ts` are the
+ * executable guard on the equivalence rather than this paragraph.
  *
  * **The range starts at NUL, not at 0x20.** Control characters are ASCII and
  * encode as one byte each, and log text contains them — a tab in a message, a

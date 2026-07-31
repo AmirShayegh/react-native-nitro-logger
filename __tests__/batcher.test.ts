@@ -385,20 +385,21 @@ describe('Batcher — backpressure', () => {
   test('the loss notice rides on top of the batch budget, not inside it', () => {
     // `maxBatchBytes` bounds the RECORDS in a batch, and the consolidated loss
     // notice is appended after that loop has closed — its bytes never join
-    // `entryBytes`. So a batch can exceed the budget by one notice, which at
-    // the defaults is 256 KB of records plus up to 64 KB of notice.
+    // `entryBytes`. So the batch handed to the sink is up to the budget in
+    // records PLUS one rendered notice.
     //
     // That is deliberate headroom rather than an oversight, and this test is
     // where it stops being an undocumented one. The alternative — counting the
     // notice against the budget — would let a large enough notice starve the
     // records out of their own batch, which is the pipeline's diagnostics
-    // jamming the pipeline. The overshoot is bounded on both sides: the
-    // destination renders every notice under `maxEntryBytes`, and a sink that
-    // still cannot take the batch answers `full`, which sheds records.
+    // jamming the pipeline.
     //
-    // What is asserted is the bound, not merely that an overshoot happens:
-    // records within budget, the notice on top, and the excess exactly one
-    // notice wide.
+    // What is asserted is the general invariant, which is all `Batcher` can
+    // promise: records within budget, exactly one notice on top. How BIG that
+    // notice may be is the caller's, because `renderNotice` is caller-supplied
+    // and this class only asks for a non-empty string — `FileDestination` is
+    // what caps it at `maxEntryBytes`, giving the 320 KB ceiling that applies
+    // to that integration and not to this option in general.
     const { batcher, sink } = build({
       batchBytes: 1_000_000, // nothing pushes until the explicit flush
       maxBatchBytes: 50, // two 21-byte records fit, and no more

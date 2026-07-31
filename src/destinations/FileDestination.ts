@@ -82,13 +82,18 @@ export interface FileDestinationOptions {
    * Largest single rendered record, in UTF-8 bytes. Default 64 KB — roomy for
    * a stack trace, far under the sink's payload cap so a batch always fits.
    *
-   * It also bounds the batcher's OVERSHOOT of `maxBatchBytes`. A consolidated
-   * loss notice is rendered under this limit and then appended to a batch
-   * whose record budget is already spent, so the largest batch the sink can
-   * be handed is `maxBatchBytes + maxEntryBytes` — 320 KB at both defaults,
-   * not 256. Raising this raises that, which is the reason the two numbers
-   * are worth reading together. See `maxBatchBytes` in `Batcher.ts` for why
-   * the notice is not charged against the budget.
+   * It is also what bounds the batcher's OVERSHOOT of `maxBatchBytes` **for
+   * this destination**. A consolidated loss notice goes through the same
+   * `boundedNotice` limit as any record and is then appended to a batch whose
+   * record budget is already spent, so the largest batch this destination
+   * hands its sink is `maxBatchBytes + maxEntryBytes` — 320 KB at both
+   * defaults, not 256. Raising this raises that, which is why the two numbers
+   * are worth reading together.
+   *
+   * The bound comes from here, not from `Batcher`: that class takes
+   * `renderNotice` from its caller and does not police the result. See
+   * `maxBatchBytes` in `Batcher.ts` for why the notice is not charged against
+   * the record budget in the first place.
    */
   readonly maxEntryBytes?: number;
   readonly batchBytes?: number;

@@ -76,15 +76,25 @@ export interface BatcherOptions {
   /**
    * Largest single batch of RECORDS. Default 256 KB.
    *
-   * A consolidated loss notice is appended after this budget has been spent
-   * and does not count against it, so a batch handed to the sink can exceed
-   * this by the size of one notice — up to `maxEntryBytes` on the
-   * destination, 64 KB at its default. Deliberate: charging the notice
-   * against the same budget would let a large one starve the records out of
-   * their own batch, which is the pipeline's diagnostics jamming the
-   * pipeline. Bounded on both sides — the destination renders every notice
-   * under `maxEntryBytes`, and a sink that still cannot take the batch
-   * answers `full`, which sheds records until it fits.
+   * **Records only.** A consolidated loss notice is appended after this
+   * budget has been spent and does not count against it, so the batch handed
+   * to the sink is up to `maxBatchBytes` of records PLUS one rendered notice.
+   * Deliberate: charging the notice against the same budget would let a large
+   * one starve the records out of their own batch, which is the pipeline's
+   * diagnostics jamming the pipeline.
+   *
+   * The size of that notice is not this class's to bound. `renderNotice` is
+   * caller-supplied and {@link Batcher.noticeText} asks only that it return a
+   * non-empty string, so a direct consumer of `Batcher` gets exactly the
+   * overshoot its own renderer produces. `FileDestination` — the only
+   * in-package consumer — renders every notice through `boundedNotice` under
+   * its `maxEntryBytes`, which is what makes the ceiling 320 KB at the
+   * defaults THERE. Anyone driving this class directly owns that number.
+   *
+   * What does hold in every case: a sink that cannot take the batch answers
+   * `full`, and the batcher then sheds records until it fits or sets the
+   * notice aside — so an oversized notice cannot wedge the pipeline, it can
+   * only cost a round trip.
    *
    * Pinned by 'the loss notice rides on top of the batch budget, not inside
    * it'.
