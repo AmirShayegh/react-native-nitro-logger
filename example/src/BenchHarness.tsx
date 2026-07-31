@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { runCase } from '../../bench/measure';
+import { cases as controlCases } from '../../bench/cases/control';
 import { cases as hotpathCases } from '../../bench/cases/hotpath';
 import { cases as formatCases } from '../../bench/cases/format';
 import { cases as batcherCases } from '../../bench/cases/batcher';
@@ -30,6 +31,10 @@ import type { BenchCase } from '../../bench/cases/cases';
  * `manual`, for a human watching Metro logs.
  */
 const ALL_CASES: BenchCase[] = [
+  // Control first, as in `bench/run.js`: Hermes is the engine whose
+  // elimination behaviour is least documented, so the floor its numbers
+  // are checked against is measured on the same device in the same run.
+  ...controlCases,
   ...hotpathCases,
   ...formatCases,
   ...batcherCases,

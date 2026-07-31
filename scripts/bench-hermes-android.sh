@@ -41,7 +41,7 @@ OUT="${1:-bench-hermes-results.json}"
 RUN_ID="bench-$(date +%Y%m%d%H%M%S)-$$"
 APPLICATION_ID="nitrologger.example"
 CASE_COUNT="$(node -e '
-  const files = ["hotpath", "format", "batcher"];
+  const files = ["control", "hotpath", "format", "batcher"];
   let n = 0;
   for (const f of files) n += require("./bench/cases/" + f + ".js").cases.length;
   process.stdout.write(String(n));
@@ -131,7 +131,7 @@ node -e '
   // balance to the same total. The harvested names must equal the case
   // list exactly — no duplicates, nothing missing, nothing unknown.
   const expected = [];
-  for (const f of ["hotpath", "format", "batcher"])
+  for (const f of ["control", "hotpath", "format", "batcher"])
     for (const c of require("./bench/cases/" + f + ".js").cases)
       expected.push(c.name);
   const seen = results.map((r) => r.name);
@@ -144,6 +144,14 @@ node -e '
   if (unknown.length) problems.push("unknown: " + unknown.join(", "));
   if (problems.length) {
     for (const p of problems) console.error("FAIL: harvested names " + p);
+    process.exit(1);
+  }
+  // The same control-floor check the Node runner applies, from the same
+  // module: a Hermes case whose work was eliminated collapses onto the
+  // empty-loop control measured on THIS device in THIS run.
+  const floorProblems = require("./bench/floor.js").checkControlFloor(results);
+  if (floorProblems.length) {
+    for (const p of floorProblems) console.error("FAIL: " + p);
     process.exit(1);
   }
   fs.writeFileSync(

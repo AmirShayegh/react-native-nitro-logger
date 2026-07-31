@@ -18,9 +18,21 @@ Cases live in `bench/cases/*.js`: the per-call hot path (`hotpath`), the
 formatters (`format`), and the batcher plus `utf8Length` corpora
 (`batcher`). One child process per case — a shared process lets one case's
 JIT tiering and heap shape leak into the next case's numbers. The runner
-refuses to run when `src` is newer than `lib/commonjs`, because measuring a
-stale build under a fresh commit message is the harness's one silent-lie
-mode.
+refuses to run when any part of `lib/commonjs` predates the newest `src`
+edit, because measuring a stale build under a fresh commit message is the
+harness's one silent-lie mode.
+
+### The control floor
+
+`bench/cases/control.js` measures an empty op — the harness's own cost —
+and every full run checks that every other case lands clearly above it
+(`bench/floor.js`, shared with the Hermes harvest). An op whose work an
+engine eliminated compiles to the same thing as an empty op, so it
+collapses onto the control; this is how the harness demonstrates, per run
+and per engine, that it measured real work instead of asserting it. The
+`--filter` flag never removes the control, and `--quick` skips the check —
+its 2 ms batches are too coarse for a ratio, and CI, which runs `--quick`,
+gates on nothing numeric.
 
 ## The Hermes mirror
 

@@ -23,10 +23,12 @@
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { CONTROL, checkControlFloor } = require('./floor');
 
 const ROOT = path.resolve(__dirname, '..');
-const CASE_FILES = ['hotpath.js', 'format.js', 'batcher.js'].map((name) =>
-  path.join(__dirname, 'cases', name)
+// `control.js` first: its empty-loop floor validates every later number.
+const CASE_FILES = ['control.js', 'hotpath.js', 'format.js', 'batcher.js'].map(
+  (name) => path.join(__dirname, 'cases', name)
 );
 
 function mtimeRange(directory) {
@@ -91,13 +93,19 @@ function main() {
   assertLibFresh();
 
   const selected = [];
+  let matched = 0;
   for (const file of CASE_FILES) {
     for (const candidate of require(file).cases) {
-      if (filter && !candidate.name.includes(filter)) continue;
+      // The control is never filtered out: it is what makes the numbers
+      // beside it mean anything, so a `--filter utf8` run still measures
+      // the floor those utf8 numbers are checked against.
+      const wanted = !filter || candidate.name.includes(filter);
+      if (wanted) matched += 1;
+      if (!wanted && candidate.name !== CONTROL) continue;
       selected.push({ file, name: candidate.name });
     }
   }
-  if (selected.length === 0) {
+  if (matched === 0) {
     process.stderr.write(`FAIL: no cases match --filter ${filter}\n`);
     process.exit(1);
   }
@@ -121,6 +129,21 @@ function main() {
         ? (result.nsPerOp / 1000).toFixed(2) + ' µs/op'
         : result.nsPerOp.toFixed(1) + ' ns/op';
     process.stdout.write(`${result.name.padEnd(44)} ${ns.padStart(14)}\n`);
+  }
+
+  // Full profile only, and deliberately so: the check is a ratio between
+  // two measurements, and `--quick` (2 ms batches, one warm-up) is too
+  // coarse to compare on a shared runner. CI runs `--quick`, and CI does
+  // not gate on numbers — including this one. What CI proves is that every
+  // case still constructs and runs; what the floor proves is that a full
+  // run's numbers are of real work, and it runs where those numbers are
+  // read.
+  if (!quick) {
+    const problems = checkControlFloor(results);
+    for (const problem of problems) {
+      process.stderr.write(`FAIL: ${problem}\n`);
+    }
+    if (problems.length > 0) process.exit(1);
   }
 
   if (jsonPath) {
@@ -147,8 +170,8 @@ function main() {
 
   process.stdout.write(
     quick
-      ? `\nok: all ${results.length} cases execute (quick profile — the numbers above are not measurements)\n`
-      : `\nok: ${results.length} cases, best-of-7 on V8 ${process.version} — Hermes decides Hermes-gated findings\n`
+      ? `\nok: all ${results.length} cases execute (quick profile — the numbers above are not measurements, and the control floor is not checked)\n`
+      : `\nok: ${results.length} cases, best-of-7 on V8 ${process.version}, every one clear of the empty-loop floor — Hermes decides Hermes-gated findings\n`
   );
 }
 
