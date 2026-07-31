@@ -37,17 +37,29 @@ function runCase(op, options) {
   var now = options.now;
   var gc = options.gc;
 
-  // Every `op()` result lands here and is published on `runCase.blackhole`
-  // after the loops, so no engine can prove the results unused and delete
-  // the work. A pure helper — `utf8Length`, a formatter — is exactly the
-  // call an inliner would otherwise be entitled to eliminate, and a bench
-  // that measures an eliminated call reports the cost of an empty loop.
-  var blackhole;
+  // EVERY `op()` result is folded into a loop-carried accumulator that is
+  // published on `runCase.blackhole` after the loops — folded, not stored,
+  // because an overwritten slot keeps only the LAST iteration's result live
+  // and leaves the other N−1 calls of a pure op dead. The fold gives each
+  // iteration's value a consumer: cases return numbers where a result
+  // exists (a byte count, a rendered length, a write counter), which join
+  // the sum directly; any other return contributes a constant through the
+  // same data dependency. A pure helper — `utf8Length`, a formatter — is
+  // exactly the call an inliner would otherwise be entitled to eliminate,
+  // and a bench that measures an eliminated call reports the cost of an
+  // empty loop. The `| 0` keeps the accumulator a small integer on both
+  // engines instead of drifting to a double.
+  /* eslint-disable no-bitwise */
+  var blackhole = 0;
+  var r;
 
   var iterations = 1;
   for (;;) {
     var start = now();
-    for (var i = 0; i < iterations; i += 1) blackhole = op();
+    for (var i = 0; i < iterations; i += 1) {
+      r = op();
+      blackhole = (blackhole + (typeof r === 'number' ? r : 1)) | 0;
+    }
     var elapsed = now() - start;
     // The cap is a runaway stop for a sub-nanosecond op, not a tuning knob.
     if (elapsed >= options.targetMs || iterations >= 16777216) break;
@@ -60,12 +72,17 @@ function runCase(op, options) {
     // Collect between batches, not during them, when the engine allows it.
     if (gc) gc();
     var batchStart = now();
-    for (var j = 0; j < iterations; j += 1) blackhole = op();
+    for (var j = 0; j < iterations; j += 1) {
+      r = op();
+      blackhole = (blackhole + (typeof r === 'number' ? r : 1)) | 0;
+    }
     var batchElapsed = now() - batchStart;
     if (s >= options.warmup) {
       counted.push((batchElapsed * 1e6) / iterations);
     }
   }
+
+  /* eslint-enable no-bitwise */
 
   runCase.blackhole = blackhole;
 

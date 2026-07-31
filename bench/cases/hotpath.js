@@ -59,11 +59,10 @@ module.exports.cases = [
         .subsystem('media', 'error');
       return {
         op() {
-          return logger.info(
-            'cache warm',
-            undefined,
-            'ui.checkout.payment.card'
-          );
+          logger.info('cache warm', undefined, 'ui.checkout.payment.card');
+          // Zero, every iteration: the count that proves nothing was
+          // delivered is itself the loop-carried value.
+          return observed.noop.writes;
         },
       };
     },
@@ -76,7 +75,8 @@ module.exports.cases = [
         .minimumLevel('warn');
       return {
         op() {
-          return logger.info('cache warm');
+          logger.info('cache warm');
+          return observed.noop.writes;
         },
       };
     },
@@ -183,7 +183,8 @@ module.exports.cases = [
       const scoped = logger.scoped('corr-bench', 'net.http');
       return {
         op() {
-          return scoped.info('tick');
+          scoped.info('tick');
+          return observed.noop.writes;
         },
       };
     },

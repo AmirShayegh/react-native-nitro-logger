@@ -38,7 +38,7 @@ module.exports.cases = [
       const fixed = entry({});
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
@@ -58,7 +58,7 @@ module.exports.cases = [
       });
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
@@ -73,7 +73,7 @@ module.exports.cases = [
       });
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
@@ -87,7 +87,7 @@ module.exports.cases = [
       return {
         op() {
           i = (i + 1) % 1000;
-          return formatter.format(entry({ timestamp: BASE + i }));
+          return formatter.format(entry({ timestamp: BASE + i })).length;
         },
       };
     },
@@ -101,7 +101,7 @@ module.exports.cases = [
       return {
         op() {
           i = (i + 1) % 3600;
-          return formatter.format(entry({ timestamp: BASE + i * 1000 }));
+          return formatter.format(entry({ timestamp: BASE + i * 1000 })).length;
         },
       };
     },
@@ -115,7 +115,7 @@ module.exports.cases = [
       const fixed = entry({ metadata: wideMetadata(40) });
       return {
         op() {
-          return formatter.formatWithin(fixed, 400);
+          return formatter.formatWithin(fixed, 400).length;
         },
       };
     },
@@ -128,7 +128,7 @@ module.exports.cases = [
       const fixed = entry({ message: 'x'.repeat(4096) });
       return {
         op() {
-          return formatter.formatWithin(fixed, 512);
+          return formatter.formatWithin(fixed, 512).length;
         },
       };
     },
@@ -141,7 +141,7 @@ module.exports.cases = [
       const fixed = entry({});
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
@@ -153,7 +153,7 @@ module.exports.cases = [
       const fixed = entry({ message: 'line one\nline two | tail' });
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
@@ -168,7 +168,7 @@ module.exports.cases = [
       });
       return {
         op() {
-          return formatter.format(fixed);
+          return formatter.format(fixed).length;
         },
       };
     },
