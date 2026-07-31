@@ -4,7 +4,7 @@ import type { NativeConsoleSink } from './specs/NativeConsoleSink.nitro';
 
 // ── Public API ──────────────────────────────────────────────────────────────
 export { Log, Logger } from './Logger';
-export type { LogOptions } from './Logger';
+export type { DestinationStatus, LogOptions } from './Logger';
 export { ScopedLogger } from './ScopedLogger';
 export type {
   LogLevel,

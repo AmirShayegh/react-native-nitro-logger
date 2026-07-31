@@ -41,6 +41,28 @@ interface Registration {
 }
 
 /**
+ * One row of {@link Logger.destinations} — a registered destination and
+ * whether this logger has cut it off.
+ *
+ * Two fields on purpose. Anything more would either come from the
+ * destination's own untrusted getters or would be a failure count, and a count
+ * invites a caller to build a policy on top of a threshold this logger owns.
+ */
+export interface DestinationStatus {
+  readonly label: string;
+  /**
+   * The circuit breaker, and only that: false once this logger auto-disabled
+   * the destination after repeated write failures.
+   *
+   * True is therefore not a promise that records are arriving. A destination
+   * that reports `isEnabled: false` about itself is skipped by the write path
+   * while still appearing here as `enabled`, and one that accepts a record and
+   * discards it internally looks no different from one that keeps it.
+   */
+  readonly enabled: boolean;
+}
+
+/**
  * The logger. Access through the `Log` singleton.
  *
  * Everything runs on the JS thread, so unlike the Swift original there is no
@@ -197,13 +219,32 @@ export class Logger {
   /**
    * Register a destination. A *different* destination already holding the
    * same label is flushed, disposed, and replaced; re-adding an instance
-   * that is already registered is a no-op, because disposing and re-pushing
-   * the same object would leave a live destination in a closed state.
+   * that is already registered does not dispose and re-push it, because that
+   * would leave a live destination in a closed state.
+   *
+   * **Re-adding an instance does re-arm it.** A destination cut off after
+   * {@link MAX_CONSECUTIVE_FAILURES} consecutive write failures stays cut off
+   * until something says otherwise, and this is that something: the failure
+   * count and the disabled mark are cleared. Before 0.3.0 the identity check
+   * below returned early and cleared nothing, so the one gesture that reads
+   * like "I have fixed it, try again" was the one gesture that did nothing —
+   * and the only way back was `removeDestination` followed by a re-add, which
+   * disposes the instance you are trying to revive.
+   *
+   * There is deliberately no `enableDestination(label)`. Reviving by name
+   * would let any caller re-arm a destination it does not hold, and holding
+   * the instance is what makes the gesture mean "I know what this is".
    */
   addDestination(destination: LogDestination): this {
     // Identity first: an already-registered instance must not have its label
     // getter touched again, or the capture-once invariant leaks right here.
-    if (this.registrations.some((r) => r.destination === destination)) {
+    const existing = this.registrations.find(
+      (r) => r.destination === destination
+    );
+    if (existing !== undefined) {
+      // The captured label, never a fresh read of the getter.
+      this.failureCounts.delete(existing.label);
+      this.disabledLabels.delete(existing.label);
       return this;
     }
     let label: string;
@@ -224,6 +265,42 @@ export class Logger {
     this.removeDestination(label);
     this.registrations.push({ destination, label });
     return this;
+  }
+
+  /**
+   * What is registered, and which of them this logger has cut off.
+   *
+   * For a diagnostics screen or a health check: without it there is no way to
+   * discover that a destination was cut off after repeated failures, since the
+   * only signal is a development-only console warning that a shipped build
+   * never sees.
+   *
+   * `enabled` reports **one thing** — this logger's circuit breaker — and is
+   * deliberately not the destination's own `isEnabled`. That getter is
+   * caller-supplied and untrusted, and calling it here would mean a throwing
+   * getter could break a diagnostics call, or a lying one could report healthy
+   * for something this logger stopped writing to.
+   *
+   * So `enabled: true` does not mean records are reaching it. A destination
+   * that reports `isEnabled: false` about itself is skipped by the write path
+   * and still appears here as `enabled` — a fenced `FileDestination` is
+   * exactly that — because from this logger's side nothing has gone wrong. The
+   * two answers are different questions, and this method answers the one no
+   * caller can find out any other way.
+   *
+   * The label is the one captured at registration, so a destination whose
+   * label getter started throwing afterwards still appears under the name this
+   * logger knows it by.
+   */
+  destinations(): readonly DestinationStatus[] {
+    return Object.freeze(
+      this.registrations.map((r) =>
+        Object.freeze({
+          label: r.label,
+          enabled: !this.disabledLabels.has(r.label),
+        })
+      )
+    );
   }
 
   removeDestination(label: string): this {

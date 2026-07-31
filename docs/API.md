@@ -42,7 +42,8 @@ down to be useful ends up not being used at the layers that need it most.
 | `redactAllMetadata()` | `this` | Redact every value regardless of marker. Not reversible. |
 | `metadataKeyCatalog(keys)` | `this` | Approve key names. Calls intersect; one bad key approves none. **Mandatory under `'private'`** — see [PRIVACY.md](PRIVACY.md#metadata-keys). |
 | `consoleLogging(enabled)` | `this` | Toggle the built-in console destination. |
-| `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. |
+| `addDestination(destination)` | `this` | Register. Labels are unique; re-registering a label replaces. Re-adding the *same instance* re-arms it. |
+| `destinations()` | `readonly DestinationStatus[]` | What is registered, and which of them this logger has cut off. |
 | `removeDestination(label)` | `this` | Unregister and dispose. |
 | `flush(deadlineMs?)` | `void` | Ask every destination to flush, inside one total budget. Returns nothing — see the note below. |
 | `newCorrelationId()` | `string` | A fresh ID, generated rather than derived. |
@@ -74,7 +75,34 @@ mistakes are otherwise silent under `'private'`, so a development build warns
 when a call leaves fewer keys approved than it found, or when the first call
 approves none — counts only, never the key names themselves.
 
-<!-- api: Logger -->
+A destination whose `write` throws five times in a row is auto-disabled: the
+logger stops calling it rather than paying for the throw on every entry. The
+only signal is a development-only console warning, which a shipped build never
+sees, so `destinations()` is how a running app finds out. It returns a frozen
+array of frozen `DestinationStatus` rows — `{ label, enabled }` and nothing
+else.
+
+`enabled` reports **one thing**: this logger's circuit breaker. It is
+deliberately not the destination's own `isEnabled`, because that getter is
+caller-supplied — a throwing one would break a diagnostics call and a lying one
+would report healthy for something this logger stopped writing to. Which means
+`enabled: true` is not a promise that records are arriving: a destination that
+reports `isEnabled: false` about itself is skipped by the write path and still
+appears here as `enabled`, and a fenced `FileDestination` is exactly that. From
+this logger's side nothing has gone wrong. The two are different questions, and
+this method answers the one you cannot find out any other way. The label is the
+one captured at registration, so a destination whose label getter started
+throwing since then still appears under the name this logger knows it by.
+
+Re-arming is `addDestination(theSameInstance)`: passing an instance that is
+already registered clears its failure count and its disabled mark and returns
+without touching the label getter again. That is the whole gesture — "I have
+fixed it, try again" — and before 0.3.0 it was the one call that did nothing.
+There is deliberately no `enableDestination(label)`, because reviving by name
+would let code that does not hold the destination re-arm it, and holding the
+instance is the evidence that the caller is the one who fixed it.
+
+<!-- api: Logger, DestinationStatus -->
 
 ### `ScopedLogger`
 
@@ -709,6 +737,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `DEGRADED_ROTATION`
 - `DEGRADED_SIDECAR`
 - `describeDegradation`
+- `DestinationStatus`
 - `DROPPED_COUNT_KEY`
 - `ERROR_METADATA_KEYS`
 - `ErrorHandlerOptions`

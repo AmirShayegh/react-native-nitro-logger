@@ -1562,6 +1562,7 @@ describe('plugin configs', () => {
     const NOT_EMITTING = new Set([
       'addDestination', // takes a destination, no message
       'consoleLogging', // boolean toggle
+      'destinations', // reports labels back, takes nothing
       'flush', // deadline only
       'metadataKeyCatalog', // key names, checked at runtime instead
       'minimumLevel', // level only

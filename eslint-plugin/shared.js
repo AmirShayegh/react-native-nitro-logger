@@ -91,6 +91,7 @@ const LOGGER_OWN_METHODS = new Set([
   ...API_METHODS,
   'addDestination',
   'consoleLogging',
+  'destinations',
   'flush',
   'logMessage',
   'metadataKeyCatalog',

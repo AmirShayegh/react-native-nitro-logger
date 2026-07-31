@@ -544,3 +544,205 @@ describe('Logger.flush — one budget across every destination', () => {
     expect(seen[0]!).toBeGreaterThan(0);
   });
 });
+
+/**
+ * `destinations()` and the re-arm gesture.
+ *
+ * Auto-disablement is silent in a shipped build — the only signal is a
+ * development-only `console.warn` — so before 0.3.0 an app had no way to
+ * discover that a destination had been cut off, and no way to bring it back
+ * short of constructing a replacement. These pin both halves.
+ *
+ * What they do not prove: that the reported `enabled` matches what the
+ * destination itself would say. That is the point of the split, and the
+ * `isEnabled` tests below pin the divergence deliberately.
+ */
+describe('Logger.destinations', () => {
+  /** Drive `dest` past the auto-disable threshold. Five is the limit; six
+   * calls leave one entry's worth of margin without depending on the exact
+   * number, which is not exported. */
+  function breakIt(logger: Logger, times = 6): void {
+    for (let i = 0; i < times; i += 1) logger.info(`m${i}`);
+  }
+
+  test('reports every registration, in registration order, enabled', () => {
+    const logger = makeLogger();
+    logger
+      .addDestination(new TestDestination('file'))
+      .addDestination(new TestDestination('console2'));
+
+    expect(logger.destinations()).toEqual([
+      { label: 'file', enabled: true },
+      { label: 'console2', enabled: true },
+    ]);
+  });
+
+  test('a destination cut off after repeated failures reports enabled: false', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const logger = makeLogger();
+      const bad = new TestDestination('bad');
+      bad.throwOnWrite = true;
+      logger.addDestination(bad).addDestination(new TestDestination('good'));
+
+      expect(logger.destinations()[0]).toEqual({ label: 'bad', enabled: true });
+      breakIt(logger);
+
+      expect(logger.destinations()).toEqual([
+        { label: 'bad', enabled: false },
+        { label: 'good', enabled: true },
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('re-adding the same instance re-arms it, and clears the failure count', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const logger = makeLogger();
+      const bad = new TestDestination('bad');
+      bad.throwOnWrite = true;
+      logger.addDestination(bad);
+      breakIt(logger);
+      expect(logger.destinations()[0]!.enabled).toBe(false);
+
+      // The gesture: hand back the instance you fixed.
+      expect(logger.addDestination(bad)).toBe(logger);
+      expect(logger.destinations()[0]!.enabled).toBe(true);
+
+      // Still broken — one more failure. The count must have been cleared, not
+      // only the disabled mark: a stale count of five would re-disable here on
+      // the very first write, and clearing it on the *next successful* write
+      // would hide that. This is the assertion that separates the two.
+      logger.info('fails once more');
+      expect(logger.destinations()[0]!.enabled).toBe(true);
+
+      bad.throwOnWrite = false;
+      logger.info('lands');
+      expect(bad.messages).toEqual(['lands']);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('re-adding an instance neither replaces nor disposes it', () => {
+    const logger = makeLogger();
+    const dest = new TestDestination('file');
+    logger.addDestination(dest).addDestination(dest);
+
+    // The same-label path flushes and disposes what it displaces. The identity
+    // path must not: the caller handed back the object it already owns.
+    expect(dest.disposeCount).toBe(0);
+    expect(dest.flushCount).toBe(0);
+    expect(logger.destinations()).toEqual([{ label: 'file', enabled: true }]);
+    logger.info('once');
+    expect(dest.messages).toEqual(['once']);
+  });
+
+  test('re-adding does not read the label getter again', () => {
+    const logger = makeLogger();
+    let reads = 0;
+    const dest: LogDestination = {
+      get label() {
+        reads += 1;
+        return 'counted';
+      },
+      isEnabled: true,
+      write() {},
+      flush() {},
+      dispose() {},
+    };
+
+    logger.addDestination(dest);
+    const afterFirst = reads;
+    logger.addDestination(dest);
+
+    // Capture-once: the registration's label is fixed at registration, and the
+    // identity branch works from the captured string. A second read is the leak
+    // — a destination whose label getter changed its answer would be re-filed
+    // under a name the failure accounting does not use.
+    expect(reads).toBe(afterFirst);
+  });
+
+  test('the reported label survives a label getter that starts throwing', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const logger = makeLogger();
+      let hostile = false;
+      const dest: LogDestination = {
+        get label() {
+          if (hostile) throw new Error('SECRET in a label getter');
+          return 'stable';
+        },
+        isEnabled: true,
+        write() {},
+        flush() {},
+        dispose() {},
+      };
+      logger.addDestination(dest);
+      hostile = true;
+
+      expect(() => logger.destinations()).not.toThrow();
+      expect(logger.destinations()).toEqual([
+        { label: 'stable', enabled: true },
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('enabled is the circuit breaker, not the destination own isEnabled', () => {
+    const logger = makeLogger();
+    const fenced = new TestDestination('fenced');
+    fenced.enabled = false; // what a fenced FileDestination says about itself
+    logger.addDestination(fenced);
+
+    // The divergence proven from both sides rather than claimed from one: the
+    // write path skips it *and* it reports enabled, because the two answer
+    // different questions. `enabled: true` is the circuit breaker untripped,
+    // not a promise that records are arriving.
+    logger.info('goes nowhere');
+    expect(fenced.entries).toHaveLength(0);
+    expect(logger.destinations()).toEqual([{ label: 'fenced', enabled: true }]);
+  });
+
+  test('a throwing isEnabled getter cannot break a diagnostics call', () => {
+    const logger = makeLogger();
+    const dest: LogDestination = {
+      label: 'hostile',
+      get isEnabled(): boolean {
+        throw new Error('SECRET from an isEnabled getter');
+      },
+      write() {},
+      flush() {},
+      dispose() {},
+    };
+    logger.addDestination(dest);
+
+    expect(() => logger.destinations()).not.toThrow();
+    expect(logger.destinations()).toEqual([
+      { label: 'hostile', enabled: true },
+    ]);
+  });
+
+  test('the array and its rows are frozen, and are not the logger state', () => {
+    const logger = makeLogger();
+    logger.addDestination(new TestDestination('file'));
+    const rows = logger.destinations();
+
+    expect(Object.isFrozen(rows)).toBe(true);
+    expect(Object.isFrozen(rows[0])).toBe(true);
+    // A fresh array each call, so keeping one cannot observe later changes.
+    expect(logger.destinations()).not.toBe(rows);
+  });
+
+  test('removeDestination drops the row', () => {
+    const logger = makeLogger();
+    logger
+      .addDestination(new TestDestination('a'))
+      .addDestination(new TestDestination('b'));
+    logger.removeDestination('a');
+    expect(logger.destinations()).toEqual([{ label: 'b', enabled: true }]);
+  });
+});
