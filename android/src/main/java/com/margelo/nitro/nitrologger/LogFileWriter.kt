@@ -325,6 +325,53 @@ class LogFileWriter internal constructor(
       return active + archives(directory, file.name).map { it.file.absolutePath }
     }
 
+    /**
+     * Unlinks the three support names beside [file] and reports whether none of
+     * them remains.
+     *
+     * The one implementation, called from two places: on the executor while a
+     * handle is live, and directly for a sink whose handle has gone — the same
+     * split, for the same reason, as [logFilePaths] and [artifactPaths]. What
+     * differs between the callers is what serializes them, never which names
+     * get deleted.
+     *
+     * Absence is success. `delete()` on a name that was never there returns
+     * false, and treating that as a failure would report a surviving bundle for
+     * the overwhelmingly common case of deleting one that is already gone — so
+     * the verdict is a re-check of the three names rather than the result of
+     * three deletions. Only [PlatformIo.Presence.ABSENT] counts as gone;
+     * `UNKNOWN` is a lookup that never found out and is treated as a survivor,
+     * which is the same fail-closed rule [sweepArtifacts] applies.
+     *
+     * The directory is synced for the reason the purge syncs it: `unlink`
+     * returning success only puts the change in the directory's in-memory
+     * state, and a crash before that reaches storage brings back a gzipped copy
+     * of the whole log that this call said was gone.
+     */
+    fun deleteSupportArtifacts(file: File, platform: PlatformIo): Boolean {
+      val directory = file.parentFile ?: File(".")
+      val baseName = file.name
+      // Exactly these three, from the same helpers [isArtifactName] uses. Never
+      // a directory listing filtered by [isArtifactName]: that matches the log
+      // files too, and this call is not a purge.
+      val names = listOf(
+        supportName(baseName), supportStagingName(baseName), supportMemberName(baseName)
+      )
+
+      // The results are deliberately ignored; the check below is the verdict.
+      for (name in names) File(directory, name).delete()
+
+      for (name in names) {
+        if (platform.lookup(File(directory, name)) != PlatformIo.Presence.ABSENT) return false
+      }
+
+      // A directory that is not there cannot be opened and has nothing whose
+      // removal needs committing; the three names are absent for the strongest
+      // possible reason.
+      if (platform.lookup(directory) == PlatformIo.Presence.ABSENT) return true
+      return platform.syncDirectory(directory)
+    }
+
     @Throws(LogWriterException::class)
     fun open(
       file: File,
@@ -1836,6 +1883,123 @@ class LogFileWriter internal constructor(
       snapshot = paths
     }
     return if (captured) snapshot ?: listOf(file.absolutePath) else listOf(file.absolutePath)
+  }
+
+  // MARK: - Support bundle deletion
+
+  /**
+   * Deletes the support bundle and its staging leftovers — see the spec's
+   * `deleteSupportBundle` for what `true` does and does not promise.
+   *
+   * Executor-confined for the reason [logFilePaths] is, and a sharper one: a
+   * collect publishes by renaming its staging name onto the final one, on this
+   * executor. Unlinking those same two names from the caller's thread would run
+   * inside that rename.
+   *
+   * Bounded, because this is reachable from the JS thread and the executor may
+   * be wedged. A timeout is `false`, and so is a shut-down executor: neither
+   * observed anything, and the one thing this call must never do is report a
+   * bundle gone while it is still on disk.
+   *
+   * [handleGeneration] is checked the way [append] checks it, and on the
+   * executor rather than here: a purge between this call and the task reaching
+   * the front would otherwise have this handle delete the *current*
+   * generation's bundle. Being active is not the same as being current — the
+   * registry's `isLive` answers the first question only — and a stale handle
+   * owns nothing in that directory any more.
+   */
+  fun deleteSupportBundle(handleGeneration: Long, deadlineMs: Double): Boolean {
+    if (Thread.currentThread() === writerThread) {
+      return deleteIfCurrent(handleGeneration)
+    }
+
+    // Written out rather than handed to [onExecutorBounded], which has no way
+    // to tell its block that nobody is waiting for it any more. That matters
+    // here and nowhere else it is used: every other bounded call reads, and a
+    // stale read is discarded by the caller, while a stale unlink is not.
+    val request = DeleteRequest()
+    var removed = false
+    val done = CountDownLatch(1)
+    val settled = try {
+      executor.execute {
+        try {
+          // Nothing is cancellable once queued, so the task asks whether it is
+          // still wanted rather than being removed.
+          if (request.begin()) removed = deleteIfCurrent(handleGeneration)
+        } finally {
+          done.countDown()
+        }
+      }
+      done.await(clampDeadline(deadlineMs), TimeUnit.MILLISECONDS)
+    } catch (_: RejectedExecutionException) {
+      // A close shut the executor down. Nothing was queued, so there is nothing
+      // to abandon and nothing was deleted.
+      return false
+    } catch (_: InterruptedException) {
+      Thread.currentThread().interrupt()
+      false
+    }
+
+    if (!settled) {
+      // A timed-out delete is not a cancelled one, and unlike a stale read it
+      // does damage. Sitting behind a slow build, this task would otherwise
+      // reach the front of the queue *after* that build renamed a fresh bundle
+      // into place, and unlink a bundle some later collect had just published
+      // and reported the path of — a call that returned "I deleted nothing"
+      // deleting somebody else's file, seconds later. This is the same barrier
+      // [CollectHandoff.giveUp] puts in front of a publish, for the same
+      // reason, in the opposite direction.
+      request.abandon()
+      return false
+    }
+    return removed
+  }
+
+  /**
+   * Deletes only if [handleGeneration] is still the writer's current one.
+   *
+   * Executor only, and the ordering is the point: the generation is read at the
+   * last possible instant before the unlinks, so a purge that landed while this
+   * task waited its turn is seen. Reading it at the call site instead would
+   * compare a number that was true when the caller asked and false by the time
+   * anything was deleted.
+   */
+  private fun deleteIfCurrent(handleGeneration: Long): Boolean {
+    val current = stateLock.withLock { generation }
+    // Not this handle's directory any more. The same refusal [append] gives a
+    // stale handle, for the same reason, with more at stake: an append that
+    // slipped through would add a record to somebody else's file, and a delete
+    // that slipped through would remove somebody else's bundle.
+    if (handleGeneration != current) return false
+    return deleteSupportArtifacts(file, platform)
+  }
+
+  /**
+   * One [deleteSupportBundle] call's claim on its own queued task.
+   *
+   * Per call, and shared by exactly the two parties to it — the thread waiting
+   * and the task running — for the reason [CollectHandoff] is per collect: a
+   * writer-wide flag would let one caller's timeout abandon another caller's
+   * deletion.
+   *
+   * The window this does *not* close is the terminal one: a task that has
+   * already passed [begin] runs to completion, so a caller can be told `false`
+   * about a deletion that then happens. That direction is safe — the artifacts
+   * are gone and a retry says so — and it cannot take a later bundle, because
+   * the executor is single-threaded and any subsequent publish is a later task
+   * than one that has already started.
+   */
+  private class DeleteRequest {
+    private var abandoned = false
+
+    /** Claims the right to unlink. False once the caller has stopped waiting. */
+    @Synchronized
+    fun begin(): Boolean = !abandoned
+
+    @Synchronized
+    fun abandon() {
+      abandoned = true
+    }
   }
 
   // MARK: - Purge

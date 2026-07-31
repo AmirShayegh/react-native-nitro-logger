@@ -125,6 +125,11 @@ namespace margelo::nitro::nitrologger {
     auto __result = method(_javaPart, deadlineMs, maxTotalBytes);
     return __result->toCpp();
   }
+  bool JHybridFileSinkSpec::deleteSupportBundle(double deadlineMs) {
+    static const auto method = _javaPart->javaClassStatic()->getMethod<jboolean(double /* deadlineMs */)>("deleteSupportBundle");
+    auto __result = method(_javaPart, deadlineMs);
+    return static_cast<bool>(__result);
+  }
   ClearOutcome JHybridFileSinkSpec::clearLogs(double deadlineMs) {
     static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JClearOutcome>(double /* deadlineMs */)>("clearLogs");
     auto __result = method(_javaPart, deadlineMs);

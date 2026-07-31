@@ -345,6 +345,31 @@ class HybridFileSink : HybridFileSinkSpec() {
     return LogFileWriter.artifactPaths(File(opened)).toTypedArray()
   }
 
+  override fun deleteSupportBundle(deadlineMs: Double): Boolean {
+    // [snapshot], the [clearLogs] treatment — deliberately NOT the
+    // [getLogFilePaths] one, though the two look alike and this method sat on
+    // the other side of that line until a review pushed back.
+    //
+    // The difference is that reading a directory this object no longer owns is
+    // harmless and deleting from it is not. Once the handle is gone there is no
+    // generation left to check and no executor to serialize against, so a live
+    // handle may own that path now and be mid-publish in it; a `.support.gz`
+    // deleted from here would be *its* bundle, whose path it has already handed
+    // back to a caller. The upload-finishes-after-`dispose` case is real, and
+    // the answer to it is to delete before disposing, or through a fresh
+    // destination on the same path — both of which produce a live handle with a
+    // current generation, which is the only thing that makes this safe.
+    //
+    // Both fields in ONE critical section, like [clearLogs]: reading them
+    // separately lets a close land in between and produce "no handle, nothing
+    // created", the one combination that is never true.
+    val (live, durableWithoutHandle) = lifecycle.snapshot()
+    // Never opened: no directory, no bundle, vacuously gone. Opened and since
+    // closed: the files are out of reach and this object cannot vouch for them.
+    val handle = live ?: return durableWithoutHandle
+    return handle.deleteSupportBundle(deadlineMs)
+  }
+
   override fun clearLogs(deadlineMs: Double): ClearOutcome {
     // Never opened: nothing was created, so "every artifact is gone" holds
     // vacuously. Opened and since closed: the files are still on disk and this

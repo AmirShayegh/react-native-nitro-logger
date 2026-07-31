@@ -252,6 +252,7 @@ const logFile = createFileDestination({
 | `purge(deadlineMs?)` | `PurgeOutcome` | The compliance path. See below. |
 | `reopen(deadlineMs?)` | `boolean` | The way back from a fence. See below. |
 | `collectForSupport({ maxTotalBytes, deadlineMs? })` | `CollectOutcome` | One gzip bundle of the whole log, for a support upload. See below. |
+| `deleteSupportBundle(deadlineMs?)` | `boolean` | Deletes that bundle once it is uploaded. See below. |
 | `getLogFilePaths()` | `string[]` | Active file first, then archives. Still answers after `dispose()`. For a consent-gated support upload. |
 | `unreportedLoss()` | `LossCounts` | Entries and bytes lost that no `flush` result has reported yet. |
 | `degradation()` | `number` | Bit mask; `0` is healthy. Rotation, prune, sidecar, gzip, protection and exclusivity each have a bit. |
@@ -323,11 +324,66 @@ const supportable = createFileDestination3();
 const bundle = supportable.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
 
 if (bundle.complete && bundle.path !== '') {
-  // Upload `bundle.path`, then let the next purge or collect replace it.
+  // Upload `bundle.path`, then delete it — see below.
 } else if (bundle.complete) {
   // Nothing to send: this device has no logs.
 }
 ```
+
+**`deleteSupportBundle(deadlineMs?)` is the third step**, and the flow is
+**collect → upload → delete**. Skipping it leaves a gzipped copy of the whole
+log on the device until a `purge()` or the next collect replaces it — outside
+the retention budget `rotation` configures, and deliberately skipped by the
+native orphan sweep, which keeps a finished bundle precisely because somebody
+may still be uploading it. On a device holding regulated data that copy is the
+one artifact retention never reclaims, so a support flow that does not call this
+has to decide it is content to leave it there.
+
+```ts
+import { createFileDestination as createFileDestination4 } from 'react-native-nitro-logger';
+
+const uploader = createFileDestination4();
+const collected = uploader.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
+
+if (collected.complete && collected.path !== '') {
+  // await upload(collected.path);
+  if (!uploader.deleteSupportBundle()) {
+    // Still there. Safe to call again — deleting a bundle that is already gone
+    // is `true`, not an error.
+  }
+}
+```
+
+It deletes the bundle and its staging leftovers, never a log file; this is not a
+smaller `purge()`. `true` means no bundle artifact remained when the call ran,
+**including vacuously** for a destination that never opened. That describes an
+instant and promises nothing about the next one: a collect started afterwards
+writes a new bundle, and sequencing the two is the caller's job.
+
+`false` is the whole of the rest, and deliberately not a list of causes: the
+deletion was refused, timed out, threw, or could not be *durably* confirmed
+gone. It does not assert that anything survived — a refusal establishes nothing
+about the directory — so read it as "assume a copy may still be there" and retry
+through a live, current destination.
+
+A fenced or disposed destination refuses, and `getLogFilePaths()` still
+answering after `dispose()` is **not** a precedent for doing otherwise: reading
+a directory this destination no longer owns is harmless, and deleting from one
+is not. Once the handle is gone there is no writer generation left to check, so
+another destination may own that path by now and be part-way through publishing
+into it — the `.support.gz` removed would be *its* bundle, whose path it has
+already handed to a caller. A fence says the same thing one step earlier.
+
+So **delete before disposing**, or through a fresh destination on the same path.
+Either gives a live handle on a current generation, which is what makes the
+deletion safe rather than merely willing. The generation is re-checked natively
+at the last instant before the unlinks, so a purge landing mid-call is caught
+too.
+
+A delete whose deadline expires is abandoned rather than left queued. Without
+that, a call that returned "I deleted nothing" could reach the front of the
+writer's queue seconds later and unlink a bundle a *subsequent* collect had just
+published and handed back the path of.
 
 `CollectForSupportOptions` is that argument object: `maxTotalBytes`, and an
 optional `deadlineMs` that defaults to 10s and bounds each of the two waits —

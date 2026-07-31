@@ -36,6 +36,12 @@ export interface FileSinkLike {
    * and report what went in. See {@link FileDestination.collectForSupport}.
    */
   collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
+  /**
+   * Delete the bundle `collectLogs` produced and its staging leftovers, and
+   * report whether none of the three remains. See
+   * {@link FileDestination.deleteSupportBundle}.
+   */
+  deleteSupportBundle(deadlineMs: number): boolean;
   flush(deadlineMs: number): FlushOutcome;
   close(deadlineMs: number): FlushOutcome;
   getLogFilePaths(): string[];
@@ -464,6 +470,59 @@ export class FileDestination implements LogDestination {
       // already succeeded or failed on its own terms.
     }
     return outcome;
+  }
+
+  /**
+   * Delete the bundle {@link collectForSupport} produced, once it has been
+   * uploaded.
+   *
+   * The third step of a support flow: collect, upload, delete. Skipping it
+   * leaves a gzipped copy of the whole log on the device until a
+   * {@link purge} or the next collect replaces it — outside the retention
+   * budget `rotation` configures, and deliberately skipped by the native
+   * orphan sweep, which keeps a finished bundle precisely because somebody may
+   * still be uploading it. On a device holding patient data that copy is the
+   * one artifact retention never reclaims.
+   *
+   * Deletes exactly the bundle and its staging leftovers, never a log file.
+   * This is not a smaller `purge()` and must not be used as one.
+   *
+   * `true` means no bundle artifact remained when the call ran — including
+   * vacuously, for a destination that never opened. It describes that instant
+   * and promises nothing about the next: a collect started afterwards writes a
+   * new bundle, and sequencing the two is the caller's job.
+   *
+   * `false` is the whole of the rest, and deliberately not a list of causes:
+   * the deletion was refused, timed out, threw, or could not be *durably*
+   * confirmed gone. It does not assert that anything survived — a refusal
+   * establishes nothing about the directory — so read it as "assume a copy may
+   * still be there" and retry through a live, current destination.
+   *
+   * A fenced or disposed destination refuses, and unlike
+   * {@link getLogFilePaths} — which still answers after `dispose()` — that is
+   * the right answer here. Reading a directory this destination no longer owns
+   * is harmless; deleting from one is not. With the handle gone there is no
+   * generation left to check, so another destination may own that path now and
+   * be mid-publish in it, and the `.support.gz` removed would be *its* bundle,
+   * whose path it has already handed to a caller. A fence says the same thing
+   * one step earlier: a purge moved the writer on, which is the reason
+   * {@link collectForSupport} declines to pack those files too.
+   *
+   * So **delete before disposing**, or through a fresh destination on the same
+   * path — either gives a live handle on a current generation, which is what
+   * makes the deletion safe rather than merely willing.
+   */
+  deleteSupportBundle(deadlineMs: number = DEFAULT_DEADLINE_MS): boolean {
+    if (!this.isEnabled) return false;
+    try {
+      return this.sink.deleteSupportBundle(deadlineMs);
+    } catch {
+      // A native throw is `false`, not a rethrow. The caller is a support flow
+      // finishing an upload; it needs to know the copy may still be there, and
+      // there is nothing it could do with a native error object that it cannot
+      // do with that fact.
+      return false;
+    }
   }
 
   /** Losses with no notice in the file yet. */

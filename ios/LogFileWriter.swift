@@ -2000,6 +2000,168 @@ public final class LogWriter {
     return active + archives(in: directory, baseName: baseName).map(\.url.path)
   }
 
+  // MARK: - Support bundle deletion
+
+  /// Deletes the support bundle and its staging leftovers — see the spec's
+  /// `deleteSupportBundle` for what `true` does and does not promise.
+  ///
+  /// Queue-confined for the reason `logFilePaths` is, and a sharper one: a
+  /// collect publishes by renaming its staging name onto the final one, on this
+  /// queue. Unlinking those same two names from the caller's thread would run
+  /// inside that rename.
+  ///
+  /// Bounded, because this is reachable from the JS thread and the queue may be
+  /// wedged. A timeout is `false`: nothing was observed, and the one thing this
+  /// call must never do is report a bundle gone while it is still on disk.
+  ///
+  /// `handleGeneration` is checked the way `append` checks it, and on the queue
+  /// rather than here: a purge between this call and the block reaching the
+  /// front would otherwise have this handle delete the *current* generation's
+  /// bundle. Being active is not the same as being current — `liveGeneration()`
+  /// answers the first question only — and a stale handle owns nothing in that
+  /// directory any more.
+  func deleteSupportBundle(handleGeneration: UInt64, deadlineMs: Double) -> Bool {
+    // Already on the queue — a nested `async` + `wait` here would deadlock,
+    // exactly as `logFilePaths` guards against.
+    if DispatchQueue.getSpecific(key: queueKey) == true {
+      return deleteIfCurrent(handleGeneration)
+    }
+
+    let request = DeleteRequest()
+    var removed = false
+    let group = DispatchGroup()
+    group.enter()
+    // No explicit QoS, like every other deadline-bound barrier here: the
+    // submission inherits the caller, which is the thread waiting on it. See
+    // `queueQoSForTesting`.
+    queue.async { [self] in
+      // Nothing is cancellable once queued, so the block asks whether it is
+      // still wanted rather than being removed.
+      if request.begin() { removed = deleteIfCurrent(handleGeneration) }
+      group.leave()
+    }
+    guard group.wait(timeout: .now() + .milliseconds(Self.clampDeadline(deadlineMs)))
+      != .timedOut
+    else {
+      // A timed-out delete is not a cancelled one, and unlike a stale read it
+      // does damage. Sitting behind a slow build, this block would otherwise
+      // reach the front of the queue *after* that build renamed a fresh bundle
+      // into place, and unlink a bundle some later collect had just published
+      // and reported the path of — a call that returned "I deleted nothing"
+      // deleting somebody else's file, seconds later. This is the same barrier
+      // `CollectHandoff.giveUp` puts in front of a publish, for the same
+      // reason, in the opposite direction.
+      request.abandon()
+      return false
+    }
+    return removed
+  }
+
+  /// Deletes only if `handleGeneration` is still the writer's current one.
+  ///
+  /// Queue only, and the ordering is the point: the generation is read at the
+  /// last possible instant before the unlinks, so a purge that landed while
+  /// this block waited its turn is seen. Reading it at the call site instead
+  /// would compare a number that was true when the caller asked and false by
+  /// the time anything was deleted.
+  private func deleteIfCurrent(_ handleGeneration: UInt64) -> Bool {
+    stateLock.lock()
+    let current = generation
+    stateLock.unlock()
+    // Not this handle's directory any more. The same refusal `append` gives a
+    // stale handle, for the same reason, with more at stake: an append that
+    // slipped through would add a record to somebody else's file, and a delete
+    // that slipped through would remove somebody else's bundle.
+    guard handleGeneration == current else { return false }
+    return Self.deleteSupportArtifacts(at: fileURL)
+  }
+
+  /// One `deleteSupportBundle` call's claim on its own queued block.
+  ///
+  /// Per call, and shared by exactly the two parties to it — the thread waiting
+  /// and the block running — for the reason `CollectHandoff` is per collect: a
+  /// writer-wide flag would let one caller's timeout abandon another caller's
+  /// deletion.
+  ///
+  /// The window this does *not* close is the terminal one: a block that has
+  /// already passed `begin` runs to completion, so a caller can be told `false`
+  /// about a deletion that then happens. That direction is safe — the artifacts
+  /// are gone and a retry says so — and it cannot take a later bundle, because
+  /// the queue is serial and any subsequent publish is a later task than a
+  /// block that has already started.
+  private final class DeleteRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var abandoned = false
+
+    /// Claims the right to unlink. `false` once the caller has stopped waiting.
+    func begin() -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return !abandoned
+    }
+
+    func abandon() {
+      lock.lock()
+      abandoned = true
+      lock.unlock()
+    }
+  }
+
+  /// Unlinks the three support names under `fileURL`'s directory and reports
+  /// whether none of them remains.
+  ///
+  /// The one implementation, called from two places: on the queue while a
+  /// handle is live, and directly for a sink whose handle has gone — the same
+  /// split, for the same reason, as `logFilePaths` and `artifactPaths`. What
+  /// differs between the callers is what serializes them, never which names get
+  /// deleted.
+  ///
+  /// Absence is success. `removeItem` on a name that was never there fails, and
+  /// treating that as a failure would report a surviving bundle for the
+  /// overwhelmingly common case of deleting one that was already deleted — so
+  /// the verdict is a re-check of the three names rather than the return value
+  /// of three removals.
+  ///
+  /// The directory is synced for the reason the purge syncs it: `unlink`
+  /// returning success only puts the change in the directory's in-memory state,
+  /// and a crash before that reaches storage brings back a gzipped copy of the
+  /// whole log that this call said was gone.
+  static func deleteSupportArtifacts(at fileURL: URL) -> Bool {
+    let fm = FileManager.default
+    let directory = fileURL.deletingLastPathComponent()
+    let baseName = fileURL.lastPathComponent
+    // Exactly these three, from the same helpers `isArtifactName` uses. Never a
+    // directory listing filtered by `isArtifactName`: that matches the log files
+    // too, and this call is not a purge.
+    let names = [
+      supportName(baseName), supportStagingName(baseName), supportMemberName(baseName),
+    ]
+
+    for name in names {
+      let target = directory.appendingPathComponent(name)
+      // The result is deliberately ignored; the loop below is the verdict.
+      try? fm.removeItem(at: target)
+    }
+
+    // Only ENOENT counts as gone, matching the `Presence.ABSENT` rule the purge
+    // applies on both platforms. `fileExists` is the tempting spelling and the
+    // wrong one: it answers false for a permissions failure and for an I/O
+    // error as readily as for absence, so a directory that has stopped
+    // answering would report every artifact deleted.
+    let absent = names.allSatisfy { name in
+      var info = stat()
+      return lstat(directory.appendingPathComponent(name).path, &info) != 0 && errno == ENOENT
+    }
+    guard absent else { return false }
+
+    // A directory that is not there cannot be opened and has nothing whose
+    // removal needs committing; the three names are absent for the strongest
+    // possible reason.
+    var info = stat()
+    if lstat(directory.path, &info) != 0 && errno == ENOENT { return true }
+    return syncDirectory(directory)
+  }
+
   // MARK: - Purge
 
   /// Deletes every artifact and fences every handle.

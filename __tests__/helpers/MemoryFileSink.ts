@@ -300,6 +300,10 @@ export class MemoryFileSink implements FileSinkLike {
   onMaintain: (() => void) | undefined;
   /** Throw out of collectLogs, as a native call can. */
   collectThrows = false;
+  /** Throw out of deleteSupportBundle, as a native call can. */
+  deleteBundleThrows = false;
+  /** Deadlines `deleteSupportBundle` was called with, in order. */
+  deleteBundleCalls: number[] = [];
   /** Arguments every collect was called with, in order. */
   collectCalls: Array<{ deadlineMs: number; maxTotalBytes: number }> = [];
   /**
@@ -449,6 +453,7 @@ export class MemoryFileSink implements FileSinkLike {
     }
 
     this.collectedBundles.push(contents);
+    this.bundleOnDisk = true;
     return {
       path: this.bundlePath,
       byteCount: bytes,
@@ -456,6 +461,40 @@ export class MemoryFileSink implements FileSinkLike {
       truncated: false,
       complete: true,
     };
+  }
+
+  /**
+   * Whether a bundle is sitting beside the log file.
+   *
+   * Computed, not settable. A collect that produced one sets it; deleting it
+   * and purging clear it. Tests assert on this rather than on the boolean
+   * `deleteSupportBundle` returned, so that a double which reported success
+   * without removing anything would still be caught.
+   */
+  private bundleOnDisk = false;
+
+  get bundleExists(): boolean {
+    return this.bundleOnDisk;
+  }
+
+  deleteSupportBundle(deadlineMs: number): boolean {
+    this.deleteBundleCalls.push(deadlineMs);
+    if (this.deleteBundleThrows) throw new Error('delete unavailable');
+
+    // No handle: the `clearLogs` answer, not the `getLogFilePaths` one. Never
+    // opened is vacuously gone; opened and since closed cannot be vouched for,
+    // because with the handle went the generation that said whose directory
+    // that is.
+    if (this.closed) return !this.mayHaveArtifacts;
+
+    // A fenced handle refuses too, exactly where the registry and the writer
+    // refuse it — the registry turns away a handle that is not active, and the
+    // writer re-checks the generation on its own queue immediately before
+    // unlinking, so a purge landing mid-call is still caught.
+    if (this.generation !== this.writer.generation) return false;
+
+    this.bundleOnDisk = false;
+    return true;
   }
 
   flush(deadlineMs: number): FlushOutcome {
@@ -539,6 +578,10 @@ export class MemoryFileSink implements FileSinkLike {
     if (durable) {
       this.artifactPaths =
         rebound && this.openedPath !== undefined ? [this.openedPath] : [];
+      // The bundle is an artifact, and a purge that left a gzipped copy of the
+      // log behind would not be a purge. Both natives include the three support
+      // names in the sweep; this is the double saying the same thing.
+      this.bundleOnDisk = false;
     }
     return this.withHostileClear({
       deletedCount: durable ? deleted : 0,

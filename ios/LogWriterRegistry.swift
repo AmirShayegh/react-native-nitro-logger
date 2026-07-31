@@ -466,6 +466,21 @@ public final class LogFileHandle {
     return writer.logFilePaths()
   }
 
+  /// Deletes the support bundle — see `LogWriter.deleteSupportBundle`.
+  ///
+  /// Gated on liveness like every other entry point, and `false` when the gate
+  /// refuses. But liveness is only half of it: `liveGeneration()` says this
+  /// handle is active, not that it is current, so the generation travels down
+  /// to the writer and is checked against the current one on the queue — the
+  /// same two-part gate `appendBatch` applies, and for a sharper reason. A
+  /// stale append adds a record to somebody else's file; a stale delete removes
+  /// somebody else's bundle.
+  public func deleteSupportBundle(deadlineMs: Double) -> Bool {
+    guard let handleGeneration = liveGeneration() else { return false }
+    return writer.deleteSupportBundle(
+      handleGeneration: handleGeneration, deadlineMs: deadlineMs)
+  }
+
   /// Deletes every artifact, then rebinds this handle **only if the purge was
   /// complete**.
   ///

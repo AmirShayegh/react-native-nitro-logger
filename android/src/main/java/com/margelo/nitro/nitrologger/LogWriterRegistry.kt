@@ -654,6 +654,25 @@ class LogFileHandle internal constructor(
   }
 
   /**
+   * Deletes the support bundle — see [LogFileWriter.deleteSupportBundle].
+   *
+   * Gated on liveness like every other entry point, and `false` when the gate
+   * refuses. But liveness is only half of it: [isLive] says this handle is
+   * active, not that it is current, so the generation travels down to the
+   * writer and is checked against the current one on the executor — the same
+   * two-part gate [appendBatch] applies, and for a sharper reason. A stale
+   * append adds a record to somebody else's file; a stale delete removes
+   * somebody else's bundle.
+   */
+  fun deleteSupportBundle(deadlineMs: Double): Boolean {
+    val handleGeneration = lock.withLock {
+      if (state != State.ACTIVE) return false
+      generation
+    }
+    return writer.deleteSupportBundle(handleGeneration, deadlineMs)
+  }
+
+  /**
    * Purges, then rebinds only if the writer really came back.
    *
    * `rebound` is a fact about THIS handle, not about the writer: if this handle

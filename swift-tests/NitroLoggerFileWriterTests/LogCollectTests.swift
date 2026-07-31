@@ -386,6 +386,182 @@ final class LogCollectTests: LogWriterTestCase {
     XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
   }
 
+  // MARK: - Deleting the bundle
+
+  /// The third step of the support flow, and the one that decides whether a
+  /// gzipped copy of the whole log stays on the device after the upload.
+  func testDeletingTheBundleRemovesItAndLeavesTheLogsAlone() throws {
+    let handle = try makeHandle(policy: policy(bytes: 64))
+    writeRotating(handle, count: 6)
+    _ = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+    let logsBefore = handle.logFilePaths()
+    XCTAssertGreaterThan(logsBefore.count, 1, "the setup did not produce archives to spare")
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "it reported the bundle gone with the bundle still on disk")
+    // The half that makes this not a smaller purge. Deleting the copy must
+    // leave every original exactly where it was.
+    XCTAssertEqual(handle.logFilePaths(), logsBefore, "it deleted log files too")
+  }
+
+  /// Deleting a bundle that is not there is the outcome the caller asked for,
+  /// not a failure — a retry, and a collect that found nothing to pack, both
+  /// land here.
+  func testDeletingABundleThatWasNeverCollectedSucceeds() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+  }
+
+  /// The staging names hold log bytes too — a half-written bundle and the
+  /// scratch file a plaintext source was being compressed into. Leaving either
+  /// behind would leave a partial copy of the log the caller believes it
+  /// deleted.
+  func testDeletingTakesTheStagingLeftoversAsWell() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    let leftovers = [
+      LogWriter.supportStagingName("app.log"),
+      LogWriter.supportMemberName("app.log"),
+    ].map { logsDirectory.appendingPathComponent($0) }
+    for leftover in leftovers { try Data("truncated".utf8).write(to: leftover) }
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    for leftover in leftovers {
+      XCTAssertFalse(
+        FileManager.default.fileExists(atPath: leftover.path),
+        "\(leftover.lastPathComponent) survived")
+    }
+  }
+
+  /// Gated on liveness like every other entry point: a released handle
+  /// unlinking would reach into a directory a live handle now owns, and may be
+  /// mid-publish in.
+  func testAReleasedHandleCannotDeleteTheBundle() throws {
+    let handle = try makeHandle(policy: policy())
+    write(handle, record)
+    _ = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    _ = handle.close(deadlineMs: 5000)
+
+    XCTAssertFalse(handle.deleteSupportBundle(deadlineMs: 5000))
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "a released handle deleted a bundle anyway")
+  }
+
+  /// Being active is not the same as being current, and this is the difference.
+  ///
+  /// The handle below is never closed, so every liveness gate it passes says
+  /// yes; what it is not is the owner of that directory any more. A sibling
+  /// purged, the writer moved to a new generation, and the bundle sitting there
+  /// now was produced by whoever holds it — and has already been handed back to
+  /// a caller as a path to upload. Deleting it is the ownership violation this
+  /// check exists for, and nothing about the handle's own state would catch it.
+  func testAHandleLeftBehindByAnotherPurgeCannotDeleteTheBundle() throws {
+    let victim = try makeHandle(policy: policy())
+    let sibling = try makeHandle(policy: policy())
+    write(victim, record)
+
+    // The sibling purges, taking the generation with it, then collects. The
+    // bundle on disk afterwards is the sibling's.
+    XCTAssertTrue(sibling.clearLogs(deadlineMs: 5000).durable)
+    write(sibling, record)
+    XCTAssertTrue(sibling.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000).complete)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: bundleURL.path))
+
+    XCTAssertFalse(
+      victim.deleteSupportBundle(deadlineMs: 5000),
+      "a stale handle reported deleting a bundle it does not own")
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "a stale handle deleted the current generation's bundle")
+
+    // And the owner can still delete its own.
+    XCTAssertTrue(sibling.deleteSupportBundle(deadlineMs: 5000))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: bundleURL.path))
+  }
+
+  /// A delete that lands *before* a build publishes leaves a bundle behind, and
+  /// that is correct rather than a leak.
+  ///
+  /// `true` is a statement about the instant the call ran, not a promise about
+  /// the next one — the collect that was already in flight legitimately writes
+  /// a fresh bundle afterwards. Sequencing the two is the caller's job, and the
+  /// alternative would be a delete that reaches forward in time to cancel a
+  /// collect it never knew about.
+  func testABundleDeletedBeforeAPublishIsRecreatedByTheCollect() throws {
+    let held = Latch()
+    defer { held.release() }
+    let inCompressor = DispatchSemaphore(value: 0)
+
+    let gated: LogWriter.Compressor = { source, destination in
+      inCompressor.signal()
+      held.wait()
+      return Self.realGzip(source, destination)
+    }
+    let handle = try makeHandle(policy: policy(bytes: 10_000_000), compressor: gated)
+    write(handle, "precious\n")
+    // A bundle from an earlier collect, so the delete below has something real
+    // to remove rather than succeeding vacuously.
+    try Data("earlier".utf8).write(to: bundleURL)
+
+    let collectFinished = DispatchSemaphore(value: 0)
+    var collected = LogCollectOutcome.nothing
+    DispatchQueue.global().async {
+      collected = handle.collectLogs(deadlineMs: 10_000, maxTotalBytes: 10_000_000)
+      collectFinished.signal()
+    }
+    inCompressor.wait()
+    held.releaseAfter(3)
+
+    // The build owns the queue, so this cannot run yet — the same serialization
+    // `testAPurgeCannotPreemptABuildAlreadyRunning` pins. It is bounded, and a
+    // bound that expires is `false`.
+    XCTAssertFalse(
+      handle.deleteSupportBundle(deadlineMs: 50),
+      "it reported a deletion it never got the queue to perform")
+
+    held.release()
+    collectFinished.wait()
+    XCTAssertTrue(collected.complete, "the build was not preempted; it published")
+
+    // The queued delete runs, then the publish already happened — so what is on
+    // disk at the end is the collect's bundle, not the one that was deleted.
+    handle.writerForTesting.settleForTesting()
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: bundleURL.path),
+      "the collect's own bundle went missing")
+    XCTAssertNotEqual(
+      try String(contentsOf: bundleURL, encoding: .isoLatin1), "earlier",
+      "the earlier bundle survived a delete that was queued before the publish")
+  }
+
+  /// The ordinary support flow, with the delete last: nothing remains.
+  func testABundleDeletedAfterAPublishIsGone() throws {
+    let handle = try makeHandle(policy: policy(bytes: 64))
+    writeRotating(handle, count: 6)
+    let collected = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+    XCTAssertTrue(collected.complete)
+    XCTAssertEqual(collected.path, bundleURL.path)
+
+    XCTAssertTrue(handle.deleteSupportBundle(deadlineMs: 5000))
+
+    // Every support name, not just the published one: a staging file the build
+    // left behind is a partial copy of the same log.
+    XCTAssertEqual(
+      names().filter { $0.hasPrefix("app.log.support") }, [],
+      "a support artifact survived the delete")
+  }
+
   // MARK: - The deadline
 
   /**

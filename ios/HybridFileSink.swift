@@ -189,6 +189,34 @@ final class HybridFileSink: HybridFileSinkSpec {
     )
   }
 
+  func deleteSupportBundle(deadlineMs: Double) throws -> Bool {
+    // `snapshot`, the `clearLogs` treatment — deliberately NOT the
+    // `getLogFilePaths` one, though the two look alike and this method sat on
+    // the other side of that line until a review pushed back.
+    //
+    // The difference is that reading a directory this object no longer owns is
+    // harmless and deleting from it is not. Once the handle is gone there is no
+    // generation left to check and no queue to serialize against, so a live
+    // handle may own that path now and be mid-publish in it; a `.support.gz`
+    // deleted from here would be *its* bundle, whose path it has already handed
+    // back to a caller. The upload-finishes-after-`dispose` case is real, and
+    // the answer to it is to delete before disposing, or through a fresh
+    // destination on the same path — both of which produce a live handle with a
+    // current generation, which is the only thing that makes this safe.
+    //
+    // Both fields in ONE critical section, like `clearLogs`: reading them
+    // separately lets a close land in between and produce "no handle, nothing
+    // created", the one combination that is never true.
+    let (live, durableWithoutHandle) = lifecycle.snapshot()
+    guard let handle = live else {
+      // Never opened: no directory, no bundle, vacuously gone. Opened and since
+      // closed: the files are out of reach and this object cannot vouch for
+      // them.
+      return durableWithoutHandle
+    }
+    return handle.deleteSupportBundle(deadlineMs: deadlineMs)
+  }
+
   func flush(deadlineMs: Double) throws -> FlushOutcome {
     // One snapshot, so the handle and the answer to give without one cannot
     // disagree about which instant they describe.

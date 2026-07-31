@@ -3,6 +3,7 @@ package com.margelo.nitro.nitrologger
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -449,6 +450,184 @@ class LogCollectTest {
     assertEquals(1, archiveNames().size)
 
     assertTrue(bundle.exists())
+  }
+
+  // MARK: - Deleting the bundle
+
+  /**
+   * The third step of the support flow, and the one that decides whether a
+   * gzipped copy of the whole log stays on the device after the upload.
+   */
+  @Test
+  fun `deleting the bundle removes it and leaves the logs alone`() {
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 64.0))
+    w.writeRotating(6)
+    w.collectLogs(1, 5000.0, 10_000_000.0)
+    assertTrue(bundle.exists())
+    val logsBefore = w.logFilePaths()
+    assertTrue("the setup did not produce archives to spare", logsBefore.size > 1)
+
+    assertTrue(w.deleteSupportBundle(w.currentGeneration, 5000.0))
+
+    assertFalse("it reported the bundle gone with the bundle still on disk", bundle.exists())
+    // The half that makes this not a smaller purge. Deleting the copy must
+    // leave every original exactly where it was.
+    assertEquals("it deleted log files too", logsBefore, w.logFilePaths())
+  }
+
+  /**
+   * Deleting a bundle that is not there is the outcome the caller asked for,
+   * not a failure — a retry, and a collect that found nothing to pack, both
+   * land here.
+   */
+  @Test
+  fun `deleting a bundle that was never collected succeeds`() {
+    val w = writer()
+    w.write(line(0))
+    w.flush(1, 1000.0)
+    assertFalse(bundle.exists())
+
+    assertTrue(w.deleteSupportBundle(w.currentGeneration, 5000.0))
+  }
+
+  /**
+   * The staging names hold log bytes too — a half-written bundle and the
+   * scratch file a plaintext source was being compressed into. Leaving either
+   * behind would leave a partial copy of the log the caller believes it
+   * deleted.
+   */
+  @Test
+  fun `deleting takes the staging leftovers as well`() {
+    val w = writer()
+    w.write(line(0))
+    w.flush(1, 1000.0)
+    val leftovers = listOf(
+      LogFileWriter.supportStagingName("app.log"),
+      LogFileWriter.supportMemberName("app.log")
+    ).map { File(directory, it) }
+    leftovers.forEach { it.writeText("truncated") }
+
+    assertTrue(w.deleteSupportBundle(w.currentGeneration, 5000.0))
+
+    leftovers.forEach { assertFalse("${it.name} survived", it.exists()) }
+  }
+
+  /**
+   * Being active is not the same as being current, and this is the difference.
+   *
+   * The generation below is never closed, so every liveness gate it passes says
+   * yes; what it is not is the owner of that directory any more. A purge moved
+   * the writer on, and the bundle sitting there was produced afterwards — and
+   * has already been handed back to a caller as a path to upload. Deleting it
+   * is the ownership violation this check exists for, and nothing about the
+   * handle's own state would catch it.
+   */
+  @Test
+  fun `a generation left behind by a purge cannot delete the bundle`() {
+    val w = writer()
+    val stale = w.currentGeneration
+    w.write(line(0))
+    w.flush(1, 1000.0)
+
+    // The purge moves the writer on; the collect afterwards publishes a bundle
+    // belonging to the new generation.
+    assertTrue(w.clearLogs(5000.0).first.durable)
+    val current = w.currentGeneration
+    assertNotEquals("the purge did not move the generation", stale, current)
+    w.append(1, current, line(1), 1)
+    w.flush(1, 1000.0)
+    assertTrue(w.collectLogs(1, 5000.0, 10_000_000.0).complete)
+    assertTrue(bundle.exists())
+
+    assertFalse(
+      "a stale generation reported deleting a bundle it does not own",
+      w.deleteSupportBundle(stale, 5000.0)
+    )
+    assertTrue("a stale generation deleted the current bundle", bundle.exists())
+
+    // And the owner can still delete its own.
+    assertTrue(w.deleteSupportBundle(current, 5000.0))
+    assertFalse(bundle.exists())
+  }
+
+  /**
+   * A delete that lands *before* a build publishes leaves a bundle behind, and
+   * that is correct rather than a leak.
+   *
+   * `true` is a statement about the instant the call ran, not a promise about
+   * the next one — the collect that was already in flight legitimately writes a
+   * fresh bundle afterwards. Sequencing the two is the caller's job.
+   *
+   * The other half, and the reason this test is worth its length: the delete
+   * whose bound expired must not run later. Queued behind the build, it would
+   * otherwise reach the front of the executor after the publish and unlink the
+   * bundle that collect just reported the path of. See
+   * [LogFileWriter.DeleteRequest].
+   */
+  @Test
+  fun `a bundle deleted before a publish is recreated by the collect`() {
+    val held = CountDownLatch(1)
+    val inCompressor = CountDownLatch(1)
+    val compressor = LogFileWriter.Compressor { source, destination ->
+      inCompressor.countDown()
+      held.await()
+      realGzip(source, destination)
+    }
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 10_000_000.0), compressor = compressor)
+    w.write("precious\n")
+    w.flush(1, 1000.0)
+    // A bundle from an earlier collect, so the delete below has something real
+    // to remove rather than succeeding vacuously.
+    bundle.writeText("earlier")
+
+    val collected = AtomicReference<LogCollectOutcome>()
+    val collectThread = Thread { collected.set(w.collectLogs(1, 10_000.0, 10_000_000.0)) }
+    try {
+      collectThread.start()
+      assertTrue(inCompressor.await(10, TimeUnit.SECONDS))
+      releaseAfter(held, 3_000)
+
+      // The build owns the executor, so this cannot run yet — the same
+      // serialization `a purge cannot preempt a build already running` pins. It
+      // is bounded, and a bound that expires is `false`.
+      assertFalse(
+        "it reported a deletion it never got the executor to perform",
+        w.deleteSupportBundle(w.currentGeneration, 50.0)
+      )
+    } finally {
+      held.countDown()
+    }
+
+    collectThread.join(10_000)
+    assertTrue("the build was not preempted; it published", collected.get().complete)
+
+    w.settleForTesting()
+    assertTrue("the collect's own bundle went missing", bundle.exists())
+    assertNotEquals(
+      "the abandoned delete ran anyway and took the bundle the collect published",
+      "earlier",
+      bundle.readText()
+    )
+  }
+
+  /** The ordinary support flow, with the delete last: nothing remains. */
+  @Test
+  fun `a bundle deleted after a publish is gone`() {
+    val w = writer(LogRotationPolicy.of(maxFileSizeBytes = 64.0))
+    w.writeRotating(6)
+    val collected = w.collectLogs(1, 5000.0, 10_000_000.0)
+    assertTrue(collected.complete)
+    assertEquals(bundle.absolutePath, collected.path)
+
+    assertTrue(w.deleteSupportBundle(w.currentGeneration, 5000.0))
+
+    // Every support name, not just the published one: a staging file the build
+    // left behind is a partial copy of the same log.
+    assertEquals(
+      "a support artifact survived the delete",
+      emptyList<String>(),
+      directory.list()!!.filter { it.startsWith("app.log.support") }
+    )
   }
 
   // MARK: - The deadline

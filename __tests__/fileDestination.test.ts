@@ -485,6 +485,156 @@ describe('FileDestination — collectForSupport', () => {
   });
 });
 
+describe('FileDestination — deleteSupportBundle', () => {
+  test('the bundle a collect produced is gone afterwards', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    expect(sink.bundleExists).toBe(true);
+
+    // Asserted on the sink's own state, not just on the returned boolean: a
+    // wrapper that answered `true` without calling anything would pass the
+    // second assertion alone.
+    expect(destination.deleteSupportBundle()).toBe(true);
+    expect(sink.bundleExists).toBe(false);
+  });
+
+  test('deleting a bundle that was never collected is true, not an error', () => {
+    const { destination, sink } = build();
+
+    // The overwhelmingly common case for a retry, and for a support flow whose
+    // collect found nothing to pack. "Already gone" is the outcome the caller
+    // asked for.
+    expect(destination.deleteSupportBundle()).toBe(true);
+    expect(sink.bundleExists).toBe(false);
+  });
+
+  test('the deadline reaches the sink, and defaults without one', () => {
+    const { destination, sink } = build();
+    destination.deleteSupportBundle(250);
+    destination.deleteSupportBundle();
+
+    expect(sink.deleteBundleCalls[0]).toBe(250);
+    // Three unlinks and an fsync, not a compression pass — so this takes the
+    // ordinary deadline rather than the collect's longer one.
+    expect(sink.deleteBundleCalls[1]).toBe(2000);
+  });
+
+  test('a disposed destination refuses, and leaves the bundle alone', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'collected before teardown' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    destination.dispose();
+
+    // Tempting to allow — the upload really can finish after teardown — and
+    // wrong. With the handle gone there is no generation left to check, so
+    // another destination may own that path by now and be mid-publish in it,
+    // and the bundle removed would be *its* bundle. `getLogFilePaths` still
+    // answering after dispose is not a precedent: reading a directory you no
+    // longer own is harmless, deleting from it is not.
+    const callsBefore = sink.deleteBundleCalls.length;
+
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+    // The sink is never reached, which is what pins THIS guard rather than the
+    // double's. Both refuse a disposed sink — the adapters do it too — so
+    // without this the assertions above pass on a wrapper that has no guard at
+    // all and simply relays whatever the sink says.
+    expect(sink.deleteBundleCalls).toHaveLength(callsBefore);
+  });
+
+  test('a sink that never opened has nothing to delete, vacuously', () => {
+    // Asserted on the sink, because a `FileDestination` opens in its
+    // constructor and cannot reach this state. It is the other side of the
+    // no-handle case and the reason that case is not a blanket refusal:
+    // nothing was ever created, so "no bundle remains" holds with nothing to
+    // check — the same `!mayHaveArtifacts` both adapters read.
+    const neverOpened = new MemoryWriter().attach();
+
+    expect(neverOpened.deleteSupportBundle(1000)).toBe(true);
+  });
+
+  test('a fenced destination refuses, and leaves the bundle alone', () => {
+    const { destination, sink, writer } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    fenceFromOutside(destination, writer.attach());
+
+    // The opposite answer to the disposed case, and the right one: a fence
+    // means a purge moved the writer on, so the bundle in that directory is
+    // whoever holds the writer's now — the same reason `collectForSupport`
+    // declines to pack it.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a destination that has not yet noticed it is stale reports the sinks refusal', () => {
+    const { destination, sink, writer } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    // A sibling purges; this destination is now stale at the sink and does not
+    // know it, because fencing is not instantaneous — a handle finds out on its
+    // next write, and this one has not written since. So `isEnabled` is still
+    // true here while the sink refuses.
+    const other = writer.attach();
+    other.open('/memory/logs/app.log', undefined, true);
+    other.clearLogs(1000);
+    expect(destination.isEnabled).toBe(true);
+
+    // The wrapper must return what the sink said. Answering `true` off the back
+    // of its own un-updated flag would tell a support flow the copy is gone
+    // while it is sitting in another generation's directory.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a native throw is reported as false, not raised at the caller', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+    sink.deleteBundleThrows = true;
+
+    // A support flow can act on "the copy may still be there". It can do
+    // nothing with a native error object that it cannot do with that fact.
+    expect(destination.deleteSupportBundle()).toBe(false);
+    expect(sink.bundleExists).toBe(true);
+  });
+
+  test('a purge removes the bundle too, so a later delete is vacuously true', () => {
+    const { destination, sink } = build();
+    destination.write(entry({ message: 'in the bundle' }));
+    destination.collectForSupport({ maxTotalBytes: 1_000_000 });
+
+    expect(destination.purge(1000).durable).toBe(true);
+    // A compliance purge that left a gzipped copy of the log behind would not
+    // be a purge. Both natives sweep the three support names with everything
+    // else, and this is the JS side of that claim.
+    expect(sink.bundleExists).toBe(false);
+    expect(destination.deleteSupportBundle()).toBe(true);
+  });
+});
+
+/**
+ * Fences `victim` the way production does — a second handle purges the writer,
+ * and the victim finds out on its next write by having the append rejected.
+ *
+ * Not `victim.purge()`: that rebinds its own caller, so it produces a *live*
+ * destination rather than a fenced one. The asymmetry is the whole point of
+ * every test that uses this.
+ */
+function fenceFromOutside(
+  victim: FileDestination,
+  other: MemoryFileSink,
+  path = '/memory/logs/app.log'
+): void {
+  other.open(path, undefined, true);
+  other.clearLogs(1000);
+  victim.write(entry({ message: 'rejected by a stale generation' }));
+  victim.flush(1000);
+  expect(victim.isEnabled).toBe(false);
+}
+
 describe('FileDestination — oversized entries', () => {
   test('a formatter that can shed structure is asked to', () => {
     const { destination, writer } = build({ maxEntryBytes: 200 });
@@ -1313,18 +1463,6 @@ describe('FileDestination.reopen', () => {
   /** Fence `victim` from the outside — a second handle purges the writer out
    * from under it, exactly as a compliance deletion on another destination
    * does. The rejection arrives on the next append, so one is forced. */
-  function fenceFromOutside(
-    victim: FileDestination,
-    other: MemoryFileSink,
-    path = '/memory/logs/app.log'
-  ): void {
-    other.open(path, undefined, true);
-    other.clearLogs(1000);
-    victim.write(entry({ message: 'rejected by a stale generation' }));
-    victim.flush(1000);
-    expect(victim.isEnabled).toBe(false);
-  }
-
   test('a handle fenced by another purge writes again after reopen', () => {
     const { destination, sink, writer } = build();
     fenceFromOutside(destination, writer.attach());

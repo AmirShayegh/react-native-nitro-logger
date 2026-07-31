@@ -193,6 +193,15 @@ namespace margelo::nitro::nitrologger::bridge::swift {
     return Result<CollectOutcome>::withError(error);
   }
   
+  // pragma MARK: Result<bool>
+  using Result_bool_ = Result<bool>;
+  inline Result_bool_ create_Result_bool_(bool value) noexcept {
+    return Result<bool>::withValue(std::move(value));
+  }
+  inline Result_bool_ create_Result_bool_(const std::exception_ptr& error) noexcept {
+    return Result<bool>::withError(error);
+  }
+  
   // pragma MARK: Result<ClearOutcome>
   using Result_ClearOutcome_ = Result<ClearOutcome>;
   inline Result_ClearOutcome_ create_Result_ClearOutcome_(const ClearOutcome& value) noexcept {

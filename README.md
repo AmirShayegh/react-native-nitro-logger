@@ -199,6 +199,12 @@ file.getLogFilePaths();     // the individual files, if you would rather send th
 const bundle = file.collectForSupport({ maxTotalBytes: 5 * 1024 * 1024 });
 if (bundle.complete && bundle.path !== '') {
   // Upload `bundle.path`. Nothing is transmitted or encrypted for you.
+  // Then delete it: collect -> upload -> delete. A bundle left behind is a
+  // gzipped copy of the whole log that retention never reclaims, because the
+  // sweep deliberately keeps a finished one in case you are still uploading it.
+  // Delete before disposing the destination — a released handle no longer knows
+  // whether that bundle is still its own, so it refuses rather than guess.
+  file.deleteSupportBundle();
 }
 
 const outcome = file.purge(5000);   // the compliance purge

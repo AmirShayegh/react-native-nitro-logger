@@ -252,6 +252,39 @@ export interface FileSink extends HybridObject<{
   collectLogs(deadlineMs: number, maxTotalBytes: number): CollectOutcome;
 
   /**
+   * Deletes the bundle `collectLogs` produced, and its staging leftovers.
+   *
+   * The third step of a support flow: collect, upload, delete. Without it the
+   * bundle stays on the device until a purge or the next collect replaces it —
+   * a gzipped copy of the whole log, outside the retention budget the app
+   * configured, and deliberately skipped by the orphan sweep because a
+   * FINISHED bundle is one somebody may still be uploading.
+   *
+   * Exactly the three support names and never a log file. This is not a purge
+   * and must not become a smaller, quieter one; `clearLogs` deletes these as
+   * well, along with everything else.
+   *
+   * `true` means no bundle artifact remained when this ran, including
+   * vacuously for a sink that never opened and has no directory to look in.
+   * That is a statement about an instant, not a promise about the next one: a
+   * collect starting afterwards — or one already in flight when this landed —
+   * legitimately writes a new bundle, and the caller sequences the two.
+   *
+   * `false` is the whole of the rest, and deliberately not a list of causes:
+   * the deletion was refused, timed out, or could not be *durably* confirmed
+   * gone. It does not assert that anything survived — a refusal establishes
+   * nothing about the directory — so the bundle should be assumed still there.
+   *
+   * Queue-bound on the writer while a handle is live, so it cannot land inside
+   * a collect's rename. A closed sink still deletes — closing releases a
+   * writer, it does not delete files, and an upload finishing after the
+   * destination went away is exactly when this gets called — but with no queue
+   * to reach, that path is best-effort in the way `getLogFilePaths` already is
+   * for a closed sink.
+   */
+  deleteSupportBundle(deadlineMs: number): boolean;
+
+  /**
    * Registry-serialized purge of the COMPLETE artifact set (current file,
    * sidecar, archives, gzip temporaries, staging/recovery files). Bumps the
    * writer generation; the invoking handle rebinds only after durable

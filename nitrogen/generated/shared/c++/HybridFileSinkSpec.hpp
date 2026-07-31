@@ -75,6 +75,7 @@ namespace margelo::nitro::nitrologger {
       virtual std::vector<std::string> getLogFilePaths() = 0;
       virtual SinkStatus maintain(double deadlineMs) = 0;
       virtual CollectOutcome collectLogs(double deadlineMs, double maxTotalBytes) = 0;
+      virtual bool deleteSupportBundle(double deadlineMs) = 0;
       virtual ClearOutcome clearLogs(double deadlineMs) = 0;
 
     protected:
