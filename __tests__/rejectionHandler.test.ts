@@ -298,6 +298,45 @@ describe('installRejectionHandler', () => {
       expect(destination.entries).toHaveLength(before + 1);
     });
 
+    /**
+     * Where the bound actually is, rather than that there is one somewhere.
+     *
+     * The test above overshoots by design and would pass just as happily
+     * against a ring of eight: the oldest id is evicted either way. What it
+     * cannot see is the limit shrinking — and a ring that quietly got smaller
+     * would drop retractions for rejections handled a moment later, which is
+     * the case this feature exists for.
+     */
+    test('the ring holds exactly 256, checked on both sides', () => {
+      const atCapacity = wired();
+      installRejectionHandler({
+        logger: atCapacity.logger,
+        tracking: atCapacity.tracking,
+      });
+      atCapacity.tracking.reject(0, new Error('first'));
+      // 255 more, so 256 are remembered and the first is the oldest of them.
+      for (let id = 1; id <= 255; id += 1) {
+        atCapacity.tracking.reject(id, new Error('filler'));
+      }
+      let before = atCapacity.destination.entries.length;
+      atCapacity.tracking.handleLate(0, new Error('first'));
+      expect(atCapacity.destination.entries).toHaveLength(before + 1);
+
+      // One more, and the first is pushed out.
+      const overCapacity = wired();
+      installRejectionHandler({
+        logger: overCapacity.logger,
+        tracking: overCapacity.tracking,
+      });
+      overCapacity.tracking.reject(0, new Error('first'));
+      for (let id = 1; id <= 256; id += 1) {
+        overCapacity.tracking.reject(id, new Error('filler'));
+      }
+      before = overCapacity.destination.entries.length;
+      overCapacity.tracking.handleLate(0, new Error('first'));
+      expect(overCapacity.destination.entries).toHaveLength(before);
+    });
+
     test('can be turned off without turning off the report', () => {
       const { logger, destination, tracking } = wired();
       installRejectionHandler({ logger, tracking, logHandledLate: false });

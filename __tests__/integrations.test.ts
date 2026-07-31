@@ -98,6 +98,48 @@ describe('installErrorHandler', () => {
     expect(destination.flushDeadlines).toEqual([750]);
   });
 
+  test('the default budget is 2s when none is given', () => {
+    const { logger, destination, errorUtils } = wired();
+    installErrorHandler({ logger, errorUtils });
+
+    // The one deadline in this library a caller is least likely to set and
+    // most likely to depend on: the process is going down, and this number is
+    // how long the last records get to reach disk.
+    errorUtils.throw(new Error('fatal'), true);
+    expect(destination.flushDeadlines).toEqual([2000]);
+  });
+
+  test.each([
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['negative', -1],
+  ])(
+    'a %s budget falls back to the default rather than through',
+    (_n, value) => {
+      const { logger, destination, errorUtils } = wired();
+      installErrorHandler({ logger, errorUtils, fatalFlushMs: value });
+
+      // Passed through, each of these breaks the flush differently — a NaN
+      // comparison is false everywhere, an Infinity is an unbounded wait on the
+      // crash path, a negative is a deadline already spent. Falling back is the
+      // only one of the four outcomes that still writes the records.
+      errorUtils.throw(new Error('fatal'), true);
+      expect(destination.flushDeadlines).toEqual([2000]);
+    }
+  );
+
+  test('a budget of zero is honoured, because zero is a real deadline', () => {
+    const { logger, destination, errorUtils } = wired();
+    installErrorHandler({ logger, errorUtils, fatalFlushMs: 0 });
+
+    // "Write what needs no waiting and give up" is a legitimate thing to ask
+    // for on a crash path, and distinct from "I did not choose". Sweeping it
+    // in with the nonsense above would silently spend two seconds a caller
+    // deliberately declined.
+    errorUtils.throw(new Error('fatal'), true);
+    expect(destination.flushDeadlines).toEqual([0]);
+  });
+
   test('nothing from the error reaches the entry', () => {
     const { logger, destination, errorUtils } = wired();
     installErrorHandler({ logger, errorUtils });
