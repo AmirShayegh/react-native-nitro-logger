@@ -31,6 +31,31 @@ public final class LogWriterRegistry {
   ///
   /// Counted rather than a set: it costs nothing and stops a stray double
   /// release from clearing a marker another close still needs.
+  ///
+  /// ## An entry here can be permanent, and that is the chosen behaviour
+  ///
+  /// The marker is dropped by the close that set it, from the `defer` in
+  /// `LogWriter.close`'s barrier. On this platform that `defer` is structural
+  /// insurance rather than a fix — nothing in that block throws — but the
+  /// Kotlin twin reached the same guarantee through a `finally` that closed a
+  /// real hole: an `Error` escaping there stranded the path on perfectly
+  /// healthy storage.
+  ///
+  /// What remains is a writer that never finishes draining, because the disk
+  /// it is writing to stopped answering. That path then refuses every later
+  /// acquire with `stillClosing` for the life of the process, and no timer
+  /// clears it. **This is deliberate.** While that writer exists it still holds
+  /// the descriptor and the OS-level exclusive lock, so the alternative is not
+  /// "recover" — it is "open a second writer onto a file the first has not let
+  /// go of", which is the collision this map exists to prevent. A marker that
+  /// is correct and unhelpful beats one that is wrong.
+  ///
+  /// Reclaiming it needs a second source of truth for "will this writer ever
+  /// finish" — a writer-owned predicate that answers *stopped forever*, not
+  /// *slow* — and `dropClaimLocked`'s doc explains why inventing one lightly is
+  /// worse than the wait. A timeout is not that predicate: an acquire timing
+  /// out says only that five seconds passed. Revisit if field reports show
+  /// `stillClosing` outliving the storage problem that caused it.
   private var closing: [String: Int] = [:]
   private var nextHandleID: UInt64 = 1
 

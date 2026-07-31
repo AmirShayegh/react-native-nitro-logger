@@ -142,15 +142,15 @@ class HybridFileSink : HybridFileSinkSpec() {
       FileSinkLifecycle.Claim.GRANTED -> Unit
       FileSinkLifecycle.Claim.ALREADY_OPEN -> throw LogWriterException(
         LogWriterException.Kind.CONFIG_CONFLICT,
-        "this sink is already open"
+        FileSinkMessages.ALREADY_OPEN
       )
       FileSinkLifecycle.Claim.CLOSING -> throw LogWriterException(
         LogWriterException.Kind.STILL_CLOSING,
-        "an earlier open on this sink is still being cancelled; retry"
+        FileSinkMessages.CLOSING
       )
       FileSinkLifecycle.Claim.DISPOSED -> throw LogWriterException(
         LogWriterException.Kind.CONFIG_CONFLICT,
-        "this sink has been disposed"
+        FileSinkMessages.DISPOSED
       )
     }
 
@@ -174,7 +174,10 @@ class HybridFileSink : HybridFileSinkSpec() {
       )
     } catch (e: Throwable) {
       // Failed attempts have to release the claim, or a retry is refused
-      // forever.
+      // forever. One exit, whatever went wrong: spreading the release across a
+      // clause per throwable kind is how the clause added next gets forgotten,
+      // and the cost of forgetting it is an object that refuses every later
+      // open for the rest of its life.
       //
       // The resolved path goes with it: `acquire` creates the log directory
       // before it opens the file, so a throw can still leave artifacts, and
@@ -182,7 +185,12 @@ class HybridFileSink : HybridFileSinkSpec() {
       // far — means there is nothing to enumerate, which is exactly what
       // should be recorded.
       lifecycle.failOpen(resolvedPath)
-      throw e
+
+      // What gets normalized and what passes through untouched is decided in
+      // [FileSinkMessages], which — unlike this class — a JVM test can reach.
+      // Until that mapping existed, whatever text the throwable happened to
+      // carry went straight to JavaScript.
+      FileSinkMessages.rethrowingOpenFailure(e)
     }
 
     // A close that arrived mid-acquisition found nothing to hand back and has

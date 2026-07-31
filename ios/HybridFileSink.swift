@@ -49,6 +49,31 @@ final class HybridFileSink: HybridFileSinkSpec {
     LogSecureFile.conventionalLogDirectory.path
   }
 
+  /// Every message this adapter can send to JavaScript when an open fails.
+  ///
+  /// Named rather than written at the throw site so the whole list is one
+  /// greppable thing on each platform, and so `__tests__/openFailureParity`
+  /// can compare it against the Kotlin twin in `FileSinkMessages.kt`. The two
+  /// silently disagreed on all eight of these — Android sent "this sink is
+  /// already open" where this side sent "FileSink: already open" — which is
+  /// exactly the kind of difference that survives review and then arrives as a
+  /// cross-platform bug report about a string nobody meant to be an API.
+  ///
+  /// Payload-free by construction: constants, never interpolation. A path
+  /// carries a username and an `errno` description carries the path, and this
+  /// string ends up wherever the app logs.
+  enum Message {
+    static let alreadyOpen = "FileSink: already open"
+    static let closing = "FileSink: an earlier open on this sink is still being cancelled; retry"
+    static let disposed = "FileSink: this sink has been disposed"
+    static let configConflict =
+      "FileSink: another destination already opened this file with a different configuration"
+    static let symlinkEscape = "FileSink: the log path is a symbolic link"
+    static let locked = "FileSink: another process is writing this log file"
+    static let stillClosing = "FileSink: the previous destination for this file is still closing"
+    static let openFailed = "FileSink: could not open the log file"
+  }
+
   func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws {
     // Refused rather than allowed to race a second acquisition: the loser's
     // handle would be unreachable, and unreachable means a later purge never
@@ -63,12 +88,11 @@ final class HybridFileSink: HybridFileSinkSpec {
     case .granted:
       break
     case .alreadyOpen:
-      throw RuntimeError.error(withMessage: "FileSink: already open")
+      throw RuntimeError.error(withMessage: Message.alreadyOpen)
     case .closing:
-      throw RuntimeError.error(
-        withMessage: "FileSink: an earlier open on this sink is still being cancelled; retry")
+      throw RuntimeError.error(withMessage: Message.closing)
     case .disposed:
-      throw RuntimeError.error(withMessage: "FileSink: this sink has been disposed")
+      throw RuntimeError.error(withMessage: Message.disposed)
     }
 
     // Written by `acquire` the moment it resolves, so the failure path below
@@ -239,26 +263,23 @@ final class HybridFileSink: HybridFileSinkSpec {
   private static func openFailure(_ error: Error) -> Error {
     switch error as? LogWriterError {
     case .configConflict:
-      return RuntimeError.error(
-        withMessage: "FileSink: another destination already opened this file with a different configuration")
+      return RuntimeError.error(withMessage: Message.configConflict)
     case .symlinkEscape:
-      return RuntimeError.error(withMessage: "FileSink: the log path is a symbolic link")
+      return RuntimeError.error(withMessage: Message.symlinkEscape)
     case .locked:
       // Distinct from every other refusal because nothing this process does
       // will fix it: another OS process is appending to this file, and the
       // answer is to pick a different path or stop the other one.
-      return RuntimeError.error(
-        withMessage: "FileSink: another process is writing this log file")
+      return RuntimeError.error(withMessage: Message.locked)
     case .stillClosing:
       // Distinct from the others because it is the one worth retrying: a
       // previous destination on this file has not finished shutting down, and
       // opening a second writer alongside it is exactly what must not happen.
-      return RuntimeError.error(
-        withMessage: "FileSink: the previous destination for this file is still closing")
+      return RuntimeError.error(withMessage: Message.stillClosing)
     case .openFailed, .none:
       // `openFailed` carries a path or an `errno` description, so its payload
       // is dropped here rather than forwarded.
-      return RuntimeError.error(withMessage: "FileSink: could not open the log file")
+      return RuntimeError.error(withMessage: Message.openFailed)
     }
   }
 
