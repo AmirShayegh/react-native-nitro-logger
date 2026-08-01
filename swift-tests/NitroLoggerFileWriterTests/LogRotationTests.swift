@@ -326,6 +326,61 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertEqual(archiveNames().count, 1, "the expired archive goes even though the count cap allows it")
   }
 
+  /// The three passes hand ONE list along — "each pass works on what the
+  /// previous one left" — and every single-cap test leaves that unpinned: a
+  /// pass that deletes files while keeping their entries, or prunes the wrong
+  /// side of its list, is only visible in what the NEXT pass measures.
+  ///
+  /// Here the age pass hands the byte pass a set whose sizes point the other
+  /// way: the expired archives are small and many, the survivor is large. A
+  /// sweep whose byte pass sees the truth deletes the oversized survivor; one
+  /// reading a stale list adds up ghosts, stays under the cap, and keeps it.
+  func testTheBytePassMeasuresWhatTheAgePassLeft() throws {
+    let handle = try makeHandle(
+      policy: sizePolicy(bytes: 64, keep: 100, archiveAge: 3600, totalBytes: 300)
+    )
+    for _ in 0..<8 { write(handle, record) }
+    XCTAssertGreaterThan(archiveNames().count, 1)
+
+    // Everything so far expires. The next batch is larger than the whole
+    // byte cap on its own, so after the age pass clears the expired set the
+    // byte pass MUST see it and take it — a stale list of small ghosts sums
+    // to under the cap and would leave it alive.
+    try backdateArchives(by: 7200)
+    write(handle, String(repeating: "z", count: 400) + "\n")
+    write(handle, record) // rotation → sweep
+
+    XCTAssertEqual(
+      archiveNames().count, 0,
+      "the oversized survivor is what the byte pass must be measuring"
+    )
+    XCTAssertEqual(
+      handle.status().degraded & LogDegradation.prune.rawValue, 0,
+      "every removal in this sweep is of a file that exists; nothing may fail"
+    )
+  }
+
+  /// The count-pass half of the same contract. The byte cap sits between the
+  /// kept set and the pre-count set, so a count pass that deletes its excess
+  /// while leaving the entries in the list pushes the byte pass over cap —
+  /// which then tries to delete a file the count pass already removed, and a
+  /// prune degradation appears that no real failure earned.
+  func testTheBytePassMeasuresWhatTheCountPassLeft() throws {
+    // The honest sweep total is ~240: two kept 80-byte archives plus the
+    // ~80 bytes the live file holds when the sweep reads it. A ghost left by
+    // the count pass adds 80 more. The cap sits between the two.
+    let handle = try makeHandle(
+      policy: sizePolicy(bytes: 64, keep: 2, totalBytes: 280)
+    )
+    for _ in 0..<10 { write(handle, record) }
+
+    XCTAssertEqual(archiveNames().count, 2)
+    XCTAssertEqual(
+      handle.status().degraded & LogDegradation.prune.rawValue, 0,
+      "the kept set is under the byte cap, so no removal here may ever fail"
+    )
+  }
+
   func testPrunesByTotalBytes() throws {
     // 40-byte records, rotating every 64 bytes, so each archive is ~80 bytes.
     let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 100, totalBytes: 200))

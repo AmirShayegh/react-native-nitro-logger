@@ -1840,17 +1840,23 @@ public final class LogWriter {
 
     // Oldest first for age, then count, then total size — each pass works on
     // what the previous one left.
+    //
+    // Each pass removes by the property that SELECTED, not by membership in
+    // the list of what was selected. The old shape filtered and then asked
+    // `removeAll { expired.contains … }` — O(n²), 360 µs at two hundred
+    // archives and widening quadratically, on the queue every append waits
+    // behind. `expired` is exactly `{ modified < cutoff }` and `excess` is
+    // exactly the tail past the cap on a list already sorted newest-first,
+    // so the predicate and the prefix ARE the sets, with nothing to search.
     if let maxAge = policy.maxArchiveAgeSeconds {
       let cutoff = clock().addingTimeInterval(-maxAge)
-      let expired = archives.filter { $0.modified < cutoff }
-      expired.forEach(remove)
-      archives.removeAll { entry in expired.contains { $0.url == entry.url } }
+      for entry in archives where entry.modified < cutoff { remove(entry) }
+      archives.removeAll { $0.modified < cutoff }
     }
 
     if archives.count > policy.maxArchivedFilesCount {
-      let excess = Array(archives[policy.maxArchivedFilesCount...])
-      excess.forEach(remove)
-      archives.removeAll { entry in excess.contains { $0.url == entry.url } }
+      for entry in archives[policy.maxArchivedFilesCount...] { remove(entry) }
+      archives.removeLast(archives.count - policy.maxArchivedFilesCount)
     }
 
     if let cap = policy.maxTotalLogBytes {
