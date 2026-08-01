@@ -286,11 +286,32 @@ class LogFileWriter internal constructor(
      */
     private fun archives(directory: File, baseName: String): List<Artifact> {
       val names = directory.list() ?: return emptyList()
-      return names
-        .filter { isArchiveName(it, baseName) }
-        .map { File(directory, it) }
-        .map { Artifact(it, it.lastModified(), it.length()) }
-        .sortedWith(compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name })
+      return archivesFrom(directory, names, baseName)
+    }
+
+    /**
+     * The Artifact-building half of [archives], over a listing the caller
+     * already holds — [sweepRetention] walks the directory once and feeds
+     * both its orphan pass and this from the same array.
+     *
+     * One pre-sized pass where this was filter → map → map → sortedWith,
+     * each a fresh list over up to 10,000 entries.
+     */
+    private fun archivesFrom(
+      directory: File,
+      names: Array<String>,
+      baseName: String,
+    ): List<Artifact> {
+      val artifacts = ArrayList<Artifact>(names.size)
+      for (name in names) {
+        if (!isArchiveName(name, baseName)) continue
+        val file = File(directory, name)
+        artifacts.add(Artifact(file, file.lastModified(), file.length()))
+      }
+      artifacts.sortWith(
+        compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name }
+      )
+      return artifacts
     }
 
     /**
@@ -1791,11 +1812,32 @@ class LogFileWriter internal constructor(
     }
   }
 
+  /**
+   * The stamp formatter, built once per writer instead of once per rotation.
+   *
+   * `SimpleDateFormat` is not thread-safe and does not need to be here:
+   * rotation runs on the writer executor and nowhere else, so a plain field
+   * is confined the same way `currentFileSize` is. `Locale.US` plus the
+   * quoted literals means every character it emits is ASCII — which is what
+   * lets `ARCHIVE_SUFFIX` anchor on `\d{8}T\d{6}Z`.
+   */
+  private val stampFormat = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
+    timeZone = java.util.TimeZone.getTimeZone("UTC")
+  }
+
   private fun rotationStamp(): String {
-    val stamp = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
-      timeZone = java.util.TimeZone.getTimeZone("UTC")
-    }.format(java.util.Date(clock()))
-    val suffix = java.util.UUID.randomUUID().toString().replace("-", "").take(8).lowercase(Locale.US)
+    val stamp = stampFormat.format(java.util.Date(clock()))
+    // Eight lowercase hex from `ThreadLocalRandom`, where this used to be
+    // `UUID.randomUUID()` — a SecureRandom draw plus three string passes. The
+    // suffix is a documented tie-breaker for rotations inside the same
+    // second, not a secret; nothing consumes its unpredictability, so paying
+    // the secure generator for it bought nothing. What the suffix MUST do is
+    // match `ARCHIVE_SUFFIX`'s `[a-f0-9]{8}`, or retention silently stops
+    // recognising the writer's own archives — `%08x` of an Int is exactly
+    // eight lowercase hex characters, always.
+    val suffix = String.format(
+      Locale.US, "%08x", java.util.concurrent.ThreadLocalRandom.current().nextInt()
+    )
     return "${stamp}_$suffix"
   }
 
@@ -1830,6 +1872,14 @@ class LogFileWriter internal constructor(
       return
     }
 
+    // Loop invariants, hoisted. `baseName` is a getter that re-reads
+    // `file.name` per call, and the two support names are concatenations —
+    // paying all three per entry over a listing that can reach the 10,000
+    // clamp is allocation for nothing.
+    val base = baseName
+    val supportStaging = supportStagingName(base)
+    val supportMember = supportMemberName(base)
+
     // Orphaned compressions first. A `.part` is a gzip that was interrupted —
     // by a crash, or by a process that died mid-rotation — and nothing will
     // ever finish it. Compression runs on this same executor, so a staging file
@@ -1839,15 +1889,17 @@ class LogFileWriter internal constructor(
     // same pass. The finished bundle is not: it is something a caller asked for
     // and may not have uploaded yet, and deleting it here would make
     // [collectLogs] a race against the next rotation.
-    names
-      .filter {
-        isStagingName(it, baseName) ||
-          it == supportStagingName(baseName) ||
-          it == supportMemberName(baseName)
+    for (name in names) {
+      if (isStagingName(name, base) || name == supportStaging || name == supportMember) {
+        remove(File(directory, name))
       }
-      .forEach { remove(File(directory, it)) }
+    }
 
-    var archives = archives(directory, baseName)
+    // The SAME listing feeds the archive pass — this used to be a second
+    // `directory.list()`. Safe because the two sides are disjoint by grammar:
+    // `isArchiveName` deliberately excludes `.part`, and the support names
+    // carry no stamp, so nothing deleted above could have been an archive.
+    var archives = archivesFrom(directory, names, base)
 
     // Oldest first for age, then count, then total size — each pass works on
     // what the previous one left.
