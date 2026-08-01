@@ -812,8 +812,9 @@ public final class LogWriter {
     // a value read before the write.
     let offsetBefore = currentFileSize
     var written = 0
+    var batchStart: UInt64?
     do {
-      try writeAll(data, written: &written)
+      try writeAll(data, written: &written, batchStart: &batchStart)
       currentFileSize = offsetBefore + UInt64(data.count)
       healthCheckPeriodically()
       rotateIfNeeded()
@@ -823,14 +824,22 @@ public final class LogWriter {
       // rest of the file unparseable from that point on — the loss would
       // spread from one batch to everything after it.
       //
-      // Measured HERE, because this is the one place where being wrong
-      // truncates bytes that are not ours. `trueEnd - written` is where this
-      // batch began no matter how far the tracked counter has drifted, and it
-      // is more exact than the old `offsetBefore`: that was read before the
-      // write and could not account for anything that landed underneath it.
-      // Never truncate blindly to the tracked value.
+      // The target is `batchStart` when the batch made partial progress —
+      // derived inside `writeAll` from this descriptor's own offset, which
+      // `O_APPEND` advances only for OUR writes, so it names where the batch
+      // began even if a foreign appender interleaved bytes between our short
+      // writes. `trueEnd - written` would not: it counts our bytes but not
+      // where they sit, and under an interleave it can keep a torn prefix of
+      // this batch while cutting someone else's bytes. Truncating to
+      // `batchStart` discards any bytes interleaved above it along with ours
+      // — unavoidable, because a file with a torn record in the middle is
+      // unparseable from that point on no matter whose bytes follow.
+      //
+      // When nothing landed (`batchStart` nil, `written` 0) there is nothing
+      // to roll back, and the truncate to `trueEnd` is a no-op — measured,
+      // never assumed from the tracked value.
       let trueEnd = Self.size(of: descriptor)
-      let target = trueEnd >= UInt64(written) ? trueEnd - UInt64(written) : 0
+      let target = min(batchStart ?? trueEnd, trueEnd)
       if ftruncate(descriptor, off_t(target)) == 0 {
         currentFileSize = target
       } else {
@@ -851,9 +860,16 @@ public final class LogWriter {
   /// anything else is terminal.
   /// - Parameter written: bytes that reached the file, reported even when this
   ///   throws. That is the whole reason it is an `inout` and not a return
-  ///   value: the caller's rollback subtracts it from the true end of file,
-  ///   and a throw is exactly when it needs to know.
-  private func writeAll(_ data: Data, written: inout Int) throws {
+  ///   value: a throw is exactly when the caller needs to know.
+  /// - Parameter batchStart: where this batch began in the file, reported the
+  ///   first time a write lands SHORT — the only situation that can leave
+  ///   bytes behind a later failure, since a batch that never wrote short
+  ///   either finished whole or landed nothing. Read from this descriptor's
+  ///   own offset, which `O_APPEND` advances atomically per write of OURS and
+  ///   which no foreign appender can move, so it stays exact under
+  ///   interleaving. The `lseek` is paid only on that first short write —
+  ///   never on the single-full-write happy path.
+  private func writeAll(_ data: Data, written: inout Int, batchStart: inout UInt64?) throws {
     var done = 0
     var retries = 0
     defer { written = done }
@@ -864,6 +880,10 @@ public final class LogWriter {
         if n > 0 {
           done += n
           retries = 0
+          if done < data.count && batchStart == nil {
+            let offset = lseek(descriptor, 0, SEEK_CUR)
+            if offset >= done { batchStart = UInt64(offset) - UInt64(done) }
+          }
           continue
         }
         if n < 0 && (errno == EINTR || errno == EAGAIN) {

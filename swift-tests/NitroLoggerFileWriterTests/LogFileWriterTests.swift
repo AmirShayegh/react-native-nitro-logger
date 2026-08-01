@@ -122,6 +122,53 @@ final class LogFileWriterTests: LogWriterTestCase {
     XCTAssertEqual(contents(), "good\nother\nafter\n")
   }
 
+  /// The harder half of the same contract: the foreign bytes land BETWEEN two
+  /// of this writer's short writes — the interleaving `O_APPEND` makes
+  /// possible when nothing honours the advisory flock. Arithmetic on counts
+  /// (`trueEnd - written`) knows how many bytes are ours but not where they
+  /// sit: under this interleave it keeps a torn prefix of the batch and cuts
+  /// the intruder instead, and a torn record makes everything after it
+  /// unparseable. The batch-start offset captured at the first short write is
+  /// immune — `O_APPEND` advances this descriptor's offset only for its own
+  /// writes — so the rollback removes the whole torn batch and the intruder
+  /// above it, which is the only answer that leaves a parseable file.
+  func testARollbackDiscardsBytesInterleavedInsideTheTornBatch() throws {
+    var armed = false
+    var callsSinceArmed = 0
+    let raw: LogWriter.RawWrite = { [self] fd, buffer, count in
+      guard armed else { return Darwin.write(fd, buffer, count) }
+      callsSinceArmed += 1
+      if callsSinceArmed == 1 {
+        // Four bytes of the batch land, then the intruder, then the failure.
+        let n = Darwin.write(fd, buffer, min(4, count))
+        if let outside = try? FileHandle(forWritingTo: logURL) {
+          outside.seekToEndOfFile()
+          outside.write(Data("intruder\n".utf8))
+          try? outside.close()
+        }
+        return n
+      }
+      errno = EIO
+      return -1
+    }
+    let handle = try makeHandle(rawWrite: raw)
+
+    write(handle, "good\n")
+    XCTAssertEqual(contents(), "good\n")
+
+    armed = true
+    write(handle, "0123456789\n")
+    XCTAssertEqual(
+      contents(), "good\n",
+      "the whole torn batch goes, and the bytes interleaved inside it go too"
+    )
+    XCTAssertEqual(handle.status().lostEntries, 1)
+
+    armed = false
+    write(handle, "after\n")
+    XCTAssertEqual(contents(), "good\nafter\n", "the writer keeps working after the rollback")
+  }
+
   func testLossIsAttributedToTheHandleThatLostIt() throws {
     let faults = WriteFaults()
     let first = try makeHandle(rawWrite: faults.raw)
