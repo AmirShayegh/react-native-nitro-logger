@@ -279,14 +279,24 @@ export function __resetRejectionHandlers(): void {
 function liveHandler(
   state: InstallState | undefined
 ): InstallState | undefined {
-  const seen = new Set<InstallState>();
+  // Allocated on the second step, not the first. Almost every call answers
+  // from the head of the chain — one handler, installed, still active — and
+  // rejections arrive in bursts, so the common case should not pay for a
+  // guard it never consults.
+  let seen: Set<InstallState> | undefined;
   let candidate = state;
   while (candidate) {
     if (candidate.active) return candidate;
     // Only reachable if a chain were ever built into a cycle, which needs a
     // mistake this module cannot currently make — and the rejection path is
     // the wrong place to discover it the hard way.
-    if (seen.has(candidate)) return undefined;
+    //
+    // Which is also why no test pins it, stated rather than left to look
+    // guarded: defeating this check outright leaves the whole suite passing,
+    // because nothing can currently construct the cycle it defends against.
+    // It is insurance against a future `previous` chain, not a live path.
+    if (seen === undefined) seen = new Set();
+    else if (seen.has(candidate)) return undefined;
     seen.add(candidate);
     candidate = candidate.previous;
   }

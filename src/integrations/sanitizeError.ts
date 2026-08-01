@@ -61,6 +61,33 @@ export const DEFAULT_BUNDLE_NAMES: readonly string[] = [
   'index.ios.bundle',
 ];
 
+/**
+ * {@link DEFAULT_BUNDLE_NAMES} as the Set the frame parser wants.
+ *
+ * Module scope because this runs on the crash path, where every allocation is
+ * one the process may not live to collect, and rebuilding a four-element Set
+ * per error was buying nothing.
+ */
+const DEFAULT_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
+  DEFAULT_BUNDLE_NAMES
+);
+
+/**
+ * The start of a URL's query or fragment, so a basename stops before it.
+ *
+ * Hoisted because a regex literal is a fresh `RegExp` on every evaluation on
+ * Hermes, and this one is evaluated per stack frame of every sanitized error.
+ *
+ * Sharing it is safe for a reason worth stating exactly, because the obvious
+ * reason is wrong: it is NOT that the literal carries no `g` flag.
+ * `String.prototype.search` saves and restores `lastIndex` and ignores `g`
+ * altogether, so this particular call would behave identically with one —
+ * adding `g` was mutated in and changed nothing. The no-`g` rule that governs
+ * the console formatter's classes is about `test` and `exec`, which do
+ * advance `lastIndex`. Here the flag simply does not participate.
+ */
+const QUERY_OR_FRAGMENT = /[?#]/;
+
 /** Frames beyond this are dropped; the count of what was dropped is kept. */
 export const DEFAULT_MAX_FRAMES = 12;
 
@@ -141,7 +168,13 @@ export function sanitizeError(
   thrown: unknown,
   options?: SanitizeErrorOptions
 ): SanitizedError {
-  const bundleNames = new Set(options?.bundleNames ?? DEFAULT_BUNDLE_NAMES);
+  // Built once when the caller did not name its own bundles, which is every
+  // call the crash handler makes. `parseFrames` takes it as a `ReadonlySet`
+  // and only ever asks `.has`, so one shared instance is safe — a caller who
+  // does supply names still gets a Set of their own.
+  const bundleNames = options?.bundleNames
+    ? new Set(options.bundleNames)
+    : DEFAULT_BUNDLE_NAME_SET;
   const maxFrames = boundedFrames(options?.maxFrames);
 
   // Read each property exactly once, and touch the thrown value in no other
@@ -365,7 +398,7 @@ function parseFrames(
 function basename(location: string): string {
   const cut = Math.max(location.lastIndexOf('/'), location.lastIndexOf('\\'));
   let name = cut >= 0 ? location.slice(cut + 1) : location;
-  const query = name.search(/[?#]/);
+  const query = name.search(QUERY_OR_FRAGMENT);
   if (query >= 0) name = name.slice(0, query);
   return name;
 }

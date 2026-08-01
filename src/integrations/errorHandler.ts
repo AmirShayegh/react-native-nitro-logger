@@ -275,15 +275,20 @@ function retireStaleInstances(errorUtils: ErrorUtilsLike): void {
 function liveHandler(
   handler: GlobalHandler | undefined
 ): GlobalHandler | undefined {
-  const seen = new Set<GlobalHandler>();
+  // Allocated on the second step, not the first: a handler we did not install
+  // is live by definition, so the overwhelmingly common chain answers at its
+  // head without ever consulting the guard. This is the crash path.
+  let seen: Set<GlobalHandler> | undefined;
   let candidate = handler;
   while (candidate) {
     const state = INSTALLED().get(candidate);
     if (!state || state.active) return candidate;
     // A cycle needs two of our own handlers pointing at each other, which
     // takes a restore we did not do — but the crash path is the wrong place
-    // to find out the hard way.
-    if (seen.has(candidate)) return undefined;
+    // to find out the hard way. No test pins it for that same reason, which
+    // is worth saying out loud: the check is insurance, not a live path.
+    if (seen === undefined) seen = new Set();
+    else if (seen.has(candidate)) return undefined;
     seen.add(candidate);
     candidate = state.previous;
   }

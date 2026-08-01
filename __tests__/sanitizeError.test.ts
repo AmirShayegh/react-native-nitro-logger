@@ -123,6 +123,19 @@ describe('sanitizeError — frames', () => {
     expect(result.frames).toEqual(['index.bundle:9:8']);
   });
 
+  test('strips a fragment before matching the basename', () => {
+    // The query case above leaves the `#` half of `/[?#]/` unexercised, so
+    // narrowing that class to `/[?]/` passed the whole suite. A fragment on a
+    // bundle URL is rarer than a query and reaches the same code, and an
+    // unrecognised basename is replaced by a fixed token rather than kept.
+    const result = sanitizeError(
+      withStack(
+        'Error: x\n    at fn (http://localhost:8081/index.bundle#ref:9:8)'
+      )
+    );
+    expect(result.frames).toEqual(['index.bundle:9:8']);
+  });
+
   // R3's point: a basename can be perfectly regex-valid and still be data.
   test('a basename we cannot vouch for becomes a fixed token', () => {
     const result = sanitizeError(
