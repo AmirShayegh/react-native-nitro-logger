@@ -61,7 +61,7 @@ appendBatch (native)` — on both platforms.
   **Opt-in, and staying that way.** This changes what a developer sees, which a
   package upgrade should not do by itself:
 
-  ```ts
+  ```js
   import {
     createNativeConsoleDestination,
     PlatformConsoleFormatter,
