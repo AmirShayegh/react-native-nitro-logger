@@ -72,7 +72,7 @@ jobs:
       - name: Typecheck the min-rn harness apps
         run: yarn check-harness
 
-      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 20 shell
+      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 22 shell
       # scripts that hold most of this repository's gates are unparsed until
       # something runs them — and several only run inside the emulator and
       # simulator jobs, so an unterminated heredoc or a stray `fi` costs
@@ -82,7 +82,7 @@ jobs:
         run: |
           count=0
           for f in scripts/*.sh; do bash -n "$f"; count=$((count + 1)); done
-          if [ "$count" -lt 20 ]; then
+          if [ "$count" -lt 22 ]; then
             echo "FAIL: parsed only $count scripts; the glob is not matching"
             exit 1
           fi
