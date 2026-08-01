@@ -258,8 +258,10 @@ export class JsonLinesFormatter implements LogFormatter {
    * full render and one full byte count per key dropped — which cost 243 µs
    * for a 40-key entry at a 400-byte budget, on the main thread, for exactly
    * the shape a crash-handler stack trace arrives in. So candidates are
-   * COSTED by adding up numbers, and `render` is called only twice: once on
-   * an empty record to learn the fixed cost, and once on the winner.
+   * COSTED by adding up numbers. Once the full record above has been rendered
+   * and found too big, choosing among the candidates costs exactly two more
+   * renders however many there are: one of an empty record, to learn the
+   * fixed cost, and one of the winner. Three per truncated entry in total.
    *
    * **That addition is exact, and here is why.** UTF-8 length is additive
    * over concatenation unless the join splits a surrogate pair — the pair

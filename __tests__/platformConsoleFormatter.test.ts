@@ -40,6 +40,41 @@ describe('PlatformConsoleFormatter', () => {
     );
   });
 
+  test('the framing the docs count is the framing it removes', () => {
+    // docs/API.md, the changeset and the class docstring all quote the same
+    // arithmetic: 713 characters of framing against 120 for a thirty-frame
+    // trace, and 593 handed back to the sink's chunk budget. Those numbers are
+    // the argument for this formatter existing, so they are derived here from
+    // the real output rather than asserted as constants — a layout change on
+    // either side has to move the prose with it.
+    //
+    // The per-line figure is what makes them large: the columns are paid once
+    // as the header and again, blanked, on every continuation line. Neither
+    // native writer splits on newlines — both chunk the rendered entry by
+    // size — so this is budget, not just noise.
+    const trace = [
+      'Unhandled TypeError',
+      ...Array.from({ length: 30 }, (_, i) => `at frame${i} (bundle.js:1:2)`),
+    ].join('\n');
+    const plain = entry({ message: trace });
+
+    const defaultRendered = new DefaultFormatter().format(plain).length;
+    const platformRendered = formatter.format(plain).length;
+    const defaultFraming = defaultRendered - trace.length;
+    const platformFraming = platformRendered - trace.length;
+
+    expect(defaultFraming).toBe(713); // 23 x 31 lines
+    expect(platformFraming).toBe(120); // 4 x 30 continuations
+    expect(defaultFraming - platformFraming).toBe(593);
+
+    // The docstring also quotes both rendered sizes, to make the point that
+    // 593 bytes back is not automatically a chunk saved: at os_log's ~900,
+    // 939 and 1532 both split in two. Saying so only stays honest while
+    // these two numbers are what the formatters actually produce.
+    expect(platformRendered).toBe(939);
+    expect(defaultRendered).toBe(1532);
+  });
+
   test('tags render in order, metadata sorted by key', () => {
     expect(
       formatter.format(entry({ correlation: 'job-1', subsystem: 'net' }))

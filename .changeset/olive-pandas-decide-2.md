@@ -26,10 +26,12 @@ import {
 createNativeConsoleDestination({ formatter: new PlatformConsoleFormatter() });
 ```
 
-The 22 characters are not only noise. os_log and logcat both chunk what they
-are handed — around 900 bytes and a budget shared with the tag — and the prefix
-is charged against that budget in every chunk a long message is split into, so
-a stack trace pays for it repeatedly.
+Those 23 characters are not only noise, and they are paid per line rather than
+once per entry: every continuation line carries the same columns blanked out,
+against four characters here. A thirty-frame stack trace spends 713 characters
+on framing under the default layout and 120 under this one. os_log and logcat
+both chunk the rendered entry by size — around 900 bytes and a budget shared
+with the tag — so that is 593 bytes handed back to the content.
 
 Structured fields — correlation, subsystem, metadata keys and values — are
 escaped exactly as `DefaultFormatter` escapes them; that is one shared

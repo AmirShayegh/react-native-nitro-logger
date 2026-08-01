@@ -592,9 +592,16 @@ import {
 createNativeConsoleDestination({ formatter: new PlatformConsoleFormatter() });
 ```
 
-Those 22 characters are not only noise. os_log and logcat both chunk what they
-are given, and the prefix is charged against that budget in every chunk a long
-message is split into.
+The ` INFO | 12:15:30.842 | ` those columns cost is 23 characters, and it is
+paid per line rather than once per entry — every continuation line carries the
+same 23 columns blanked out, against four characters here. A thirty-frame stack
+trace spends 713 characters on framing under the default layout and 120 under
+this one. os_log and logcat both chunk the rendered entry by size, so that is
+593 bytes of budget back — most of an os_log chunk. That can decide whether an
+entry crosses a chunk boundary rather than always deciding it: this trace
+splits in two either way. It tells for entries near a boundary, and near the
+eight-chunk ceiling both writers enforce, past which the tail arrives as a byte
+count instead of as content.
 
 Structured fields are escaped exactly as `DefaultFormatter` escapes them. The
 continuation marker is weaker: with no columns to blank, a message that begins
