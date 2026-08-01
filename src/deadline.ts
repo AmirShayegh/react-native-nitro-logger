@@ -108,6 +108,22 @@ export function startDeadline(deadlineMs: number): Deadline {
 }
 
 /**
+ * One reading from the same clock {@link startDeadline} counts against.
+ *
+ * Exported for callers that need to know how long ago something happened
+ * rather than how much of a budget is left — `scheduleMaintenance` deciding
+ * whether a foreground transition has earned a sweep. They must not reach for
+ * `Date.now`: a wall-clock correction between two readings makes an elapsed
+ * time that never elapsed, and here that would mean a sweep skipped or
+ * doubled on a clock change.
+ *
+ * Readings are comparable only with each other, and only within a process.
+ */
+export function monotonicNow(): number {
+  return resolveClock()();
+}
+
+/**
  * The monotonic clock, once one has been found. Never cleared.
  *
  * Undefined means "not found yet", which is a different statement from "this
