@@ -132,9 +132,38 @@ function configuredLoggerNames(context) {
     : DEFAULT_LOGGER_NAMES;
 }
 
-function loggerNames(context) {
-  return new Set(configuredLoggerNames(context));
+/**
+ * Wraps an option-derived Set builder so it runs once per rule run.
+ *
+ * The four sets below are pure functions of `context.options`, which cannot
+ * change while a rule runs over a file, and they were being rebuilt on every
+ * lookup — 1,428 and 1,100 identical Sets for one 529-line file in the audit.
+ *
+ * Keyed on `context`, deliberately, and not on the source file: these are
+ * OPTIONS-derived, and two rules over the same file can be configured
+ * differently. It is the same reason {@link mutabilityCache} is keyed this
+ * way, and the opposite of the poisoned-globals walk, whose answer depends on
+ * the AST alone.
+ *
+ * The Set is now shared by every caller within a rule run rather than handed
+ * out fresh, so it must stay read-only. Every current caller asks `.has(…)`;
+ * anything that needs to add or remove should copy it first.
+ */
+function perContextSet(build) {
+  const cache = new WeakMap();
+  return function cached(context) {
+    let value = cache.get(context);
+    if (value === undefined) {
+      value = build(context);
+      cache.set(context, value);
+    }
+    return value;
+  };
 }
+
+const loggerNames = perContextSet(
+  (context) => new Set(configuredLoggerNames(context))
+);
 
 /**
  * The one name that means the Logger singleton itself, rather than "some
@@ -171,23 +200,23 @@ function canonicalLoggerName(context) {
 const DEFAULT_LOGGER_CLASSES = ['Logger'];
 const DEFAULT_SCOPED_CLASSES = ['ScopedLogger'];
 
-function loggerClassNames(context) {
+const loggerClassNames = perContextSet((context) => {
   const configured = context.options?.[0]?.loggerClassNames;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_LOGGER_CLASSES
   );
-}
+});
 
-function scopedClassNames(context) {
+const scopedClassNames = perContextSet((context) => {
   const configured = context.options?.[0]?.scopedClassNames;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_SCOPED_CLASSES
   );
-}
+});
 
 /**
  * The receiver-resolution options every rule accepts.
@@ -209,14 +238,14 @@ const RECEIVER_OPTION_PROPERTIES = {
 /** Modules an import of the Logger may legitimately come from. */
 const DEFAULT_LOGGER_MODULES = ['react-native-nitro-logger'];
 
-function loggerModules(context) {
+const loggerModules = perContextSet((context) => {
   const configured = context.options?.[0]?.loggerModules;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_LOGGER_MODULES
   );
-}
+});
 
 /**
  * Was this binding imported from a module that actually ships the Logger?
