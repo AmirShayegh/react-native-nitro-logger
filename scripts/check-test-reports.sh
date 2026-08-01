@@ -41,7 +41,7 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=256
+    MINIMUM=259
     REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogPerfTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"

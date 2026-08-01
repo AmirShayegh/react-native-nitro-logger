@@ -50,6 +50,37 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertEqual(archiveNames().count, 1, "age rotates a file that never reached the size cap")
   }
 
+  /// The other half of `fileStart`'s contract: a file that already exists is
+  /// as old as the FILESYSTEM says, not as old as the process that reopened
+  /// it. `testRotatesOnAge` cannot see this — its file is created by the
+  /// handle under test, so the injected clock and the birth date describe the
+  /// same moment. Here the file predates the handle, the injected clock
+  /// stands two hours past the real birth time, and the very first write must
+  /// rotate. A writer that falls back to its own clock for existing files
+  /// reads every reopened file as newborn, and a log that outlived its
+  /// process never ages out — exactly the mutant this pins.
+  func testAnExistingFilesAgeComesFromTheFilesystemNotFromReopening() throws {
+    try FileManager.default.createDirectory(
+      at: logsDirectory, withIntermediateDirectories: true
+    )
+    try Data("from a previous run\n".utf8).write(to: logURL)
+
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 3600
+    )
+    let clock = WallClock()
+    clock.advance(7200)
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
+
+    write(handle, "first write after reopen\n")
+    XCTAssertEqual(
+      archiveNames().count, 1,
+      "a two-hour-old file crossed the one-hour age cap before this process existed"
+    )
+  }
+
   /// The file a rotation opens is new, and its age restarts — measured on the
   /// clock the writer is actually using.
   ///
@@ -478,6 +509,41 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertEqual(Gzip.crc32(Data(everyTableIndexInOrder)), 0xD2A7_D615)
 
     XCTAssertEqual(Gzip.crc32(Data()), 0x0000_0000)
+  }
+
+  /// The writer reads creation dates through `stat`'s `st_birthtimespec`
+  /// instead of `FileManager.attributesOfItem` (S7). That the two are the
+  /// same fact is an assumption about the volume, not about Foundation — so
+  /// it is held here as a differential rather than believed. If this ever
+  /// fails on a supported volume type, the `stat` path goes back to
+  /// `FileManager` for dates, per the remediation plan's N5 gate.
+  ///
+  /// What this does NOT prove: agreement on volumes the suite never runs on
+  /// (FAT-family externals have no birth time at all). It pins the volumes
+  /// tests and devices actually use — APFS, and HFS+ behind the /var symlink.
+  func testBirthTimeAgreesWithFileManagersCreationDate() throws {
+    try FileManager.default.createDirectory(
+      at: logsDirectory, withIntermediateDirectories: true
+    )
+    let url = logsDirectory.appendingPathComponent("birthtime-differential.txt")
+    try Data("x".utf8).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    let foundation = try XCTUnwrap(
+      attributes[.creationDate] as? Date,
+      "a volume with no creation date at all would already have failed S7"
+    )
+
+    var info = stat()
+    XCTAssertEqual(stat(url.path, &info), 0)
+    let birth = TimeInterval(info.st_birthtimespec.tv_sec)
+      + TimeInterval(info.st_birthtimespec.tv_nsec) / 1_000_000_000
+
+    XCTAssertEqual(
+      foundation.timeIntervalSince1970, birth, accuracy: 1e-6,
+      "st_birthtimespec and .creationDate must be the same fact on this volume"
+    )
   }
 
   func testCompressedArchiveIsAValidGzipOfTheOriginal() throws {

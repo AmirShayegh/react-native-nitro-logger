@@ -610,9 +610,26 @@ public final class LogWriter {
   /// value age rotation measures against: taking the real clock here while the
   /// writer runs on an injected one would make a fresh file look arbitrarily old
   /// or arbitrarily young to the very check that reads it.
+  /// `stat`'s `st_birthtimespec` rather than `FileManager.attributesOfItem`
+  /// (audit-measured 66.6 µs → 2.4 µs, paid per open under the registry
+  /// lock). That the two are the same fact is an assumption about the volume,
+  /// not about Foundation — held as a differential by
+  /// `testBirthTimeAgreesWithFileManagersCreationDate`, not believed.
+  /// The existing-file half of the contract is pinned by
+  /// `testAnExistingFilesAgeComesFromTheFilesystemNotFromReopening`.
+  /// (Recorded: the nanosecond term is not pinned — a mutant dropping it
+  /// survives, because it shifts ages by under a second against thresholds
+  /// measured in seconds. The differential test pins the platform fact at
+  /// microsecond accuracy; this term is what keeps the conversion faithful
+  /// to it.)
   private static func creationDate(of url: URL, fallback: Date) -> Date {
-    let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-    return (attributes?[.creationDate] as? Date) ?? fallback
+    var info = stat()
+    guard stat(url.path, &info) == 0 else { return fallback }
+    let birth = info.st_birthtimespec
+    return Date(
+      timeIntervalSince1970: TimeInterval(birth.tv_sec)
+        + TimeInterval(birth.tv_nsec) / 1_000_000_000
+    )
   }
 
   /// Cuts a torn trailing record left by a crash — but only when the producer
@@ -1451,10 +1468,12 @@ public final class LogWriter {
   /// zero would let it into the bundle without being charged against the
   /// caller's ceiling.
   private static func fileSize(at url: URL) -> UInt64? {
-    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-      return nil
-    }
-    return attributes[.size] as? UInt64
+    // One stat(2) instead of FileManager's attribute dictionary — this runs
+    // N+1 times per collect. The contract above is untouched: a failed stat
+    // is nil, an empty file is 0.
+    var info = stat()
+    guard stat(url.path, &info) == 0 else { return nil }
+    return UInt64(max(0, info.st_size))
   }
 
   /// A byte ceiling from JavaScript, where every number is a Double.
