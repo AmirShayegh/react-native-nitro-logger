@@ -786,12 +786,17 @@ public final class LogWriter {
       return
     }
 
-    // The true end of file, not a tracked counter: it is what a partial write
-    // has to be rolled back to, and being wrong about it means truncating
-    // somebody else's bytes.
-    let offsetBefore = Self.size(of: descriptor)
+    // Tracked, not measured. This used to `fstat` on every append — about a
+    // fifth of the per-batch syscall time, and the only per-append syscall
+    // that can be removed at all — on the grounds that a rollback must know
+    // the true end of file. That grounds is sound and the conclusion was not:
+    // the happy path never rolls back, and the failure path can measure the
+    // truth at the moment it actually needs it, which is strictly better than
+    // a value read before the write.
+    let offsetBefore = currentFileSize
+    var written = 0
     do {
-      try writeAll(data)
+      try writeAll(data, written: &written)
       currentFileSize = offsetBefore + UInt64(data.count)
       healthCheckPeriodically()
       rotateIfNeeded()
@@ -800,8 +805,21 @@ public final class LogWriter {
       // batch is a half-written record, and a half-written record makes the
       // rest of the file unparseable from that point on — the loss would
       // spread from one batch to everything after it.
-      if ftruncate(descriptor, off_t(offsetBefore)) == 0 {
-        currentFileSize = offsetBefore
+      //
+      // Measured HERE, because this is the one place where being wrong
+      // truncates bytes that are not ours. `trueEnd - written` is where this
+      // batch began no matter how far the tracked counter has drifted, and it
+      // is more exact than the old `offsetBefore`: that was read before the
+      // write and could not account for anything that landed underneath it.
+      // Never truncate blindly to the tracked value.
+      let trueEnd = Self.size(of: descriptor)
+      let target = trueEnd >= UInt64(written) ? trueEnd - UInt64(written) : 0
+      if ftruncate(descriptor, off_t(target)) == 0 {
+        currentFileSize = target
+      } else {
+        // The rollback itself failed, so the file is whatever it is. Anchor
+        // to that rather than to a counter now known to be a guess.
+        currentFileSize = trueEnd
       }
       record(loss: entryCount, bytes: data.count, for: handleID)
       invalidateHandleIfUnlinked()
@@ -814,15 +832,20 @@ public final class LogWriter {
   /// short write as success is how a log file ends up with a record missing its
   /// second half. `EINTR` and `EAGAIN` are retried a bounded number of times;
   /// anything else is terminal.
-  private func writeAll(_ data: Data) throws {
-    var written = 0
+  /// - Parameter written: bytes that reached the file, reported even when this
+  ///   throws. That is the whole reason it is an `inout` and not a return
+  ///   value: the caller's rollback subtracts it from the true end of file,
+  ///   and a throw is exactly when it needs to know.
+  private func writeAll(_ data: Data, written: inout Int) throws {
+    var done = 0
     var retries = 0
+    defer { written = done }
     try data.withUnsafeBytes { raw in
       guard let base = raw.baseAddress else { return }
-      while written < data.count {
-        let n = rawWrite(descriptor, base + written, data.count - written)
+      while done < data.count {
+        let n = rawWrite(descriptor, base + done, data.count - done)
         if n > 0 {
-          written += n
+          done += n
           retries = 0
           continue
         }
@@ -945,7 +968,24 @@ public final class LogWriter {
   private func invalidateHandleIfUnlinked() {
     guard descriptor >= 0 else { return }
     var info = stat()
-    if fstat(descriptor, &info) == 0 && info.st_nlink > 0 { return }
+    if fstat(descriptor, &info) == 0 && info.st_nlink > 0 {
+      // Re-anchor while the answer is already in hand. This runs every
+      // `healthCheckStride` writes, which is what bounds how far the tracked
+      // `currentFileSize` can drift from the file it claims to describe —
+      // eight batches, not the life of the handle. The `flock` is what makes
+      // drift unlikely in the first place; this is what makes it survivable
+      // when the lock could not be taken and the sink said so.
+      //
+      // Not pinned by any test, and recorded rather than left to look
+      // guarded: deleting this line leaves all 253 Swift tests passing.
+      // Rollback correctness under drift IS pinned — see
+      // `testARollbackRemovesThisBatchAndNotWhatSomebodyElseAppended` — but
+      // what this bounds is how late SIZE ROTATION runs when a foreign
+      // appender is growing the file, and no test drives eight batches
+      // alongside one.
+      currentFileSize = UInt64(max(0, info.st_size))
+      return
+    }
     attemptReopen()
   }
 

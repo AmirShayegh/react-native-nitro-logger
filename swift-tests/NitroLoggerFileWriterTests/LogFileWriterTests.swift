@@ -85,6 +85,43 @@ final class LogFileWriterTests: LogWriterTestCase {
     XCTAssertEqual(contents(), "good\nafter\n", "the writer keeps working after a failed batch")
   }
 
+  /// The rollback target is measured at the moment of failure rather than
+  /// tracked from before the write, and this is the case where the two differ:
+  /// something appended to the same file behind this writer's back — a second
+  /// process, or this one through a handle it does not own. Truncating to the
+  /// tracked offset would delete those bytes instead of this batch's.
+  ///
+  /// Without this the whole of S5 is unpinned. Every other rollback test keeps
+  /// the tracked counter and the true end of file in agreement, so rolling
+  /// back to either one passes.
+  func testARollbackRemovesThisBatchAndNotWhatSomebodyElseAppended() throws {
+    let faults = WriteFaults()
+    let handle = try makeHandle(rawWrite: faults.raw)
+
+    write(handle, "good\n")
+    XCTAssertEqual(contents(), "good\n")
+
+    let outside = try FileHandle(forWritingTo: logURL)
+    outside.seekToEndOfFile()
+    outside.write(Data("other\n".utf8))
+    try outside.close()
+    XCTAssertEqual(contents(), "good\nother\n")
+
+    faults.failAfter(4) // four bytes of the next batch land, then it fails
+    write(handle, "0123456789\n")
+
+    XCTAssertEqual(
+      contents(),
+      "good\nother\n",
+      "the rollback must remove what this batch wrote and nothing else"
+    )
+    XCTAssertEqual(handle.status().lostEntries, 1)
+
+    faults.recover()
+    write(handle, "after\n")
+    XCTAssertEqual(contents(), "good\nother\nafter\n")
+  }
+
   func testLossIsAttributedToTheHandleThatLostIt() throws {
     let faults = WriteFaults()
     let first = try makeHandle(rawWrite: faults.raw)
