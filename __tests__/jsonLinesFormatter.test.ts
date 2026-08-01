@@ -468,6 +468,138 @@ describe('JsonLinesFormatter — formatWithin', () => {
     expect(JSON.parse(out).truncated).toBe(true);
   });
 
+  /**
+   * Since 0.4.0 the candidates are COSTED rather than rendered: the parts of
+   * the record that do not vary are measured once and the rest is addition.
+   * Every test above is satisfied by an answer that is a byte or two off,
+   * because they assert "within budget" and "the right fields survived".
+   *
+   * These assert the exact budget at which one more field fits, which is the
+   * only thing that catches a term missing from the sum. Each was checked by
+   * mutation: dropping the separating commas, forgetting the closing brace of
+   * the metadata object, and leaving `correlation`/`subsystem` out of the
+   * fixed part all pass the rest of this file and fail here.
+   */
+  describe('the budget arithmetic is exact, not approximate', () => {
+    const VALUE = 'v'.repeat(10);
+    const meta = { k0: VALUE, k1: VALUE, k2: VALUE, k3: VALUE };
+    const four = entry({ message: 'm', metadata: meta });
+
+    // Written out rather than computed, so this file states the answer
+    // instead of asking the formatter what it thinks the answer is. Note
+    // that a shortened record is BIGGER than the full one by the seventeen
+    // bytes of `,"truncated":true`, which is why the whole record (154
+    // bytes) is the ceiling every budget below has to sit under.
+    const withKeys = (n: number, tag = '') =>
+      '{"timestamp":"2026-07-27T12:15:30.842Z","level":"INFO","message":"m"' +
+      tag +
+      (n === 0
+        ? ''
+        : ',"metadata":{' +
+          Array.from({ length: n }, (_, i) => `"k${i}":"${VALUE}"`).join(',') +
+          '}') +
+      ',"truncated":true}';
+
+    test.each([
+      [3, 153],
+      [2, 135],
+      [1, 117],
+      [0, 86],
+    ])('exactly %i keys fit a budget of %i bytes', (keys, budget) => {
+      expect(fmt.formatWithin(four, budget)).toBe(withKeys(keys));
+    });
+
+    test.each([
+      [2, 152],
+      [1, 134],
+      [0, 116],
+    ])('one byte short of that and only %i fit (budget %i)', (keys, budget) => {
+      expect(fmt.formatWithin(four, budget)).toBe(withKeys(keys));
+    });
+
+    test('the tags are charged for, so they shift every threshold', () => {
+      // `,"correlation":"c"` is eighteen bytes and sits in the part of the
+      // record that never varies, so every threshold above moves up by
+      // exactly eighteen and by nothing else.
+      const tagged = entry({
+        message: 'm',
+        metadata: meta,
+        correlation: 'c',
+      });
+      const TAG = ',"correlation":"c"';
+      expect(fmt.formatWithin(tagged, 153 + 18)).toBe(withKeys(3, TAG));
+      expect(fmt.formatWithin(tagged, 153 + 17)).toBe(withKeys(2, TAG));
+    });
+  });
+
+  /**
+   * The message search runs over UTF-16 indices snapped to code-point
+   * boundaries. The 'never splits a surrogate pair' test above steps in 7s
+   * and so visits only a seventh of the budgets; an off-by-one in the
+   * snapping shows up at particular budgets and not their neighbours.
+   */
+  /**
+   * The other half of the boundary rule, and the half a "did it stay valid"
+   * test cannot see: the prefix must be as LONG as the budget allows.
+   *
+   * A search that probes raw UTF-16 indices does not produce a broken record
+   * — a prefix cut mid-pair renders as `\ud83d`, six characters where the
+   * whole pair is four bytes, so it simply fails to fit and the search walks
+   * away from it. What it produces is a record one code point shorter than it
+   * had room for, every time, silently. Mutation-checked: unsnapping the
+   * probe passes every other test in this file and fails these.
+   */
+  describe('the message keeps every code point the budget pays for', () => {
+    // 65 bytes of record before the message, 18 after it, and a quoted
+    // k-emoji message costs 4k + 2 — so k emojis fit at exactly 85 + 4k.
+    const emoji = entry({ message: '🙂'.repeat(10) });
+    const record = (message: string) =>
+      '{"timestamp":"2026-07-27T12:15:30.842Z","level":"INFO","message":' +
+      JSON.stringify(message) +
+      ',"truncated":true}';
+
+    test.each([
+      [0, 85],
+      [0, 88],
+      [1, 89],
+      [1, 92],
+      [2, 93],
+      [3, 97],
+    ])('%i emoji at a budget of %i bytes', (kept, budget) => {
+      expect(fmt.formatWithin(emoji, budget)).toBe(record('🙂'.repeat(kept)));
+    });
+
+    test('an ASCII character before the pair does not shift the rule', () => {
+      // `a` costs one byte and the pair four, so `a` fits at 86 and `a🙂` at
+      // 90 — the boundary the search has to find is now at an odd index. The
+      // trailing run is only there to keep the whole record well over these
+      // budgets, so the untruncated short-circuit cannot answer instead.
+      const mixed = entry({ message: `a🙂b🙂c${'z'.repeat(80)}` });
+      expect(fmt.formatWithin(mixed, 89)).toBe(record('a'));
+      expect(fmt.formatWithin(mixed, 90)).toBe(record('a🙂'));
+      expect(fmt.formatWithin(mixed, 91)).toBe(record('a🙂b'));
+    });
+  });
+
+  test('every budget over an astral message lands on a whole code point', () => {
+    const message = `${'a'.repeat(9)}${'🙂'.repeat(20)}${'b'.repeat(9)}`;
+    const e = entry({ message });
+    const floor = fmt.formatWithin(e, 0);
+    for (let budget = 0; budget <= 260; budget += 1) {
+      const out = fmt.formatWithin(e, budget);
+      const parsed = JSON.parse(out) as { message: string };
+
+      // Never a lone half: re-splitting by code point and rejoining is the
+      // identity exactly when nothing was cut through a pair.
+      expect(Array.from(parsed.message).join('')).toBe(parsed.message);
+      expect(out).not.toContain('\\ud');
+      expect(message.startsWith(parsed.message)).toBe(true);
+
+      // And still the contract: within budget, or the documented floor.
+      if (utf8Length(out) > budget) expect(out).toBe(floor);
+    }
+  });
+
   test('the floor keeps correlation and subsystem, which identify the entry', () => {
     // A message can be shortened to nothing and the record still says which
     // scope and subsystem it came from. Dropping those to save bytes would
