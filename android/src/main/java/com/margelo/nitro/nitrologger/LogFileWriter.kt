@@ -962,6 +962,24 @@ class LogFileWriter internal constructor(
       // The true end of file, not a tracked counter: it is what a partial write
       // has to be rolled back to, and being wrong about it means truncating
       // somebody else's bytes.
+      //
+      // The iOS writer tracks this instead and measures only when it rolls
+      // back (see `append` in LogFileWriter.swift). That was tried here and
+      // REVERTED, because the two platforms' write contracts are not twins.
+      // `write(2)` reports a partial write as a positive return and an error
+      // as -1 with nothing written, so Swift always knows how many bytes
+      // landed and can roll back to `trueEnd - written`. Kotlin's underlying
+      // `FileOutputStream.write(data, offset, length)` returns void and is
+      // allowed to throw HAVING ALREADY WRITTEN part of the buffer — which is
+      // exactly what `LogFileWriterTest`'s injected fault models. A rollback
+      // computed from a byte count nobody can know would under-report, leave
+      // half a record in the file, and make everything after it unparseable:
+      // the corruption this whole path exists to prevent, in the direction
+      // that spreads it.
+      //
+      // Rolling back to the last newline at or below the true end would work
+      // without a count, and is a bigger change than removing one syscall
+      // justifies. Until then this reading stays.
       val offsetBefore = try {
         live.channel.size()
       } catch (_: Exception) {
