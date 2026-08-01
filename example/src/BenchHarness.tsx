@@ -5,6 +5,7 @@ import { cases as controlCases } from '../../bench/cases/control';
 import { cases as hotpathCases } from '../../bench/cases/hotpath';
 import { cases as formatCases } from '../../bench/cases/format';
 import { cases as batcherCases } from '../../bench/cases/batcher';
+import { cases as fileDestinationCases } from '../../bench/cases/fileDestination';
 import type { BenchCase } from '../../bench/cases/cases';
 
 /**
@@ -38,6 +39,7 @@ const ALL_CASES: BenchCase[] = [
   ...hotpathCases,
   ...formatCases,
   ...batcherCases,
+  ...fileDestinationCases,
 ];
 
 const MARKER = 'NITRO_BENCH';

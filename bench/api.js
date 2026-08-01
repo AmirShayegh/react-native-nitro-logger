@@ -19,6 +19,7 @@
 const logger = require('../lib/commonjs/Logger.js');
 const privacy = require('../lib/commonjs/privacy.js');
 const batcher = require('../lib/commonjs/destinations/Batcher.js');
+const fileDestination = require('../lib/commonjs/destinations/FileDestination.js');
 const utf8 = require('../lib/commonjs/utf8.js');
 const jsonLines = require('../lib/commonjs/formatters/JsonLinesFormatter.js');
 const defaultFormatter = require('../lib/commonjs/formatters/DefaultFormatter.js');
@@ -29,6 +30,7 @@ module.exports = {
   pub: privacy.pub,
   priv: privacy.priv,
   Batcher: batcher.Batcher,
+  FileDestination: fileDestination.FileDestination,
   utf8Length: utf8.utf8Length,
   JsonLinesFormatter: jsonLines.JsonLinesFormatter,
   DefaultFormatter: defaultFormatter.DefaultFormatter,

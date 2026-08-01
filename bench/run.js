@@ -44,9 +44,13 @@ const LOAD_PER_CORE_WARN = 1;
 
 const ROOT = path.resolve(__dirname, '..');
 // `control.js` first: its empty-loop floor validates every later number.
-const CASE_FILES = ['control.js', 'hotpath.js', 'format.js', 'batcher.js'].map(
-  (name) => path.join(__dirname, 'cases', name)
-);
+const CASE_FILES = [
+  'control.js',
+  'hotpath.js',
+  'format.js',
+  'batcher.js',
+  'fileDestination.js',
+].map((name) => path.join(__dirname, 'cases', name));
 
 function mtimeRange(directory) {
   let newest = 0;
