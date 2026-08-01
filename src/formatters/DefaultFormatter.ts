@@ -79,15 +79,51 @@ const CONTINUATION = `${' '.repeat(5)} | ${' '.repeat(12)} | `;
  * This is a deliberate parity difference; docs/PARITY.md records it.
  */
 function formatMessage(message: string): string {
-  // Four things besides \n break a line. A bare \r does, and can also drag
-  // the cursor back over what was already printed. U+0085 (NEL) does for any
-  // Unicode-aware reader. U+2028 and U+2029 do for anything treating this as
-  // JavaScript-flavoured text.
+  // Almost every message is clean, and for a clean one the whole pipeline
+  // below is the identity: nothing to split on means one part, and a part
+  // with nothing to escape comes back out of `escapeControls` as itself.
+  // See {@link NEEDS_ESCAPE} for why that shortcut is exact rather than
+  // approximately right.
+  if (!NEEDS_ESCAPE.test(message)) return message;
+
   return message
-    .split(/\r\n|[\n\r\u0085\u2028\u2029]/)
+    .split(LINE_BREAKS)
     .map(escapeControls)
     .join(`\n${CONTINUATION}`);
 }
+
+/**
+ * The four things besides `\n` that break a line.
+ *
+ * A bare `\r` does, and can also drag the cursor back over what was already
+ * printed. U+0085 (NEL) does for any Unicode-aware reader. U+2028 and U+2029
+ * do for anything treating this as JavaScript-flavoured text. `\r\n` leads so
+ * that a CRLF costs one break rather than two.
+ *
+ * Hoisted to module scope because a regex literal is a fresh `RegExp` on
+ * every evaluation on Hermes, and this one is evaluated per record. Safe to
+ * share only because it carries no `g` flag: a global regex keeps a
+ * `lastIndex` between calls and would be a bug the moment it were hoisted.
+ */
+const LINE_BREAKS = /\r\n|[\n\r\u0085\u2028\u2029]/;
+
+/**
+ * Anything this formatter will not pass through as itself.
+ *
+ * **A strict superset of {@link LINE_BREAKS}' alphabet, and it must stay
+ * one.** That is what makes the fast path in `formatMessage` exact: a message
+ * this rejects cannot contain a line break either, so splitting it would
+ * yield one part and escaping that part would return it unchanged. Every
+ * member is covered — `\n` (U+000A) and `\r` (U+000D) by the C0 range,
+ * U+0085 by the C1 range, and U+2028/U+2029 by name. Add a break form here
+ * without adding it there and clean-looking messages stop being split; the
+ * line-break test in `__tests__/defaultFormatter.test.ts` is what fails.
+ *
+ * Hoisted for the same reason as `LINE_BREAKS`, and `test` is likewise safe
+ * to share only in the absence of `g`.
+ */
+// eslint-disable-next-line no-control-regex
+const NEEDS_ESCAPE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
 
 /**
  * Renders C0, DEL, C1, and the Unicode line/paragraph separators as escapes.
@@ -119,8 +155,7 @@ function formatMessage(message: string): string {
  * whole, so this costs nothing in the normal case.
  */
 function escapeControls(field: string): string {
-  // eslint-disable-next-line no-control-regex
-  if (!/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/.test(field)) return field;
+  if (!NEEDS_ESCAPE.test(field)) return field;
 
   let out = '';
   for (const character of field) {

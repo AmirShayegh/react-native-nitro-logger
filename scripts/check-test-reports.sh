@@ -61,7 +61,7 @@ case "$MODE" in
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=1208
+    MINIMUM=1210
     REQUIRED_SUITES="adapterThinness apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError scope subsystem timestamp utf8"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
