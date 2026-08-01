@@ -582,7 +582,19 @@ function isGlobalObjectRef(context, node, seen = new Set()) {
 }
 
 function poisonedGlobals(context) {
-  const cached = poisonedGlobalsCache.get(context);
+  // Keyed on the SOURCE, not the rule. What this computes is a function of
+  // the syntax tree alone: the nine functions reachable from here —
+  // `unwrap`, `memberChain`, `builtinNamespaceOf`, `isGlobalObjectRef`,
+  // `resolveVariable`, `lookUpVariable`, `immutableInit`, `singleDef` and
+  // this one — read no rule options between them, so four rules over one
+  // file were doing the same whole-file walk four times.
+  //
+  // This is the opposite call from `mutabilityCache` and the option name
+  // sets, which MUST stay per-context because they really do depend on
+  // configuration. The distinction is the whole reason to check rather than
+  // copy whichever neighbour is nearest.
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const cached = poisonedGlobalsCache.get(sourceCode);
   if (cached) return cached;
 
   const poisoned = new Set();
@@ -736,6 +748,15 @@ function poisonedGlobals(context) {
     }
   };
 
+  const visitorKeys = sourceCode.visitorKeys ?? {};
+
+  // Retained deliberately, and NOT pinned by any test — recorded here rather
+  // than left to look load-bearing. Removing it leaves all 407 plugin tests
+  // passing and the walk terminating, because nothing in the corpus reaches
+  // one node under two visitor keys. That is a fact about the fixtures, not
+  // a proof about TS-ESTree, and the cost of being wrong is a walk that does
+  // not finish inside someone's editor. It stays until the stronger claim is
+  // actually proven.
   const seenNodes = new Set();
   const visit = (node) => {
     if (!node || typeof node.type !== 'string' || seenNodes.has(node)) return;
@@ -767,16 +788,28 @@ function poisonedGlobals(context) {
         break;
     }
 
-    for (const key of Object.keys(node)) {
+    // The parser's own child-key table, which skips `loc`, `range`, `type`
+    // and the rest that `Object.keys` was walking on every node.
+    //
+    // The fallback is MANDATORY and must never become a `continue`. A node
+    // type missing from the table is a node type this walk has never seen,
+    // which is exactly when it must look hardest: skipping it means missing
+    // a write to a namespace, which means treating a poisoned `Object.keys`
+    // as trustworthy, which means reading a metadata key set that is not
+    // really there. In a privacy rule the failure is a FALSE NEGATIVE — a
+    // patient identifier logged because the rule decided it had checked.
+    // Walking a few extra properties is the cheap side of that trade.
+    const keys = visitorKeys[node.type] ?? Object.keys(node);
+    for (const key of keys) {
       if (key === 'parent') continue;
       const value = node[key];
       if (Array.isArray(value)) value.forEach(visit);
       else if (value && typeof value.type === 'string') visit(value);
     }
   };
-  visit((context.sourceCode ?? context.getSourceCode()).ast);
+  visit(sourceCode.ast);
 
-  poisonedGlobalsCache.set(context, poisoned);
+  poisonedGlobalsCache.set(sourceCode, poisoned);
   return poisoned;
 }
 
