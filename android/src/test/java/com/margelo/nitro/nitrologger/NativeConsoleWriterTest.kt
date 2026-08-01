@@ -431,6 +431,34 @@ class NativeConsoleWriterTest {
   }
 
   /**
+   * The boundary where the two encodings disagree about FITTING, not just
+   * about size: 634 emoji are 2,536 standard-UTF-8 bytes — comfortably under
+   * the 3,800 budget — and 3,804 as logcat counts them, four over. A fit
+   * check that priced supplementary code points at their standard width
+   * would declare this line whole, emit it unsplit, and logcat would drop
+   * the tail. The emoji case above cannot see that: its line is over budget
+   * in both encodings, so it splits either way.
+   */
+  @Test
+  fun `a line that fits in standard UTF-8 but not as logcat counts is still split`() {
+    val recorder = Recorder()
+    val writer = NativeConsoleWriter(recorder.emit)
+    val line = "😀".repeat(634)
+    writer.logBatch(doubleArrayOf(2.0), arrayOf(line))
+
+    assertTrue("the line must be split, saw ${recorder.entries.size} entries",
+               recorder.entries.size > 1)
+    for ((_, _, message) in recorder.entries) {
+      assertTrue("a piece was ${logcatBytes(message)} bytes to logcat",
+                 logcatBytes(message) <= NativeConsoleWriter.CHUNK_BYTES)
+    }
+    assertEquals("every emoji still arrives, in order", line,
+                 recorder.entries.joinToString("") { (_, _, message) ->
+                   message.substringAfter(") ")
+                 })
+  }
+
+  /**
    * The tail is preserved by splitting earlier, not by dropping it. A budget
    * that ignored the tag would return this line as one entry that logcat then
    * cuts short.

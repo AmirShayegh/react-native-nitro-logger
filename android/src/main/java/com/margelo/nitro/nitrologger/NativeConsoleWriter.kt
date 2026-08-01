@@ -18,15 +18,27 @@ import android.util.Log
  */
 class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGCAT) {
 
+  /**
+   * The tag and the message budget derived from it, bound together so one
+   * volatile read hands [logBatch] a consistent pair — two separate fields
+   * could be observed mid-rebind, charging one install's messages against
+   * another install's tag.
+   */
+  private class Binding(val tag: String, val budget: Int)
+
   @Volatile
-  private var tag: String = FALLBACK_TAG
+  private var binding = Binding(FALLBACK_TAG, messageBudget(FALLBACK_TAG))
 
   /** Binds the tag. Calling it again rebinds. */
   fun install(subsystem: String, category: String) {
     // logcat has no subsystem dimension, so the category becomes the tag and
     // the subsystem is deliberately unused — it is already in the rendered
     // line. An empty category would produce entries nobody can filter for.
-    tag = cappedTag(category.ifEmpty { FALLBACK_TAG })
+    //
+    // The budget is a pure function of the tag, so it is computed once here
+    // rather than re-walking the tag's bytes for every message of every batch.
+    val tag = cappedTag(category.ifEmpty { FALLBACK_TAG })
+    binding = Binding(tag, messageBudget(tag))
   }
 
   /**
@@ -40,12 +52,19 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
    */
   fun logBatch(levels: DoubleArray, messages: Array<String>) {
     if (messages.isEmpty()) return
-    val tag = this.tag
+    val bound = binding
     for (i in messages.indices) {
       val priority = priorityOf(if (i < levels.size) levels[i] else 2.0)
+      val message = messages[i]
       // The tag travels with the message into one entry and is charged against
-      // the same budget — see [messageBudget].
-      for (chunk in chunks(messages[i], tag)) emit(priority, tag, chunk)
+      // the same budget — see [messageBudget]. The common case — a line that
+      // fits — emits directly: no singleton list, no iterator, and the byte
+      // count stops at the budget instead of measuring a runaway line in full.
+      if (fitsWithin(message, bound.budget)) {
+        emit(priority, bound.tag, message)
+      } else {
+        for (chunk in chunks(message, bound.budget)) emit(priority, bound.tag, chunk)
+      }
     }
   }
 
@@ -229,9 +248,12 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
      * because most callers here are asking about the split itself, and that is
      * the shortest tag any entry can carry.
      */
-    fun chunks(message: String, tag: String = FALLBACK_TAG): List<String> {
-      val limit = messageBudget(tag)
-      if (logcatLength(message) <= limit) return listOf(message)
+    fun chunks(message: String, tag: String = FALLBACK_TAG): List<String> =
+      chunks(message, messageBudget(tag))
+
+    /** The [chunks] body, over a budget the caller already computed. */
+    private fun chunks(message: String, limit: Int): List<String> {
+      if (fitsWithin(message, limit)) return listOf(message)
 
       // Reserve room for the widest marker any of these pieces can carry, so
       // adding the prefix cannot push a piece back over the limit.
@@ -314,14 +336,46 @@ class NativeConsoleWriter(private val emit: (Int, String, String) -> Unit = LOGC
      * would answer the wrong question.
      */
     fun logcatLength(text: CharSequence): Int {
-      var bytes = 0
+      // A leading ASCII run is one byte per char with no code-point decode —
+      // but the run stops at U+0000, not just at 0x80: modified UTF-8 makes
+      // NUL the two-byte C0 80, and an ASCII path that charged it 1 would
+      // undercount by exactly the byte that pushes an entry over the limit.
       var i = 0
+      while (i < text.length) {
+        val unit = text[i].code
+        if (unit !in 1..0x7F) break
+        i += 1
+      }
+      var bytes = i
       while (i < text.length) {
         val codePoint = Character.codePointAt(text, i)
         bytes += logcatWidth(codePoint)
         i += Character.charCount(codePoint)
       }
       return bytes
+    }
+
+    /**
+     * Whether [text] costs at most [limit] bytes as logcat counts them —
+     * [logcatLength], but it stops counting at the first byte past the limit
+     * instead of measuring a 4 MB line in full to learn it does not fit.
+     */
+    private fun fitsWithin(text: CharSequence, limit: Int): Boolean {
+      var bytes = 0
+      var i = 0
+      while (i < text.length) {
+        val unit = text[i].code
+        if (unit in 1..0x7F) {
+          bytes += 1
+          i += 1
+        } else {
+          val codePoint = Character.codePointAt(text, i)
+          bytes += logcatWidth(codePoint)
+          i += Character.charCount(codePoint)
+        }
+        if (bytes > limit) return false
+      }
+      return true
     }
 
     /** One code point's cost in modified UTF-8. See [logcatLength]. */
