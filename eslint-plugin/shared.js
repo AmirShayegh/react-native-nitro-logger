@@ -1470,7 +1470,7 @@ function objectProperty(context, object, name) {
  * Returns the string rather than a boolean so that a computed member access
  * (`Log[method]`) can be resolved to the name it actually reads.
  */
-function staticStringValue(context, node, seen = new Set()) {
+function staticStringValue(context, node, seen) {
   const current = unwrap(node);
   if (!current) return null;
   switch (current.type) {
@@ -1483,24 +1483,39 @@ function staticStringValue(context, node, seen = new Set()) {
         : null;
     case 'Identifier': {
       const variable = resolveVariable(context, current);
-      if (!variable || seen.has(variable)) return null;
-      seen.add(variable);
+      if (!variable) return null;
+      // `seen` is allocated here rather than defaulted in the signature
+      // because the two cases above answer without ever looking at it, and
+      // they are almost every call. What it must NOT become is one Set per
+      // recursive step: it is the cycle guard, and `const a = b; const b = a`
+      // only terminates because every step down a chain shares one.
+      const visited = seen ?? new Set();
+      if (visited.has(variable)) return null;
+      visited.add(variable);
       // No mutability check here, deliberately. Whatever this resolves to is
       // a string, and a string cannot be changed by anything an escape could
       // do to it — member writes are no-ops on a primitive, and `immutableInit`
       // already restricts this to `const`, which forbids rebinding. Escape
       // analysis belongs to the object paths, and `MemberExpression` below
       // still goes through it.
-      return staticStringValue(context, immutableInit(variable), seen);
+      return staticStringValue(context, immutableInit(variable), visited);
     }
     case 'MemberExpression': {
       // `MESSAGES.startup`, where MESSAGES is a const object of literals that
       // nothing writes through and nothing else can reach.
-      const name = staticPropertyName(context, current, seen);
+      //
+      // One Set across all three sub-calls, for the reason above: a cycle can
+      // run through the property name and the object, so they have to be
+      // looking at the same record of where they have been. `const k1 = o[k2];
+      // const k2 = o[k1]` is the fixture that fails if they are not.
+      const visited = seen ?? new Set();
+      const name = staticPropertyName(context, current, visited);
       if (name === null) return null;
-      const object = resolveObjectLiteral(context, current.object, seen);
+      const object = resolveObjectLiteral(context, current.object, visited);
       const property = objectProperty(context, object, name);
-      return property ? staticStringValue(context, property.value, seen) : null;
+      return property
+        ? staticStringValue(context, property.value, visited)
+        : null;
     }
     default:
       return null;
@@ -1517,9 +1532,13 @@ function isStaticString(context, node) {
  * string subscript, or a subscript that resolves to a constant string.
  * `Log.info`, `Log['info']` and `const m = 'info'; Log[m]` are one thing.
  */
-function staticPropertyName(context, node, seen = new Set()) {
+function staticPropertyName(context, node, seen) {
   if (!node || node.type !== 'MemberExpression') return null;
   if (!node.computed) {
+    // Every measured call took this branch and none of them needed `seen`,
+    // which is why it is not defaulted in the signature. The computed branch
+    // below copies it, and `new Set(undefined)` is already an empty Set, so
+    // arriving without one needs no special case there.
     // `this.#logger` is as much a named field as `this.logger`; the hash is
     // visibility, not identity.
     return node.property.type === 'Identifier' ||
