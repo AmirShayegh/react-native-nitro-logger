@@ -1,7 +1,7 @@
 import type { AppStateLike } from './appState';
 import { resolveAppState } from './appState';
 import type { Uninstall } from './errorHandler';
-import { monotonicNow } from '../deadline';
+import { createElapsed } from '../deadline';
 
 /**
  * The part of a destination this drives.
@@ -113,13 +113,17 @@ export function scheduleMaintenance(
   let stopped = false;
 
   /**
-   * When a sweep last finished, on the monotonic clock.
+   * Time since the destination was last seen to.
    *
-   * Starts at install even though install deliberately does not sweep: the
-   * question this answers is "how long has it been since this destination was
-   * last seen to", and install is when the interval that sees to it started.
+   * Anchored at install even though install deliberately does not sweep: the
+   * question this answers is how long it has been since anyone looked at this
+   * destination, and install is when the interval that looks at it started.
+   *
+   * An `Elapsed` rather than two readings of a clock, because the two are
+   * not the same thing on a host that gains `performance.now` partway
+   * through — see `createElapsed`.
    */
-  let lastSweepAt = monotonicNow();
+  const elapsed = createElapsed();
 
   const sweep = (): void => {
     try {
@@ -129,7 +133,7 @@ export function scheduleMaintenance(
       // structural case — a destination from somewhere else, on a timer with
       // nobody to catch what it raises.
     }
-    lastSweepAt = monotonicNow();
+    elapsed.anchor();
   };
 
   const start = (): void => {
@@ -158,7 +162,7 @@ export function scheduleMaintenance(
    */
   const resume = (): void => {
     if (stopped || timer !== undefined || pending !== undefined) return;
-    const due = intervalMs - (monotonicNow() - lastSweepAt);
+    const due = intervalMs - elapsed.sinceAnchor();
     if (due <= 0) {
       sweep();
       start();

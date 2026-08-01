@@ -107,20 +107,65 @@ export function startDeadline(deadlineMs: number): Deadline {
   return () => Math.max(0, budget - Math.floor(read() - start));
 }
 
+/** Measures time since its last anchor, across a change of clock. */
+export interface Elapsed {
+  /** Milliseconds since {@link anchor}, never negative. */
+  sinceAnchor(): number;
+  /** Start measuring from now. */
+  anchor(): void;
+}
+
 /**
- * One reading from the same clock {@link startDeadline} counts against.
+ * An elapsed-time reader for callers asking "how long ago", not "how much
+ * budget is left" — `scheduleMaintenance` deciding whether a foreground
+ * transition has earned a sweep.
  *
- * Exported for callers that need to know how long ago something happened
- * rather than how much of a budget is left — `scheduleMaintenance` deciding
- * whether a foreground transition has earned a sweep. They must not reach for
- * `Date.now`: a wall-clock correction between two readings makes an elapsed
- * time that never elapsed, and here that would mean a sweep skipped or
- * doubled on a clock change.
+ * It exists as a thing rather than a bare `now()` because a bare one is
+ * unsafe here, and subtly so. {@link resolveClock} memoises on success ONLY,
+ * which means a process that starts without `performance.now` keeps answering
+ * from `Date.now` until the host installs one — and those two are not the
+ * same timebase. `Date.now` counts from 1970 and `performance.now` from
+ * somewhere around process start, so a value taken before the upgrade and one
+ * taken after share no origin at all. Subtracting them yields an elapsed time
+ * of roughly minus fifty-five years, which as a `setTimeout` delay overflows
+ * to something that fires immediately or never. Two readings from a naive
+ * `monotonicNow()` are only comparable if no upgrade happened between them,
+ * and nothing at the call site can know that.
  *
- * Readings are comparable only with each other, and only within a process.
+ * So the clock that produced the anchor is kept beside it. When the upgrade
+ * lands mid-life the readings are simply not comparable, and the honest
+ * answer is not a number: it re-anchors and reports nothing elapsed, which
+ * costs at most one interval, once, at the moment the host improves.
+ *
+ * Wall-clock corrections remain a hazard on a host that never gains
+ * `performance.now`, exactly as they are for {@link startDeadline}. Every
+ * runtime this library supports provides one.
  */
-export function monotonicNow(): number {
-  return resolveClock()();
+export function createElapsed(): Elapsed {
+  let read = resolveClock();
+  let mark = read();
+  return {
+    // Re-resolving here is tidiness, not correctness, and is recorded as such:
+    // dropping it leaves every test passing, because `read` and `mark` stay a
+    // consistent PAIR either way — anchoring from the old clock stores an old
+    // reading, and `sinceAnchor` then notices the change and re-anchors one
+    // cycle later. It is kept so the pair is never knowingly left stale.
+    anchor(): void {
+      read = resolveClock();
+      mark = read();
+    },
+    sinceAnchor(): number {
+      const current = resolveClock();
+      if (current !== read) {
+        read = current;
+        mark = current();
+        return 0;
+      }
+      // Clamped because the `Date.now` fallback can go backwards under a
+      // correction, and a negative elapsed time is worse here than a zero.
+      return Math.max(0, current() - mark);
+    },
+  };
 }
 
 /**

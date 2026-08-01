@@ -221,3 +221,85 @@ describe('the clock a deadline is spent against', () => {
     }
   });
 });
+
+describe('createElapsed', () => {
+  /** A fresh copy, so the process-lifetime clock memo starts empty. */
+  function freshCreateElapsed(): typeof import('../src/deadline').createElapsed {
+    jest.resetModules();
+    return (require('../src/deadline') as typeof import('../src/deadline'))
+      .createElapsed;
+  }
+
+  /** A `performance`-shaped object whose reading the test can move. */
+  function movableClock(at: number) {
+    const state = { now: at };
+    return { state, value: { now: () => state.now } };
+  }
+
+  test('a host that gains performance.now mid-life re-anchors onto it', () => {
+    // The failure this exists for: `resolveClock` memoises on SUCCESS only, so
+    // a process that starts without `performance.now` keeps answering from
+    // `Date.now` until the host installs one. Those are different timebases —
+    // epoch milliseconds against process-relative milliseconds — and a value
+    // taken before the upgrade minus one taken after is roughly minus
+    // fifty-five years. As a `setTimeout` delay that overflows to a timer
+    // which fires immediately or never.
+    const restore = replacePerformance(null);
+    try {
+      const createElapsed = freshCreateElapsed();
+      const elapsed = createElapsed(); // anchored on Date.now
+
+      const clock = movableClock(5);
+      const restoreClock = replacePerformance({ value: clock.value });
+      try {
+        // Nothing comparable to report across the change.
+        expect(elapsed.sinceAnchor()).toBe(0);
+
+        // The assertion that matters, and the one a bare `Math.max(0, ...)`
+        // cannot satisfy: the anchor has MOVED onto the new clock, so time
+        // measured after the upgrade is real. Clamping a stale epoch-based
+        // anchor would answer 0 here for the next fifty-five years.
+        clock.state.now = 1005;
+        expect(elapsed.sinceAnchor()).toBe(1000);
+      } finally {
+        restoreClock();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test('a clock that goes backwards reports no time rather than negative', () => {
+    // Same clock throughout — this is a correction, not an upgrade, so the
+    // re-anchor above does not fire and the clamp is what answers. A negative
+    // here becomes a LONGER wait: `intervalMs - (-600)` overshoots the
+    // schedule instead of catching up.
+    const clock = movableClock(1000);
+    const restore = replacePerformance({ value: clock.value });
+    try {
+      const createElapsed = freshCreateElapsed();
+      const elapsed = createElapsed();
+      clock.state.now = 400;
+      expect(elapsed.sinceAnchor()).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('an ordinary reading is the time that actually passed', () => {
+    const clock = movableClock(1000);
+    const restore = replacePerformance({ value: clock.value });
+    try {
+      const createElapsed = freshCreateElapsed();
+      const elapsed = createElapsed();
+      clock.state.now = 2500;
+      expect(elapsed.sinceAnchor()).toBe(1500);
+      elapsed.anchor();
+      expect(elapsed.sinceAnchor()).toBe(0);
+      clock.state.now = 2900;
+      expect(elapsed.sinceAnchor()).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+});
