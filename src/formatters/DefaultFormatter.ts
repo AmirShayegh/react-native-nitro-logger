@@ -34,12 +34,16 @@ export class DefaultFormatter implements LogFormatter {
       const metadata = entry.metadata;
       const keys = Object.keys(metadata).sort();
       if (keys.length > 0) {
-        const pairs = keys
-          .map(
-            (k) => `${escapeControls(k)}=${escapeControls(String(metadata[k]))}`
-          )
-          .join(', ');
-        body += ` {${pairs}}`;
+        // Appended in place rather than mapped into an array and joined: the
+        // separator is written between the pairs instead of after them, which
+        // is the whole of the difference from `keys.map(…).join(', ')`.
+        body += ' {';
+        for (let i = 0; i < keys.length; i += 1) {
+          if (i > 0) body += ', ';
+          const key = keys[i]!;
+          body += `${escapeControls(key)}=${escapeControls(String(metadata[key]))}`;
+        }
+        body += '}';
       }
     }
 
