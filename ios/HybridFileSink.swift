@@ -47,8 +47,13 @@ final class HybridFileSink: HybridFileSinkSpec {
     }
   }
 
-  func appendBatch(batch: String, entryCount: Double) throws -> AppendResult {
-    Self.appendResult(answers.appendBatch(batch: batch, entryCount: entryCount))
+  func appendBatch(batch: ArrayBuffer, entryCount: Double) throws -> AppendResult {
+    // Copied, not borrowed: the buffer is JS-owned and only safe inside this
+    // call, and the writer enqueues. One memcpy of the payload — where the
+    // String this took through 0.3.x crossed the bridge as UTF-16 (~2× for
+    // JSON Lines) and was re-encoded to UTF-8 here.
+    Self.appendResult(
+      answers.appendBatch(batch: batch.toData(copyIfNeeded: true), entryCount: entryCount))
   }
 
   func getStatus() throws -> SinkStatus {

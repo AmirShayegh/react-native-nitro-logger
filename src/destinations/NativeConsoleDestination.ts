@@ -19,7 +19,20 @@ export interface NativeConsoleDestinationOptions {
   /** Registration key. Default 'native-console'. */
   readonly label?: string;
   readonly minimumLevel?: LogLevel;
-  /** Default `DefaultFormatter` — os_log wants a line, not a JSON record. */
+  /**
+   * Default `DefaultFormatter` — os_log wants a line, not a JSON record.
+   *
+   * `PlatformConsoleFormatter` is the better fit and is not the default: it
+   * drops the 23 ` INFO | 12:15:30.842 | ` columns, which both native writers
+   * duplicate with their own severity and timestamp and which every
+   * continuation line pays again, blanked, against the sink's chunk budget.
+   * Changing what a developer sees in Console.app is not something a package
+   * upgrade should do by itself, so it is opt-in:
+   *
+   *     new NativeConsoleDestination(sink, {
+   *       formatter: new PlatformConsoleFormatter(),
+   *     })
+   */
   readonly formatter?: LogFormatter;
   /** Reverse-DNS, as os_log expects. Default: the bundle's, chosen natively. */
   readonly subsystem?: string;

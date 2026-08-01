@@ -1,4 +1,9 @@
-import type { LogEntry, LogPrimitive, RedactedMetadata } from '../types';
+import type {
+  LogEntry,
+  LogLevel,
+  LogPrimitive,
+  RedactedMetadata,
+} from '../types';
 import type { LogFormatter } from './types';
 import { LEVEL_NAME } from '../levels';
 import { utf8Length } from '../utf8';
@@ -19,8 +24,164 @@ export interface JsonLinesFormatterOptions {
   readonly timestampStyle?: JsonTimestampStyle;
 }
 
-/** Instants JavaScript can represent as a Date but not as ISO 8601. */
+/**
+ * Instants JavaScript can represent as a Date but not as ISO 8601.
+ *
+ * A whole number of seconds, which {@link isoTimestampJson} relies on: an
+ * in-range instant floored to its own second cannot land outside the range.
+ */
 const MAX_ISO_MS = 8.64e15;
+
+/**
+ * Level names pre-quoted, once, at module load.
+ *
+ * Derived from {@link LEVEL_NAME} rather than written out a second time, so
+ * the two cannot drift — a level added in `levels.ts` gets its JSON form here
+ * with no second edit — and quoted by `JSON.stringify` rather than by
+ * splicing, so nothing rests on an argument about what those names contain.
+ */
+const LEVEL_JSON = Object.fromEntries(
+  Object.entries(LEVEL_NAME).map(([level, name]) => [
+    level,
+    JSON.stringify(name),
+  ])
+) as Record<LogLevel, string>;
+
+/*
+ * ## The memos below, and why they are not the state `LogFormatter` forbids
+ *
+ * A section note rather than a doc comment: it belongs to the three caches
+ * together, and attaching it to whichever one happens to be declared first
+ * would say it was about that one.
+ *
+ * `formatters/types.ts` requires that a formatter "must not carry state that
+ * later records depend on", because a formatter counting its own calls is
+ * counting the wrong sequence — plenty of entries are formatted and never
+ * written. The caches here are not that kind of state. Each holds the last
+ * result of a pure function together with the input it came from, and each
+ * checks that input before using the result. What a record *says* is still
+ * derived entirely from the entry it was given: delete every memo and every
+ * byte is unchanged. That is the property the rule protects, and it survives.
+ *
+ * They are module-level rather than per-instance deliberately. One process
+ * commonly holds two `JsonLinesFormatter`s — a file destination and a native
+ * console one — which see the same entry a moment apart, and a shared slot
+ * turns the second rendering of it into three hits instead of three misses.
+ *
+ * One slot each, never a Map. `subsystem` and `correlation` are
+ * caller-supplied strings, and a cache of those that grows is a retention
+ * surface in a package whose whole thesis is that caller-supplied strings are
+ * where the leak is. One slot retains one string — the one the most recent
+ * entry was already carrying.
+ */
+
+/** The whole second {@link isoHead} was rendered for. `NaN` matches nothing. */
+let isoSecond = NaN;
+
+/** `"YYYY-MM-DDTHH:MM:SS.` — everything before the milliseconds. */
+let isoHead = '';
+
+/**
+ * `"2026-07-27T12:15:30.842Z"`, quoted and ready to splice into a record.
+ *
+ * `new Date(ms).toISOString()` measured ~26% of `format()`, and every entry
+ * logged within the same second shares all of its answer but the last three
+ * digits. So the second is rendered on a miss, and the milliseconds are
+ * appended on every call.
+ *
+ * Three details are load-bearing:
+ *
+ * **`Math.trunc` first, because the `Date` constructor does.** `new Date(1.7)`
+ * is the same instant as `new Date(1)`. Without this, a fractional timestamp
+ * — nothing in this package produces one, but `LogEntry.timestamp` is a plain
+ * number and a hand-built entry can — would put a fraction in the millisecond
+ * field, where `Date` would have discarded it.
+ *
+ * **The seconds split is a floor, not a division toward zero.** `-1500` is
+ * `1969-12-31T23:59:58.500Z`: second `-2`, millisecond `500`. Truncating
+ * toward zero gives second `-1` and millisecond `-500`, which renders as
+ * `59.-500`. The `epoch-before-1970` golden is exactly this case.
+ *
+ * **The head is `JSON.stringify`'s own output, cut from the end.** Taking
+ * `slice(0, -5)` off the quoted form drops `SSSZ"` and keeps the opening
+ * quote, so an expanded-year instant (`"+275760-09-13T…`, which `MAX_ISO_MS`
+ * admits) moves the cut rather than breaking it — and no claim about which
+ * characters JSON escapes is needed anywhere, because nothing here re-quotes
+ * a string.
+ */
+function isoTimestampJson(epochMs: number): string {
+  const instant = Math.trunc(epochMs);
+  const second = Math.floor(instant / 1000);
+  if (second !== isoSecond) {
+    const quoted = JSON.stringify(new Date(second * 1000).toISOString());
+    isoHead = quoted.slice(0, -5);
+    isoSecond = second;
+  }
+  const ms = instant - second * 1000;
+  const pad = ms < 10 ? '00' : ms < 100 ? '0' : '';
+  return `${isoHead}${pad}${ms}Z"`;
+}
+
+/**
+ * A one-slot memo over `JSON.stringify` of a string.
+ *
+ * A factory rather than two hand-written pairs of variables so that "one
+ * slot, checked by strict equality, holding one caller string" is written
+ * once. Two separate slots rather than one shared one because a record
+ * carrying both fields would otherwise evict itself twice per entry — a
+ * performance point and only that: crossing the two callers below renders
+ * byte-identical output, verified by mutation, because each miss recomputes.
+ * No test can pin the separation, so this comment is the only record of it.
+ *
+ * A miss costs one string comparison on top of the `stringify` it was going
+ * to do anyway, which is the whole downside for a correlation ID that changes
+ * every request.
+ */
+function oneSlotJson(): (value: string) => string {
+  let key: string | undefined;
+  let json = '';
+  return (value) => {
+    if (value !== key) {
+      json = JSON.stringify(value);
+      key = value;
+    }
+    return json;
+  };
+}
+
+const correlationJson = oneSlotJson();
+const subsystemJson = oneSlotJson();
+
+/** Opens the metadata object. Written once so `formatWithin` can cost it. */
+const METADATA_OPEN = ',"metadata":{';
+
+/** …and the brace that closes it, which nothing else accounts for. */
+const METADATA_FRAME_BYTES = METADATA_OPEN.length + 1;
+
+/**
+ * The largest code-point boundary at or below `index`, in UTF-16 units.
+ *
+ * `formatWithin` searches for the longest message prefix that fits, and it
+ * must only ever consider prefixes that end on a whole code point. That is
+ * not merely a tidiness rule about not splitting an emoji: **the byte cost of
+ * a prefix is not monotonic across a surrogate pair.** Cutting `"🙂"` after
+ * its high half leaves a lone surrogate, which `JSON.stringify` writes as the
+ * six characters `\ud83d` — so the shorter prefix renders as EIGHT bytes
+ * where the longer one renders as six. A binary search over raw unit indices
+ * would be searching a function that goes back down, and could return a
+ * prefix longer than the budget it was given.
+ *
+ * Restricted to boundaries the cost is monotone, which is what makes the
+ * search valid. A lone low surrogate with no high before it is itself a
+ * boundary: it has no partner to be half of, and gets escaped on its own.
+ */
+function boundaryAtOrBelow(text: string, index: number): number {
+  if (index <= 0 || index >= text.length) return index;
+  const code = text.charCodeAt(index);
+  if (code < 0xdc00 || code > 0xdfff) return index;
+  const previous = text.charCodeAt(index - 1);
+  return previous >= 0xd800 && previous <= 0xdbff ? index - 1 : index;
+}
 
 /**
  * One JSON object per line, matching SwiftLogger's `JSONLogFormatter`.
@@ -90,6 +251,32 @@ export class JsonLinesFormatter implements LogFormatter {
    * already turned it into a six-character `\udXXX` escape by the time
    * anything is measured.
    *
+   * ## Why this is arithmetic rather than rendering
+   *
+   * Every candidate is the same record with a different middle. Rendering
+   * each one and measuring it whole was quadratic on the metadata path — one
+   * full render and one full byte count per key dropped — which cost 243 µs
+   * for a 40-key entry at a 400-byte budget, on the main thread, for exactly
+   * the shape a crash-handler stack trace arrives in. So candidates are
+   * COSTED by adding up numbers. Once the full record above has been rendered
+   * and found too big, choosing among the candidates costs exactly two more
+   * renders however many there are: one of an empty record, to learn the
+   * fixed cost, and one of the winner. Three per truncated entry in total.
+   *
+   * **That addition is exact, and here is why.** UTF-8 length is additive
+   * over concatenation unless the join splits a surrogate pair — the pair
+   * costs 4 bytes together and 3 + 3 apart, so `utf8Length(a) + utf8Length(b)`
+   * would be 2 too many. It cannot happen here: every quantity being added
+   * covers a whole number of JSON tokens, and a JSON token ends with `"`, a
+   * digit, the `e` of `true`/`false`, or a brace — all ASCII. No pair can
+   * straddle a join when nothing being joined ends mid-pair.
+   *
+   * Note what this argument does NOT rest on: that records contain no
+   * surrogates. They routinely do — any astral character in a message or a
+   * metadata value is a surrogate PAIR in the rendered record, passed through
+   * unescaped. What matters is that the pairs sit strictly inside the
+   * quantities being summed, never across them.
+   *
    * When even an empty message will not fit, the result comes back OVER
    * budget: it is the smallest record that still identifies the entry, which
    * is not quite the same as the smallest record possible. `correlation` and
@@ -103,42 +290,88 @@ export class JsonLinesFormatter implements LogFormatter {
     const full = this.format(entry);
     if (utf8Length(full) <= maxBytes) return full;
 
+    // The record with nothing in it — no message, no metadata — rendered by
+    // the same method that renders every answer below. Its length is the
+    // fixed cost of this entry: the timestamp, the level, the tags, the
+    // truncation flag and all the punctuation. Minus two, for the quotes
+    // around the empty message it does contain.
+    //
+    // Deriving it this way rather than assembling the pieces here is the
+    // whole reason `render` is untouched by this method: a second description
+    // of the record's shape, exercised only by budget tests, is exactly the
+    // kind of thing that drifts out of parity with the goldens quietly.
+    const frame = utf8Length(this.render(entry, '', undefined, true)) - 2;
+    const messageBytes = utf8Length(JSON.stringify(entry.message));
+
     // Metadata first: a dropped field costs the reader one fact, whereas a
     // shortened message can cost them the sentence that explains the others.
-    const keys = entry.metadata ? Object.keys(entry.metadata).sort() : [];
-    for (let keep = keys.length - 1; keep >= 0; keep -= 1) {
-      const subset: Record<string, LogPrimitive> = {};
-      for (const key of keys.slice(0, keep)) {
-        subset[key] = entry.metadata![key]!;
+    const metadata = entry.metadata;
+    const keys = metadata ? Object.keys(metadata).sort() : [];
+    if (keys.length > 0) {
+      // `keep` stops one short of the full set, which was already rejected
+      // above — and by more than this loop could recover, since every
+      // candidate here also carries `,"truncated":true`. Running the extra
+      // iteration would therefore be wasted rather than wrong, which is a way
+      // of saying no test pins this bound: it was mutated to `keys.length`
+      // and every one of the 14,365 differential cases still agreed.
+      let total = frame + messageBytes + METADATA_FRAME_BYTES;
+      let keep = 0;
+      for (let i = 0; i < keys.length - 1; i += 1) {
+        const key = keys[i]!;
+        // `"key":value`, plus one byte for the comma joining it to the last.
+        const pair = JSON.stringify(key) + ':' + renderValue(metadata![key]!);
+        total += utf8Length(pair) + (i > 0 ? 1 : 0);
+        if (total > maxBytes) break;
+        keep = i + 1;
       }
-      const candidate = this.render(
-        entry,
-        entry.message,
-        keep === 0 ? undefined : subset,
-        true
-      );
-      if (utf8Length(candidate) <= maxBytes) return candidate;
+      if (keep > 0) {
+        const subset: Record<string, LogPrimitive> = {};
+        for (let i = 0; i < keep; i += 1)
+          subset[keys[i]!] = metadata![keys[i]!]!;
+        return this.render(entry, entry.message, subset, true);
+      }
+      // Keeping no metadata at all is still a candidate, and a cheap one to
+      // test: it is the frame with the whole message in it.
+      if (frame + messageBytes <= maxBytes) {
+        return this.render(entry, entry.message, undefined, true);
+      }
     }
 
     // Then the message, by code points so a surrogate pair is never split
     // into a lone half. Escaping means a code point can cost anywhere from
-    // one to twelve bytes, so the fit is found by measuring whole rendered
-    // records rather than by arithmetic on the message alone.
-    const points = Array.from(entry.message);
+    // one to twelve bytes, so the fit is found by measuring the rendered
+    // message rather than by arithmetic on the source text.
+    //
+    // The search runs over UTF-16 indices and snaps every probe down to a
+    // code-point boundary — see `boundaryAtOrBelow` for why it must. Both
+    // ends stay on boundaries, which is what makes the guard below provably
+    // sufficient rather than merely observed to work.
+    const message = entry.message;
+    const budget = maxBytes - frame;
     let low = 0;
-    let high = points.length;
+    let high = message.length;
     while (low < high) {
-      const mid = Math.ceil((low + high) / 2);
-      const candidate = this.render(
-        entry,
-        points.slice(0, mid).join(''),
-        undefined,
-        true
-      );
-      if (utf8Length(candidate) <= maxBytes) low = mid;
-      else high = mid - 1;
+      let mid = boundaryAtOrBelow(message, low + Math.ceil((high - low) / 2));
+      // Only reachable when `high` is `low + 2` around a surrogate pair: the
+      // midpoint is then `low + 1`, which snapping pushes back to `low`. No
+      // boundary lies strictly between, so `high` is the last candidate. This
+      // line has no test of its own because its absence does not fail — it
+      // spins, and the loop never terminates.
+      if (mid === low) mid = high;
+      if (utf8Length(JSON.stringify(message.slice(0, mid))) <= budget) {
+        low = mid;
+      } else {
+        // Snapping this end too is defensive rather than load-bearing: it was
+        // mutated to a bare `mid - 1` and every differential case still
+        // agreed, because a prefix cut mid-pair always costs MORE than the
+        // one that includes the whole pair (six escape characters against
+        // four bytes) and so can never be chosen once that one has failed.
+        // Keeping both ends on boundaries means nobody has to rediscover
+        // that argument to read the loop.
+        high = boundaryAtOrBelow(message, mid - 1);
+      }
     }
-    return this.render(entry, points.slice(0, low).join(''), undefined, true);
+    return this.render(entry, message.slice(0, low), undefined, true);
   }
 
   private render(
@@ -149,20 +382,20 @@ export class JsonLinesFormatter implements LogFormatter {
   ): string {
     let json = '{"timestamp":';
     json += this.renderTimestamp(entry.timestamp);
-    json += ',"level":' + JSON.stringify(LEVEL_NAME[entry.level]);
+    json += ',"level":' + LEVEL_JSON[entry.level];
     json += ',"message":' + JSON.stringify(message);
 
     if (entry.correlation !== undefined) {
-      json += ',"correlation":' + JSON.stringify(entry.correlation);
+      json += ',"correlation":' + correlationJson(entry.correlation);
     }
     if (entry.subsystem !== undefined) {
-      json += ',"subsystem":' + JSON.stringify(entry.subsystem);
+      json += ',"subsystem":' + subsystemJson(entry.subsystem);
     }
 
     if (metadata) {
       const keys = Object.keys(metadata).sort();
       if (keys.length > 0) {
-        json += ',"metadata":{';
+        json += METADATA_OPEN;
         for (let i = 0; i < keys.length; i += 1) {
           if (i > 0) json += ',';
           json +=
@@ -185,7 +418,7 @@ export class JsonLinesFormatter implements LogFormatter {
     if (!Number.isFinite(epochMs) || Math.abs(epochMs) > MAX_ISO_MS) {
       return '"1970-01-01T00:00:00.000Z"';
     }
-    return JSON.stringify(new Date(epochMs).toISOString());
+    return isoTimestampJson(epochMs);
   }
 }
 

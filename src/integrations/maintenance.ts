@@ -1,6 +1,7 @@
 import type { AppStateLike } from './appState';
 import { resolveAppState } from './appState';
 import type { Uninstall } from './errorHandler';
+import { createElapsed } from '../deadline';
 
 /**
  * The part of a destination this drives.
@@ -72,10 +73,20 @@ const FOREGROUND = 'active';
  *
  * ### Foreground only
  *
- * The interval stops when the app leaves the foreground and starts again when
- * it returns, with one catch-up sweep on the way in: an interval that was
- * frozen for six hours has six hours of expired archives waiting, and waiting
- * a further five minutes for the next tick would be an odd way to spend them.
+ * The interval stops when the app leaves the foreground and picks up where it
+ * left off when it returns. A catch-up sweep runs on the way in only when a
+ * whole interval has actually gone by: an interval frozen for six hours has
+ * six hours of expired archives waiting, and waiting a further five minutes
+ * for the next tick would be an odd way to spend them — but returning after
+ * twenty seconds has nothing to catch up on, and iOS sends a real
+ * `active -> inactive -> active` for the notification shade, control centre,
+ * a call banner, Face ID and screenshots. Sweeping on each of those is up to
+ * `deadlineMs` of synchronous main thread for no work.
+ *
+ * When the catch-up is declined the schedule is still preserved rather than
+ * restarted, so being interrupted repeatedly cannot push maintenance out
+ * indefinitely.
+ *
  * Installing while the app is already in the foreground does *not* sweep —
  * opening the sink has just run one, and app launch is the worst moment to
  * scan a directory.
@@ -97,7 +108,22 @@ export function scheduleMaintenance(
   const appState = options.appState ?? resolveAppState();
 
   let timer: ReturnType<typeof setInterval> | undefined;
+  /** A one-shot standing in for the part of an interval already served. */
+  let pending: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
+
+  /**
+   * Time since the destination was last seen to.
+   *
+   * Anchored at install even though install deliberately does not sweep: the
+   * question this answers is how long it has been since anyone looked at this
+   * destination, and install is when the interval that looks at it started.
+   *
+   * An `Elapsed` rather than two readings of a clock, because the two are
+   * not the same thing on a host that gains `performance.now` partway
+   * through — see `createElapsed`.
+   */
+  const elapsed = createElapsed();
 
   const sweep = (): void => {
     try {
@@ -107,17 +133,57 @@ export function scheduleMaintenance(
       // structural case — a destination from somewhere else, on a timer with
       // nobody to catch what it raises.
     }
+    elapsed.anchor();
   };
 
   const start = (): void => {
-    if (stopped || timer !== undefined) return;
+    if (stopped || timer !== undefined || pending !== undefined) return;
     timer = setInterval(sweep, intervalMs);
   };
 
+  /**
+   * Restart the schedule where it left off, rather than from zero.
+   *
+   * Leaving the foreground clears the interval and returning sets a new one,
+   * so every return used to restart the countdown. That was invisible while
+   * every return also swept: the sweep happened, and the interval it reset
+   * was going to be reset again anyway.
+   *
+   * With the catch-up guarded on elapsed time it stops being invisible and
+   * becomes starvation. A user who opens control centre every couple of
+   * minutes bounces `active -> inactive -> active` each time, and against a
+   * five-minute interval each bounce would push the next sweep five minutes
+   * further out while the guard declined to sweep now. Rotation and expiry
+   * are time-driven and would simply stop.
+   *
+   * So the remaining time is honoured: a sweep that was due in ninety
+   * seconds is still due in ninety seconds, however many times the app is
+   * interrupted before then.
+   */
+  const resume = (): void => {
+    if (stopped || timer !== undefined || pending !== undefined) return;
+    const due = intervalMs - elapsed.sinceAnchor();
+    if (due <= 0) {
+      sweep();
+      start();
+      return;
+    }
+    pending = setTimeout(() => {
+      pending = undefined;
+      sweep();
+      start();
+    }, due);
+  };
+
   const stop = (): void => {
-    if (timer === undefined) return;
-    clearInterval(timer);
-    timer = undefined;
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+    if (pending !== undefined) {
+      clearTimeout(pending);
+      pending = undefined;
+    }
   };
 
   // No sweep here, deliberately — see the note above.
@@ -134,8 +200,19 @@ export function scheduleMaintenance(
           // `active` twice, and a second one must not buy a second sweep.
           if (foreground) return;
           foreground = true;
-          sweep();
-          start();
+          // And guarded on elapsed time, because the transition guard is not
+          // enough. iOS sends `active -> inactive -> active` for the
+          // notification shade, control centre, an incoming call banner, Face
+          // ID and taking a screenshot, so a real transition is not evidence
+          // that anything needs sweeping. `sweep()` is a SYNCHRONOUS barrier
+          // of up to `deadlineMs` — a second of main thread, by default —
+          // inside an AppState listener, and paying it every time someone
+          // swipes down for their notifications is the whole finding.
+          //
+          // A full interval since the last sweep is the same bar the timer
+          // applies, so this catches up only when the timer would have fired
+          // while the app was away.
+          resume();
           return;
         }
         foreground = false;

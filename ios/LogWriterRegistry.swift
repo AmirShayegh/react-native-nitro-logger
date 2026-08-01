@@ -380,7 +380,7 @@ public final class LogFileHandle {
   /// disk. Holding the lock closes the window at no cost: `writer.append` only
   /// reserves bytes and enqueues, never touches the disk, and never reaches back
   /// for this lock.
-  public func appendBatch(_ batch: String, entryCount: Int) -> LogAppendResult {
+  public func appendBatch(_ batch: Data, entryCount: Int) -> LogAppendResult {
     condition.lock()
     defer { condition.unlock() }
 

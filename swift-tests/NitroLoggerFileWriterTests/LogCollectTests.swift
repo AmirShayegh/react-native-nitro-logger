@@ -222,6 +222,33 @@ final class LogCollectTests: LogWriterTestCase {
     XCTAssertFalse(restored.contains(line(0)), "the oldest record should have been cut")
   }
 
+  /// A source the platform will not measure must mark the bundle truncated,
+  /// not ride along free. `fileSize` answers nil for exactly this — a failed
+  /// stat — and the nil/zero distinction is load-bearing: zero is an empty
+  /// file, skipped because it contributes nothing; nil is a member whose
+  /// ABSENCE makes the bundle incomplete, reported out rather than charged
+  /// nothing against a ceiling that says how much may leave the device. A
+  /// dangling symlink wearing a legitimate archive name is the one way to
+  /// make stat fail deterministically inside a directory the enumeration can
+  /// still read.
+  func testAnUnmeasurableSourceMarksTheBundleTruncated() throws {
+    let handle = try makeHandle(policy: policy(bytes: 64))
+    writeRotating(handle, count: 3)
+
+    let phantom = logsDirectory.appendingPathComponent("app.log.20260101T000000Z_0000dead")
+    XCTAssertEqual(
+      symlink("/nowhere/at/all", phantom.path), 0,
+      "the fixture needs a dangling symlink to exist")
+
+    let outcome = handle.collectLogs(deadlineMs: 5000, maxTotalBytes: 10_000_000)
+
+    XCTAssertTrue(outcome.complete, "the measurable members still made a bundle")
+    XCTAssertTrue(
+      outcome.truncated,
+      "an unmeasurable member must be reported out, not taken for free")
+    XCTAssertGreaterThan(outcome.sourceFileCount, 0)
+  }
+
   func testACeilingOfZeroProducesNoBundle() throws {
     let handle = try makeHandle(policy: policy(bytes: 10_000_000))
     write(handle, "secret\n")

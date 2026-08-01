@@ -10,6 +10,7 @@ package com.margelo.nitro.nitrologger
 import androidx.annotation.Keep
 import com.facebook.jni.HybridData
 import com.facebook.proguard.annotations.DoNotStrip
+import com.margelo.nitro.core.ArrayBuffer
 import com.margelo.nitro.core.HybridObject
 
 /**
@@ -36,7 +37,7 @@ abstract class HybridFileSinkSpec: HybridObject() {
   
   @DoNotStrip
   @Keep
-  abstract fun appendBatch(batch: String, entryCount: Double): AppendResult
+  abstract fun appendBatch(batch: ArrayBuffer, entryCount: Double): AppendResult
   
   @DoNotStrip
   @Keep

@@ -201,6 +201,26 @@ handles regulated data.** It covers what the contract does and does not
 promise, the approved-key catalog, and the compliance boundary — in short, a
 build where reveal is possible is a build for synthetic data only.
 
+## Upgrading to 0.4.0
+
+**Ship it as a native release. 0.4.0 JavaScript over a 0.3.x binary is not
+OTA-safe.** Batches now cross the bridge as UTF-8 bytes (`ArrayBuffer`)
+instead of a UTF-16 `String`; a 0.3.x binary rejects every batch at the
+bridge while the app runs on looking healthy — nothing throws at a logging
+call site, and the only runtime signals are `flush()` returning
+`durable: false` with climbing unreported-loss counters. The changelog has
+the measured failure shape on both platforms.
+
+One compiler-pointed change for code in this repo's orbit:
+
+| Was | Now |
+| --- | --- |
+| a `FileSinkLike.appendBatch(batch: string, …)` | `appendBatch(batch: ArrayBuffer, …)` — UTF-8 bytes |
+
+Everything else — every logging call, destination option, formatter and file
+on disk — is unchanged. Log files written by 0.3.x are read, rotated and
+collected by 0.4.0 exactly as before.
+
 ## Upgrading to 0.3.0
 
 Four breaking changes, each of which the compiler points at:

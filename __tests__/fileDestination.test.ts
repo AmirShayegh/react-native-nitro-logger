@@ -6,7 +6,7 @@ import { Logger } from '../src/Logger';
 import { utf8Length } from '../src/utf8';
 import type { LogEntry } from '../src/types';
 import type { LogFormatter } from '../src/formatters/types';
-import { MemoryWriter } from './helpers/MemoryFileSink';
+import { MemoryWriter, utf8Payload } from './helpers/MemoryFileSink';
 import type { MemoryFileSink } from './helpers/MemoryFileSink';
 import type { ClearOutcome } from '../src/specs/FileSink.nitro';
 
@@ -1171,7 +1171,7 @@ describe('MemoryFileSink — beyond the shared no-handle table', () => {
   function openedThenClosed(): MemoryFileSink {
     const sink = new MemoryWriter().attach();
     sink.open('/memory/logs/app.log', undefined, true);
-    sink.appendBatch('{"m":1}\n', 1);
+    sink.appendBatch(utf8Payload('{"m":1}\n'), 1);
     sink.close(1000);
     return sink;
   }
@@ -1301,7 +1301,7 @@ describe('MemoryFileSink — beyond the shared no-handle table', () => {
       '/memory/logs/app.log',
       '/memory/logs/app.log.20260101T000000Z_abcd.gz',
     ];
-    sink.appendBatch('{"m":1}\n', 1);
+    sink.appendBatch(utf8Payload('{"m":1}\n'), 1);
     sink.flush(1000);
 
     expect(sink.clearLogs(1000).rebound).toBe(true);
@@ -1358,7 +1358,7 @@ describe('MemoryFileSink — beyond the shared no-handle table', () => {
     };
     sink.open('/memory/logs/app.log', rotation, true);
 
-    sink.appendBatch('{"m":"much longer than eight bytes"}\n', 1);
+    sink.appendBatch(utf8Payload('{"m":"much longer than eight bytes"}\n'), 1);
     sink.flush(1000);
 
     expect(sink.openedRotation).toBe(rotation);

@@ -30,6 +30,7 @@ namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 #include "RotationConfig.hpp"
 #include <optional>
 #include "AppendResult.hpp"
+#include <NitroModules/ArrayBuffer.hpp>
 #include "SinkStatus.hpp"
 #include "FlushOutcome.hpp"
 #include <vector>
@@ -68,7 +69,7 @@ namespace margelo::nitro::nitrologger {
     public:
       // Methods
       virtual void open(const std::string& path, const std::optional<RotationConfig>& rotation, std::optional<bool> lineFramed) = 0;
-      virtual AppendResult appendBatch(const std::string& batch, double entryCount) = 0;
+      virtual AppendResult appendBatch(const std::shared_ptr<ArrayBuffer>& batch, double entryCount) = 0;
       virtual SinkStatus getStatus() = 0;
       virtual FlushOutcome flush(double deadlineMs) = 0;
       virtual FlushOutcome close(double deadlineMs) = 0;

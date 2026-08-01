@@ -53,7 +53,7 @@ class LogFileWriter internal constructor(
    * of which have to mean the same thing across a restart — so this one is
    * allowed to jump when the device clock is corrected.
    */
-  private val clock: () -> Long,
+  private val clock: Clock,
   /**
    * Monotonic millis. Answers "how much of the budget is left" and "has the
    * backoff elapsed", neither of which may ever be affected by an NTP
@@ -64,7 +64,7 @@ class LogFileWriter internal constructor(
    * and a close that was promised 200 ms and takes an hour is an ANR. iOS keeps
    * the same split, using `DispatchTime` for deadlines and `Date` for ages.
    */
-  private val monotonic: () -> Long,
+  private val monotonic: Clock,
   /** See the parameter of the same name on [open]. Null in production. */
   private val openSweepGate: (() -> Unit)? = null
 ) {
@@ -84,6 +84,17 @@ class LogFileWriter internal constructor(
   /** Archive compression, injectable because the interesting case is failure. */
   fun interface Compressor {
     fun compress(source: File, destination: File): Boolean
+  }
+
+  /**
+   * A millisecond clock. A `fun interface` rather than `() -> Long` because
+   * `Function0<Long>`'s `invoke` returns a boxed `java.lang.Long` — read per
+   * append, with values far outside the `Long.valueOf` cache — while a SAM
+   * `invoke` returns the primitive. The `operator` keeps every call site
+   * reading `clock()`.
+   */
+  fun interface Clock {
+    operator fun invoke(): Long
   }
 
   companion object {
@@ -286,11 +297,32 @@ class LogFileWriter internal constructor(
      */
     private fun archives(directory: File, baseName: String): List<Artifact> {
       val names = directory.list() ?: return emptyList()
-      return names
-        .filter { isArchiveName(it, baseName) }
-        .map { File(directory, it) }
-        .map { Artifact(it, it.lastModified(), it.length()) }
-        .sortedWith(compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name })
+      return archivesFrom(directory, names, baseName)
+    }
+
+    /**
+     * The Artifact-building half of [archives], over a listing the caller
+     * already holds — [sweepRetention] walks the directory once and feeds
+     * both its orphan pass and this from the same array.
+     *
+     * One pre-sized pass where this was filter → map → map → sortedWith,
+     * each a fresh list over up to 10,000 entries.
+     */
+    private fun archivesFrom(
+      directory: File,
+      names: Array<String>,
+      baseName: String,
+    ): List<Artifact> {
+      val artifacts = ArrayList<Artifact>(names.size)
+      for (name in names) {
+        if (!isArchiveName(name, baseName)) continue
+        val file = File(directory, name)
+        artifacts.add(Artifact(file, file.lastModified()))
+      }
+      artifacts.sortWith(
+        compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name }
+      )
+      return artifacts
     }
 
     /**
@@ -387,8 +419,8 @@ class LogFileWriter internal constructor(
       platform: PlatformIo,
       rawWrite: RawWrite? = null,
       compressor: Compressor? = null,
-      clock: (() -> Long)? = null,
-      monotonic: (() -> Long)? = null,
+      clock: Clock? = null,
+      monotonic: Clock? = null,
       /**
        * Runs on the executor immediately before the open sweep, so a test can
        * hold the sweep there and observe the writer as it is *before* retention
@@ -410,8 +442,8 @@ class LogFileWriter internal constructor(
       platform = platform,
       rawWrite = rawWrite ?: defaultRawWrite,
       compressor = compressor ?: defaultCompressor,
-      clock = clock ?: System::currentTimeMillis,
-      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L },
+      clock = clock ?: Clock { System.currentTimeMillis() },
+      monotonic = monotonic ?: Clock { System.nanoTime() / 1_000_000L },
       openSweepGate = openSweepGate
     ).also { it.start() }
   }
@@ -473,6 +505,23 @@ class LogFileWriter internal constructor(
    */
   private val collectLock = ReentrantLock()
   private var reservedBytes = 0L
+
+  /**
+   * Bumped by a purge, compared by the executor before bytes land.
+   *
+   * `@Volatile` so the fence read in [performWrite] is a volatile load
+   * rather than a third [stateLock] acquisition on every append. The bump
+   * stays under [stateLock] — it is paired with the loss and degradation
+   * reset in [clearLogs], and those three must move as one — but the
+   * executor-side read needs only visibility, not atomicity with anything:
+   * the fence holds on BOTH sides of the race. A read that observes the
+   * bump drops the batch; a read the bump has not reached yet lets the
+   * batch land in the pre-purge file, which the sweep — enqueued behind it
+   * on the same executor, after the bump — then deletes. What volatile
+   * guarantees is exactly the part that matters: once bumped, no later
+   * read answers with the old generation.
+   */
+  @Volatile
   private var generation = 1L
   private var closed = false
   private var degraded = LogDegradation.NONE
@@ -873,10 +922,12 @@ class LogFileWriter internal constructor(
   fun append(
     handleId: Long,
     handleGeneration: Long,
-    batch: String,
+    data: ByteArray,
     entryCount: Long
   ): LogAppendResult {
-    val data = batch.toByteArray(Charsets.UTF_8)
+    // UTF-8 bytes as they arrived (0.4.0) — encoded once, in TypeScript.
+    // Through 0.3.x this took a String and paid `toByteArray` here, after
+    // JNI had already crossed the payload as UTF-16.
     val bytes = data.size.toLong()
 
     stateLock.lock()
@@ -943,7 +994,20 @@ class LogFileWriter internal constructor(
         return
       }
 
-      val stale = stateLock.withLock { writeGeneration != generation }
+      // A volatile load, not a lock acquire — see [generation] for why the
+      // fence needs visibility and nothing else from this read.
+      //
+      // (Recorded: the DROP half of this fence is pinned — a mutant that
+      // counts the fenced batch as loss fails "in-flight bytes from before a
+      // purge are dropped without being counted lost" — but a mutant that
+      // never drops survives the suite. The interleaving it would corrupt, a
+      // stale write running AFTER the sweep, needs the enqueue in [append] to
+      // land behind the purge's sweep task, and the only window for that is
+      // between append's stateLock release and its executor.execute — which
+      // has no test seam, and had none when this read held stateLock either.
+      // On the forceable interleavings the executor's FIFO order makes an
+      // unfenced stale write land in the file the sweep then deletes.)
+      val stale = writeGeneration != generation
       if (stale) {
         // A purge landed between acceptance and here. These bytes belong to a
         // file that was deliberately deleted, so they are dropped WITHOUT being
@@ -962,6 +1026,24 @@ class LogFileWriter internal constructor(
       // The true end of file, not a tracked counter: it is what a partial write
       // has to be rolled back to, and being wrong about it means truncating
       // somebody else's bytes.
+      //
+      // The iOS writer tracks this instead and measures only when it rolls
+      // back (see `append` in LogFileWriter.swift). That was tried here and
+      // REVERTED, because the two platforms' write contracts are not twins.
+      // `write(2)` reports a partial write as a positive return and an error
+      // as -1 with nothing written, so Swift always knows how many bytes
+      // landed and can roll back to `trueEnd - written`. Kotlin's underlying
+      // `FileOutputStream.write(data, offset, length)` returns void and is
+      // allowed to throw HAVING ALREADY WRITTEN part of the buffer — which is
+      // exactly what `LogFileWriterTest`'s injected fault models. A rollback
+      // computed from a byte count nobody can know would under-report, leave
+      // half a record in the file, and make everything after it unparseable:
+      // the corruption this whole path exists to prevent, in the direction
+      // that spreads it.
+      //
+      // Rolling back to the last newline at or below the true end would work
+      // without a count, and is a bigger change than removing one syscall
+      // justifies. Until then this reading stays.
       val offsetBefore = try {
         live.channel.size()
       } catch (_: Exception) {
@@ -1685,19 +1767,27 @@ class LogFileWriter internal constructor(
   private fun rotateIfNeeded() {
     val live = stream ?: return
 
-    // Two clocks, deliberately. The backoff asks "has enough time passed since
-    // the last failure", which must not be re-answered by an NTP correction;
-    // the age test asks "how old is this file", which is measured against a
-    // creation time recorded on a previous run and so has to be epoch.
+    // The cheap question first. The size check is a pure field compare, and
+    // under the default policy (no age cap) it is the only question — this
+    // runs per append, and on the no-rotation path neither clock is read at
+    // all. Two clocks remain, deliberately, each read only once its answer
+    // can matter: the age test asks "how old is this file", measured against
+    // a creation time recorded on a previous run, so it has to be epoch and
+    // is allowed to jump with an NTP correction; the backoff asks "has
+    // enough time passed since the last failure", which must never be
+    // re-answered by one.
+    val tooBig = currentFileSize >= policy.maxFileSizeBytes
+    val tooOld = !tooBig && (policy.maxFileAgeSeconds?.let {
+      clock() - currentFileStart >= (it * 1000).toLong()
+    } ?: false)
+    if (!tooBig && !tooOld) return
+
+    // Checked after the thresholds but still before the attempt is counted
+    // or anything moves — rotation happens iff a threshold is crossed AND
+    // the backoff has elapsed, and the order the two are asked in is not
+    // observable.
     val steady = monotonic()
     if (steady < rotationBlockedUntil) return
-
-    val now = clock()
-    val tooBig = currentFileSize >= policy.maxFileSizeBytes
-    val tooOld = policy.maxFileAgeSeconds?.let {
-      now - currentFileStart >= (it * 1000).toLong()
-    } ?: false
-    if (!tooBig && !tooOld) return
     rotationAttempts += 1
 
     try {
@@ -1773,17 +1863,46 @@ class LogFileWriter internal constructor(
     }
   }
 
+  /**
+   * The stamp formatter, built once per writer instead of once per rotation.
+   *
+   * `SimpleDateFormat` is not thread-safe and does not need to be here:
+   * rotation runs on the writer executor and nowhere else, so a plain field
+   * is confined the same way `currentFileSize` is. `Locale.US` plus the
+   * quoted literals means every character it emits is ASCII — which is what
+   * lets `ARCHIVE_SUFFIX` anchor on `\d{8}T\d{6}Z`.
+   */
+  private val stampFormat = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
+    timeZone = java.util.TimeZone.getTimeZone("UTC")
+  }
+
   private fun rotationStamp(): String {
-    val stamp = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
-      timeZone = java.util.TimeZone.getTimeZone("UTC")
-    }.format(java.util.Date(clock()))
-    val suffix = java.util.UUID.randomUUID().toString().replace("-", "").take(8).lowercase(Locale.US)
+    val stamp = stampFormat.format(java.util.Date(clock()))
+    // Eight lowercase hex from `ThreadLocalRandom`, where this used to be
+    // `UUID.randomUUID()` — a SecureRandom draw plus three string passes. The
+    // suffix is a documented tie-breaker for rotations inside the same
+    // second, not a secret; nothing consumes its unpredictability, so paying
+    // the secure generator for it bought nothing. What the suffix MUST do is
+    // match `ARCHIVE_SUFFIX`'s `[a-f0-9]{8}`, or retention silently stops
+    // recognising the writer's own archives — `%08x` of an Int is exactly
+    // eight lowercase hex characters, always.
+    val suffix = String.format(
+      Locale.US, "%08x", java.util.concurrent.ThreadLocalRandom.current().nextInt()
+    )
     return "${stamp}_$suffix"
   }
 
   // MARK: - Retention (executor only)
 
-  data class Artifact(val file: File, val modified: Long, val size: Long)
+  /**
+   * No size field on purpose: `File.length()` is a stat(2) per archive per
+   * enumeration on Android, and the only reader of sizes is the
+   * `maxTotalLogBytes` pass — null by default — which stats the survivors
+   * itself when it runs. (The iOS twin keeps size in its Artifact because it
+   * prefetches both values in the one directory enumeration; the platforms'
+   * listing contracts differ, so the shapes do.)
+   */
+  data class Artifact(val file: File, val modified: Long)
 
   /**
    * Applies all three retention limits. Runs at open, after each rotation, and
@@ -1812,6 +1931,14 @@ class LogFileWriter internal constructor(
       return
     }
 
+    // Loop invariants, hoisted. `baseName` is a getter that re-reads
+    // `file.name` per call, and the two support names are concatenations —
+    // paying all three per entry over a listing that can reach the 10,000
+    // clamp is allocation for nothing.
+    val base = baseName
+    val supportStaging = supportStagingName(base)
+    val supportMember = supportMemberName(base)
+
     // Orphaned compressions first. A `.part` is a gzip that was interrupted —
     // by a crash, or by a process that died mid-rotation — and nothing will
     // ever finish it. Compression runs on this same executor, so a staging file
@@ -1821,15 +1948,17 @@ class LogFileWriter internal constructor(
     // same pass. The finished bundle is not: it is something a caller asked for
     // and may not have uploaded yet, and deleting it here would make
     // [collectLogs] a race against the next rotation.
-    names
-      .filter {
-        isStagingName(it, baseName) ||
-          it == supportStagingName(baseName) ||
-          it == supportMemberName(baseName)
+    for (name in names) {
+      if (isStagingName(name, base) || name == supportStaging || name == supportMember) {
+        remove(File(directory, name))
       }
-      .forEach { remove(File(directory, it)) }
+    }
 
-    var archives = archives(directory, baseName)
+    // The SAME listing feeds the archive pass — this used to be a second
+    // `directory.list()`. Safe because the two sides are disjoint by grammar:
+    // `isArchiveName` deliberately excludes `.part`, and the support names
+    // carry no stamp, so nothing deleted above could have been an archive.
+    var archives = archivesFrom(directory, names, base)
 
     // Oldest first for age, then count, then total size — each pass works on
     // what the previous one left.
@@ -1847,13 +1976,19 @@ class LogFileWriter internal constructor(
     }
 
     policy.maxTotalLogBytes?.let { cap ->
-      var total = currentFileSize + archives.sumOf { it.size }
-      val remaining = archives.toMutableList()
-      // Newest-first order, so dropping from the end sheds the oldest.
-      while (total > cap && remaining.isNotEmpty()) {
-        val oldest = remaining.removeAt(remaining.size - 1)
-        remove(oldest.file)
-        total = if (total > oldest.size) total - oldest.size else 0
+      // Sizes are read here and nowhere else, so they are measured here and
+      // nowhere else — on the survivors of the age and count passes, only
+      // when a byte cap is configured at all. The measurement still happens
+      // before any shedding, so the pass works on one consistent snapshot.
+      val sizes = LongArray(archives.size) { archives[it].file.length() }
+      var total = currentFileSize + sizes.sum()
+      var oldest = archives.size - 1
+      // Newest-first order, so shedding from the end sheds the oldest.
+      while (total > cap && oldest >= 0) {
+        remove(archives[oldest].file)
+        val shed = sizes[oldest]
+        total = if (total > shed) total - shed else 0
+        oldest -= 1
       }
     }
 

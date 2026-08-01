@@ -112,6 +112,7 @@ const LOGGER_OWN_METHODS = new Set([
   'metadataKeyCatalog',
   'minimumLevel',
   'newCorrelationId',
+  'passesLevel',
   'privacyDefault',
   'redactAllMetadata',
   'removeDestination',
@@ -131,9 +132,38 @@ function configuredLoggerNames(context) {
     : DEFAULT_LOGGER_NAMES;
 }
 
-function loggerNames(context) {
-  return new Set(configuredLoggerNames(context));
+/**
+ * Wraps an option-derived Set builder so it runs once per rule run.
+ *
+ * The four sets below are pure functions of `context.options`, which cannot
+ * change while a rule runs over a file, and they were being rebuilt on every
+ * lookup — 1,428 and 1,100 identical Sets for one 529-line file in the audit.
+ *
+ * Keyed on `context`, deliberately, and not on the source file: these are
+ * OPTIONS-derived, and two rules over the same file can be configured
+ * differently. It is the same reason {@link mutabilityCache} is keyed this
+ * way, and the opposite of the poisoned-globals walk, whose answer depends on
+ * the AST alone.
+ *
+ * The Set is now shared by every caller within a rule run rather than handed
+ * out fresh, so it must stay read-only. Every current caller asks `.has(…)`;
+ * anything that needs to add or remove should copy it first.
+ */
+function perContextSet(build) {
+  const cache = new WeakMap();
+  return function cached(context) {
+    let value = cache.get(context);
+    if (value === undefined) {
+      value = build(context);
+      cache.set(context, value);
+    }
+    return value;
+  };
 }
+
+const loggerNames = perContextSet(
+  (context) => new Set(configuredLoggerNames(context))
+);
 
 /**
  * The one name that means the Logger singleton itself, rather than "some
@@ -170,23 +200,23 @@ function canonicalLoggerName(context) {
 const DEFAULT_LOGGER_CLASSES = ['Logger'];
 const DEFAULT_SCOPED_CLASSES = ['ScopedLogger'];
 
-function loggerClassNames(context) {
+const loggerClassNames = perContextSet((context) => {
   const configured = context.options?.[0]?.loggerClassNames;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_LOGGER_CLASSES
   );
-}
+});
 
-function scopedClassNames(context) {
+const scopedClassNames = perContextSet((context) => {
   const configured = context.options?.[0]?.scopedClassNames;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_SCOPED_CLASSES
   );
-}
+});
 
 /**
  * The receiver-resolution options every rule accepts.
@@ -208,14 +238,14 @@ const RECEIVER_OPTION_PROPERTIES = {
 /** Modules an import of the Logger may legitimately come from. */
 const DEFAULT_LOGGER_MODULES = ['react-native-nitro-logger'];
 
-function loggerModules(context) {
+const loggerModules = perContextSet((context) => {
   const configured = context.options?.[0]?.loggerModules;
   return new Set(
     Array.isArray(configured) && configured.length > 0
       ? configured
       : DEFAULT_LOGGER_MODULES
   );
-}
+});
 
 /**
  * Was this binding imported from a module that actually ships the Logger?
@@ -278,7 +308,55 @@ function propertyKeyName(property) {
  * Binding resolution
  * ---------------------------------------------------------------------- */
 
+/**
+ * The binding an identifier refers to, or null if nothing declares it.
+ *
+ * Memoised per identifier NODE, which is the only key that is correct here.
+ * The scope walk below is a linear search of every scope's variable list up
+ * to the global one, and a realistic config declares hundreds of globals —
+ * the audit measured 4,825 calls doing 753,390 name comparisons on one
+ * 529-line file, the same identifier resolved three times along a single
+ * chain of callers.
+ *
+ * Keying on the name instead would be wrong, not merely coarse: two bindings
+ * in different scopes share a name all the time, and that is what shadowing
+ * IS. Keying on the node makes the cache a pure record of a computation
+ * whose inputs — the node and the scope chain above it — cannot change while
+ * a rule runs.
+ *
+ * `null` is cached as itself and read back with `!== undefined`, because the
+ * distinction between "nothing declares this" and "a declared global with no
+ * definitions" is load-bearing downstream: `classifyCandidate` and
+ * `isGlobalNamed` both branch on it, and collapsing the two would change what
+ * `{ logger: analytics }` means. That is also why this memoises the existing
+ * walk rather than switching to reference-based resolution, which cannot tell
+ * those two apart at all.
+ *
+ * The per-context outer layer is conservatism, not correctness, and this
+ * says so rather than letting it read as load-bearing: unlike every other
+ * cache in this file, resolution reads no options at all, so it was mutated
+ * to a single process-wide node-keyed WeakMap and all 407 plugin tests still
+ * passed. It is kept because it matches the shape of the caches around it and
+ * ends every entry's life with the rule run, and it would have to change if
+ * resolution ever started consulting configuration.
+ */
+const variableCache = new WeakMap();
+
 function resolveVariable(context, identifier) {
+  let perContext = variableCache.get(context);
+  if (!perContext) {
+    perContext = new WeakMap();
+    variableCache.set(context, perContext);
+  }
+  const cached = perContext.get(identifier);
+  if (cached !== undefined) return cached;
+
+  const found = lookUpVariable(context, identifier);
+  perContext.set(identifier, found);
+  return found;
+}
+
+function lookUpVariable(context, identifier) {
   let scope = context.sourceCode.getScope(identifier);
   while (scope) {
     const found = scope.variables.find((v) => v.name === identifier.name);
@@ -504,7 +582,19 @@ function isGlobalObjectRef(context, node, seen = new Set()) {
 }
 
 function poisonedGlobals(context) {
-  const cached = poisonedGlobalsCache.get(context);
+  // Keyed on the SOURCE, not the rule. What this computes is a function of
+  // the syntax tree alone: the nine functions reachable from here —
+  // `unwrap`, `memberChain`, `builtinNamespaceOf`, `isGlobalObjectRef`,
+  // `resolveVariable`, `lookUpVariable`, `immutableInit`, `singleDef` and
+  // this one — read no rule options between them, so four rules over one
+  // file were doing the same whole-file walk four times.
+  //
+  // This is the opposite call from `mutabilityCache` and the option name
+  // sets, which MUST stay per-context because they really do depend on
+  // configuration. The distinction is the whole reason to check rather than
+  // copy whichever neighbour is nearest.
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const cached = poisonedGlobalsCache.get(sourceCode);
   if (cached) return cached;
 
   const poisoned = new Set();
@@ -658,6 +748,15 @@ function poisonedGlobals(context) {
     }
   };
 
+  const visitorKeys = sourceCode.visitorKeys ?? {};
+
+  // Retained deliberately, and NOT pinned by any test — recorded here rather
+  // than left to look load-bearing. Removing it leaves all 407 plugin tests
+  // passing and the walk terminating, because nothing in the corpus reaches
+  // one node under two visitor keys. That is a fact about the fixtures, not
+  // a proof about TS-ESTree, and the cost of being wrong is a walk that does
+  // not finish inside someone's editor. It stays until the stronger claim is
+  // actually proven.
   const seenNodes = new Set();
   const visit = (node) => {
     if (!node || typeof node.type !== 'string' || seenNodes.has(node)) return;
@@ -689,16 +788,28 @@ function poisonedGlobals(context) {
         break;
     }
 
-    for (const key of Object.keys(node)) {
+    // The parser's own child-key table, which skips `loc`, `range`, `type`
+    // and the rest that `Object.keys` was walking on every node.
+    //
+    // The fallback is MANDATORY and must never become a `continue`. A node
+    // type missing from the table is a node type this walk has never seen,
+    // which is exactly when it must look hardest: skipping it means missing
+    // a write to a namespace, which means treating a poisoned `Object.keys`
+    // as trustworthy, which means reading a metadata key set that is not
+    // really there. In a privacy rule the failure is a FALSE NEGATIVE — a
+    // patient identifier logged because the rule decided it had checked.
+    // Walking a few extra properties is the cheap side of that trade.
+    const keys = visitorKeys[node.type] ?? Object.keys(node);
+    for (const key of keys) {
       if (key === 'parent') continue;
       const value = node[key];
       if (Array.isArray(value)) value.forEach(visit);
       else if (value && typeof value.type === 'string') visit(value);
     }
   };
-  visit((context.sourceCode ?? context.getSourceCode()).ast);
+  visit(sourceCode.ast);
 
-  poisonedGlobalsCache.set(context, poisoned);
+  poisonedGlobalsCache.set(sourceCode, poisoned);
   return poisoned;
 }
 
@@ -1293,6 +1404,59 @@ function receiverPropertyCandidates(context, node, name, callNode) {
   const variable = resolveVariable(context, current);
   if (!variable) return candidates;
 
+  // The write sites are a property of the binding, not of where the call is,
+  // so they are found once and only the reachability question is asked per
+  // call site. That list is empty for almost every receiver.
+  for (const write of receiverWrites(context, variable, name)) {
+    if (!reachesCall(write.gate, callNode)) continue;
+    for (const value of write.values) candidates.push(value);
+  }
+  return candidates;
+}
+
+/**
+ * Every site that could install `name` on `variable`, paired with the node
+ * whose reachability decides whether it counts.
+ *
+ * Split out of {@link receiverPropertyCandidates} because that function ran
+ * for every member call whose method is not an API method — `_.map`,
+ * `axios.get`, `navigation.navigate` — and rescanned every reference of the
+ * receiver's binding each time, which is O(references x call sites) per file.
+ * Nothing in this scan depends on the call site except `reachesCall`, so the
+ * scan is cached per (context, variable, name) and the call site supplies
+ * only the filter.
+ *
+ * Cached per CONTEXT because `staticPropertyName` and `resolveReceiverObject`
+ * both consult options-derived configuration on the way through.
+ *
+ * Reordering is safe because `reachesCall` is pure: it compares positions in
+ * a syntax tree that is not being modified. The old code asked it before
+ * resolving an `Object.assign` source and this asks it after, which changes
+ * how much work is skipped and not which candidates come back.
+ */
+const receiverWriteCache = new WeakMap();
+
+function receiverWrites(context, variable, name) {
+  let perContext = receiverWriteCache.get(context);
+  if (!perContext) {
+    perContext = new WeakMap();
+    receiverWriteCache.set(context, perContext);
+  }
+  let perVariable = perContext.get(variable);
+  if (!perVariable) {
+    perVariable = new Map();
+    perContext.set(variable, perVariable);
+  }
+  const cached = perVariable.get(name);
+  if (cached !== undefined) return cached;
+
+  const writes = computeReceiverWrites(context, variable, name);
+  perVariable.set(name, writes);
+  return writes;
+}
+
+function computeReceiverWrites(context, variable, name) {
+  const writes = [];
   for (const reference of variable.references) {
     const identifier = reference.identifier;
     const member = identifier.parent;
@@ -1301,8 +1465,7 @@ function receiverPropertyCandidates(context, node, name, callNode) {
       if (
         !call ||
         call.type !== 'CallExpression' ||
-        !call.arguments.includes(identifier) ||
-        !reachesCall(call, callNode)
+        !call.arguments.includes(identifier)
       ) {
         continue;
       }
@@ -1314,13 +1477,15 @@ function receiverPropertyCandidates(context, node, name, callNode) {
         call.arguments[0] === identifier &&
         isNamespaceMethod(context, call, 'Object', 'assign')
       ) {
+        const values = [];
         for (const source of call.arguments.slice(1)) {
           const match = receiverProperty(
             resolveReceiverObject(context, source),
             name
           );
-          if (match) candidates.push(match.value);
+          if (match) values.push(match.value);
         }
+        if (values.length > 0) writes.push({ gate: call, values });
         continue;
       }
 
@@ -1360,13 +1525,12 @@ function receiverPropertyCandidates(context, node, name, callNode) {
     if (
       assignment &&
       assignment.type === 'AssignmentExpression' &&
-      assignment.left === member &&
-      reachesCall(assignment, callNode)
+      assignment.left === member
     ) {
-      candidates.push(assignment.right);
+      writes.push({ gate: assignment, values: [assignment.right] });
     }
   }
-  return candidates;
+  return writes;
 }
 
 /**
@@ -1469,7 +1633,7 @@ function objectProperty(context, object, name) {
  * Returns the string rather than a boolean so that a computed member access
  * (`Log[method]`) can be resolved to the name it actually reads.
  */
-function staticStringValue(context, node, seen = new Set()) {
+function staticStringValue(context, node, seen) {
   const current = unwrap(node);
   if (!current) return null;
   switch (current.type) {
@@ -1482,24 +1646,39 @@ function staticStringValue(context, node, seen = new Set()) {
         : null;
     case 'Identifier': {
       const variable = resolveVariable(context, current);
-      if (!variable || seen.has(variable)) return null;
-      seen.add(variable);
+      if (!variable) return null;
+      // `seen` is allocated here rather than defaulted in the signature
+      // because the two cases above answer without ever looking at it, and
+      // they are almost every call. What it must NOT become is one Set per
+      // recursive step: it is the cycle guard, and `const a = b; const b = a`
+      // only terminates because every step down a chain shares one.
+      const visited = seen ?? new Set();
+      if (visited.has(variable)) return null;
+      visited.add(variable);
       // No mutability check here, deliberately. Whatever this resolves to is
       // a string, and a string cannot be changed by anything an escape could
       // do to it — member writes are no-ops on a primitive, and `immutableInit`
       // already restricts this to `const`, which forbids rebinding. Escape
       // analysis belongs to the object paths, and `MemberExpression` below
       // still goes through it.
-      return staticStringValue(context, immutableInit(variable), seen);
+      return staticStringValue(context, immutableInit(variable), visited);
     }
     case 'MemberExpression': {
       // `MESSAGES.startup`, where MESSAGES is a const object of literals that
       // nothing writes through and nothing else can reach.
-      const name = staticPropertyName(context, current, seen);
+      //
+      // One Set across all three sub-calls, for the reason above: a cycle can
+      // run through the property name and the object, so they have to be
+      // looking at the same record of where they have been. `const k1 = o[k2];
+      // const k2 = o[k1]` is the fixture that fails if they are not.
+      const visited = seen ?? new Set();
+      const name = staticPropertyName(context, current, visited);
       if (name === null) return null;
-      const object = resolveObjectLiteral(context, current.object, seen);
+      const object = resolveObjectLiteral(context, current.object, visited);
       const property = objectProperty(context, object, name);
-      return property ? staticStringValue(context, property.value, seen) : null;
+      return property
+        ? staticStringValue(context, property.value, visited)
+        : null;
     }
     default:
       return null;
@@ -1516,9 +1695,13 @@ function isStaticString(context, node) {
  * string subscript, or a subscript that resolves to a constant string.
  * `Log.info`, `Log['info']` and `const m = 'info'; Log[m]` are one thing.
  */
-function staticPropertyName(context, node, seen = new Set()) {
+function staticPropertyName(context, node, seen) {
   if (!node || node.type !== 'MemberExpression') return null;
   if (!node.computed) {
+    // Every measured call took this branch and none of them needed `seen`,
+    // which is why it is not defaulted in the signature. The computed branch
+    // below copies it, and `new Set(undefined)` is already an empty Set, so
+    // arriving without one needs no special case there.
     // `this.#logger` is as much a named field as `this.logger`; the hash is
     // visibility, not identity.
     return node.property.type === 'Identifier' ||
@@ -2111,29 +2294,37 @@ function describeCall(context, node) {
   if (!callee) return null;
 
   if (callee.type === 'MemberExpression') {
+    // The callee's own property name, read once and used throughout: it is
+    // `call`/`apply` when the call is forwarded and the API method when it is
+    // direct. This was read twice, and the second read repeated the entire
+    // resolution — for a computed callee, a fresh walk through
+    // `staticStringValue` and everything it resolves.
+    const method = staticPropertyName(context, callee);
+
     // `Log.info.call(thisArg, message, …)` / `.apply(thisArg, argsArray)`
-    const outer = staticPropertyName(context, callee);
-    if (outer === 'call' || outer === 'apply') {
+    if (method === 'call' || method === 'apply') {
       const inner = unwrap(callee.object);
       if (inner && inner.type === 'MemberExpression') {
-        const method = staticPropertyName(context, inner);
-        if (method !== null && API_METHODS.has(method)) {
+        // The method being forwarded TO, which is the one that gets reported.
+        // Named apart from `method` because the two were both called `method`
+        // in their own scopes, and they are different nodes' property names.
+        const target = staticPropertyName(context, inner);
+        if (target !== null && API_METHODS.has(target)) {
           const receiver = receiverOf(context, inner.object, node);
           if (receiver === null) return null;
-          const args = outer === 'call' ? node.arguments.slice(1) : [];
+          const args = method === 'call' ? node.arguments.slice(1) : [];
           return {
-            method,
+            method: target,
             receiver,
             // `.apply` passes an array — positional analysis is meaningless,
             // so report only that the call exists.
             args,
-            spreadArgs: outer === 'apply' || hasSpread(args),
+            spreadArgs: method === 'apply' || hasSpread(args),
           };
         }
       }
     }
 
-    const method = staticPropertyName(context, callee);
     // The container walk runs only when the method says this could be a
     // logger call at all — `cache.get(key)` has no business paying for it —
     // and `receiverOf` is where the precedence between the walk and the name

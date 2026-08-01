@@ -1,5 +1,208 @@
 # react-native-nitro-logger
 
+## 0.4.0
+
+### Minor Changes
+
+- 74af75a: Batches cross the bridge as bytes — 0.4.0 needs a native rebuild, and this JavaScript over a 0.3.x binary is not OTA-safe
+
+  `appendBatch` now takes an `ArrayBuffer`. The batch is encoded to UTF-8
+  exactly once, in TypeScript, with the `TextEncoder` Hermes has shipped since
+  well below this package's React Native 0.78 floor; the bytes cross the bridge
+  as they are, and each adapter makes one copy into memory the writer owns.
+  Through 0.3.x the same batch crossed as a String — UTF-16 on the wire, roughly
+  twice the bytes for JSON Lines — and was then re-encoded to UTF-8 a second
+  time on the native side, on Android under the handle lock. What lands on disk
+  is byte-identical; the 21 SwiftLogger goldens run unchanged as the proof.
+
+  For a caller the only shape change is `FileSinkLike`: a custom sink's
+  `appendBatch` now receives an `ArrayBuffer` of UTF-8 bytes where it received a
+  `string`, and the compiler points at it.
+
+  **The cost is the wire type, and it is a real compatibility break.** A 0.3.x
+  binary registered `appendBatch(std::string)`; 0.4.0 JavaScript hands that
+  binary an object. This was measured, not inferred — on both platforms, a
+  consumer app compiled against the published 0.3.0 tarball with this release's
+  JavaScript delivered over it, which is the OTA pairing exactly:
+
+  - Construction succeeds. The method names did not change, so nothing fails at
+    startup, where a failure would at least be visible.
+  - The bridge rejects every batch. The raw sink call throws
+    `FileSink.appendBatch(...): Value is an object, expected a String` — `at
+appendBatch (native)` — on both platforms.
+  - Through `FileDestination`, nothing throws at any logging call site. The
+    batcher treats a throwing sink as a failing sink: every flush returns
+    `durable: false` with `unreportedEntries`/`unreportedBytes` climbing
+    (measured: 1 entry owed after the first flush, 2 after the second — 141
+    then 286 bytes on iOS, 137 then 278 on Android; the second batch also
+    carries the loss notice for the first, and loses it the same way), while
+    `degraded` stays `0`, `isEnabled` stays `true`, and the signature-unchanged
+    methods keep answering normally (`getLogFilePaths` returned the opened
+    file; `deleteSupportBundle` returned `true`). Every record is lost,
+    silently, for as long as the pairing runs.
+
+  So: ship 0.4.0 as a native release, never as an over-the-air JavaScript
+  update onto a binary built from 0.3.x. The mismatched app runs, looks
+  healthy, and writes nothing to disk; the only runtime signals are `flush()`'s
+  `durable: false` and its unreported-loss counters.
+
+- a39f01a: New: `PlatformConsoleFormatter`, for sinks that already stamp the time
+
+  `NativeConsoleDestination` writes through `DefaultFormatter`, which renders
+  `INFO | 12:15:30.842 |` in front of every line. Both native writers pass the
+  text through verbatim and stamp their own severity and timestamp on top, so
+  Console.app shows the same instant twice, a millisecond apart, and every
+  logcat line carries a priority it is also spelling out.
+
+  `PlatformConsoleFormatter` writes the rest of the layout and nothing else:
+
+      [correlation] [subsystem] message {key=value}
+
+  **Opt-in, and staying that way.** This changes what a developer sees, which a
+  package upgrade should not do by itself:
+
+  ```js
+  import {
+    createNativeConsoleDestination,
+    PlatformConsoleFormatter,
+  } from 'react-native-nitro-logger';
+
+  createNativeConsoleDestination({ formatter: new PlatformConsoleFormatter() });
+  ```
+
+  Those 23 characters are not only noise, and they are paid per line rather than
+  once per entry: every continuation line carries the same columns blanked out,
+  against four characters here. A thirty-frame stack trace spends 713 characters
+  on framing under the default layout and 120 under this one. os_log and logcat
+  both chunk the rendered entry by size — around 900 bytes and a budget shared
+  with the tag — so that is 593 bytes handed back to the content.
+
+  Structured fields — correlation, subsystem, metadata keys and values — are
+  escaped exactly as `DefaultFormatter` escapes them; that is one shared
+  implementation, not two. The continuation marker for multi-line messages is
+  weaker here and deliberately so: with no columns to blank, a message beginning
+  ` |` renders a first line that reads like a continuation. What that can
+  impersonate is another line of your app's console output, never a record. The
+  durable copy is `FileDestination`'s and `JsonLinesFormatter` is what makes it
+  unforgeable; keep the default if you want the stronger guarantee in the console
+  as well.
+
+- d51f07f: The level decision is memoised, and made before the options object is built
+
+  A message below the minimum is the most common thing a logger does, and it was
+  the most expensive thing it did per call for its result. Resolving a subsystem
+  walked the dot hierarchy every time — a Map lookup, a `lastIndexOf` and an
+  allocated slice per segment — and the six level methods allocated an options
+  object before anything had asked whether the message would be logged at all.
+
+  Both are fixed. Resolution is memoised per subsystem name and the memo is
+  discarded whenever `minimumLevel`, `subsystem` or `resetSubsystem` changes what
+  it could answer; the six level methods, on `Logger` and on `ScopedLogger`, ask
+  the level question first and return before allocating. `logMessage` still makes
+  the same check on arrival, so integrations and direct callers are unaffected.
+
+  The memo is bounded at 512 subsystem names. Past that, resolution still answers
+  correctly, it is simply not remembered — the keys are caller-supplied strings,
+  and an unbounded cache of them would be a process-lifetime record of every
+  subsystem name ever logged.
+
+  **One behaviour change, and it is for a subclass rather than a caller.** The six
+  convenience methods used to reach the overridable method underneath them on
+  every call, and now they reach it only on calls that pass the level check. So a
+  subclass of `Logger` that overrides `logMessage()`, or of `ScopedLogger` that
+  overrides `log()`, no longer sees the calls the level filter drops — whatever
+  the override was for. That includes overrides that would have acted on those
+  calls rather than merely watched them: re-routing a filtered call, raising its
+  level, or deliberately emitting it is no longer possible from there, because
+  the call does not arrive.
+
+  Two things are unchanged. Calls that pass the level check still go through the
+  overridden method exactly as before, and a direct call to `logMessage()` or to
+  `log()` is untouched — which is the path every integration in this package
+  uses (the error handler, the rejection handler, the bridges).
+
+  `Logger.passesLevel(level, subsystem?)` is public as a consequence:
+  `ScopedLogger` has to be able to ask. It answers the level question and nothing
+  else — no message, no thunk, no entry.
+
+### Patch Changes
+
+- 15fd071: Two crash-path fixes: a ReDoS in stack-frame parsing, and error handlers that stacked up across Fast Refresh
+
+  **Hostile stack traces can no longer stall the fatal-error handler.** The
+  regex that picked `file:line:column` off the end of a stack frame backtracked
+  from every offset when the tail almost-matched, and `stack` is a property of
+  any thrown object — attacker-shaped input on the one path that runs between a
+  fatal error and `flush(2000)`. Measured through the shipped artifact: a
+  benign stack cost 0.1 ms; 64 KB of `"1:"` repeated cost 225 ms on desktop V8,
+  which is seconds on a mid-range phone — inside the handler whose whole job is
+  getting the log to disk before the watchdog kills the process. The parse is
+  now a backward scan, character-class-identical to the regex — proven by a
+  differential fuzz test (random strings, both parsers, identical
+  `(location, line, column)` triples) and pinned by a hostile fixture with a
+  tight time budget. Same output, linear time.
+
+  **A Fast Refresh no longer leaves the previous error handler installed.**
+  Each reload re-ran the installer while the old instance stayed chained on
+  `ErrorUtils`, so N reloads meant N sanitizer passes per error and N
+  `flush(2000)` barriers on a fatal one — multiplying exactly the path fixed
+  above. The install registry now lives on a global symbol, so a fresh instance
+  recognises its predecessor and marks it inert. Unbranded handlers — RedBox,
+  crash reporters — are never skipped; only this package's own stale instances
+  step aside. Development-only by nature, and the termination signal (module
+  re-evaluation) is stated in the handler for what it is: weaker than a real
+  teardown hook.
+
+- 15fd071: The audit sweep: measured performance work across every layer, with byte output pinned unchanged
+
+  Six subsystem audits, each finding measured before landing and each landing
+  behind the tests that pin its behaviour. Log bytes on disk are unchanged
+  everywhere — the SwiftLogger golden suite is the proof — and no redaction,
+  durability, ordering or loss-accounting rule moved. The highlights, per
+  layer:
+
+  - **Per-call TypeScript path.** A filtered call — what a production logger
+    does most — resolves its subsystem from a bounded memo instead of walking
+    the dot hierarchy (291.6 → 31 ns measured), and the six level methods
+    return before allocating anything. Delivered calls redact through a
+    single-source fast path (720 → 400 ns for five keys). The memo is capped
+    at 512 names because caller-supplied strings retained for process lifetime
+    are a disclosure surface, not just memory.
+  - **Formatters.** JSON Lines timestamps come from a whole-second memo
+    (~600 → ~30 ns for same-second entries — pure memos, output stays a
+    function of the entry alone), budget-fitting an oversize record is no
+    longer quadratic (9.6× on shedding, and crash-handler stacks are exactly
+    that shape), and the console formatter escapes clean messages without a
+    rebuild.
+  - **Batcher.** The steady-state drain stopped allocating an array per flush
+    and the no-loss path stopped building snapshots nobody reads; the batch
+    joins once.
+  - **iOS writer.** Archive-name recognition is a hand scan (93× over the
+    per-name regex), retention prunes are linear instead of O(n²), the CRC in
+    archive compression is sliced-by-8 (about −45% off whole-archive
+    compression, on the queue every append waits behind), directory sweeps
+    walk once, opens `stat()` instead of round-tripping `FileManager` (28×),
+    and the per-append `fstat` is gone — the failure path re-measures the file
+    before any rollback, so a torn batch still truncates to a boundary read
+    from disk, never to arithmetic on counters.
+  - **Android writer.** Appends make one syscall where they made two, rotation
+    asks its cheap question before reading any clock, archive sizes are read
+    only when a byte cap will use them, the logcat writer budgets lines
+    without re-walking the tag per message (with the NUL-costs-two-bytes edge
+    pinned), and the purge fence's executor-side read is a volatile load — the
+    drop half of that fence is pinned by test; the write stays locked.
+  - **ESLint plugin and integrations.** The plugin's receiver walk is no
+    longer quadratic in file size and its config sets are built once per
+    context — 2.9× on the plugin's share of a 5,209-line file, verified
+    byte-identical against all 362 extracted rule fixtures, twice. App resumes
+    no longer pay a catch-up maintenance sweep on every notification-shade
+    bounce.
+
+  What did NOT change, deliberately, is recorded too: the declined rewrites
+  (engine-specific string tricks, a shared scratch buffer a re-entrant
+  destination could clobber, a process-lifetime key cache) live in the plan and
+  in code comments, each with the measurement or the hazard that killed it.
+
 ## 0.3.0
 
 ### Minor Changes

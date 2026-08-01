@@ -50,6 +50,37 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertEqual(archiveNames().count, 1, "age rotates a file that never reached the size cap")
   }
 
+  /// The other half of `fileStart`'s contract: a file that already exists is
+  /// as old as the FILESYSTEM says, not as old as the process that reopened
+  /// it. `testRotatesOnAge` cannot see this — its file is created by the
+  /// handle under test, so the injected clock and the birth date describe the
+  /// same moment. Here the file predates the handle, the injected clock
+  /// stands two hours past the real birth time, and the very first write must
+  /// rotate. A writer that falls back to its own clock for existing files
+  /// reads every reopened file as newborn, and a log that outlived its
+  /// process never ages out — exactly the mutant this pins.
+  func testAnExistingFilesAgeComesFromTheFilesystemNotFromReopening() throws {
+    try FileManager.default.createDirectory(
+      at: logsDirectory, withIntermediateDirectories: true
+    )
+    try Data("from a previous run\n".utf8).write(to: logURL)
+
+    let policy = LogRotationPolicy(
+      maxFileSizeBytes: 10_000_000,
+      maxArchivedFilesCount: 5,
+      maxFileAgeSeconds: 3600
+    )
+    let clock = WallClock()
+    clock.advance(7200)
+    let handle = try makeHandle(policy: policy, clock: { clock.now })
+
+    write(handle, "first write after reopen\n")
+    XCTAssertEqual(
+      archiveNames().count, 1,
+      "a two-hour-old file crossed the one-hour age cap before this process existed"
+    )
+  }
+
   /// The file a rotation opens is new, and its age restarts — measured on the
   /// clock the writer is actually using.
   ///
@@ -110,6 +141,54 @@ final class LogRotationTests: LogWriterTestCase {
         "\(name) should also be prunable"
       )
     }
+  }
+
+  /// The stamp grammar, spelled out case by case against the scan that
+  /// replaced the regex. The imposter cases at the end pin two places the
+  /// scan is deliberately EXACT where ICU was loose: `$` also matched before
+  /// a trailing newline, and `\d` admitted every Unicode decimal digit.
+  /// Neither form is a name rotation can write — `stampFormatter` is
+  /// `en_US_POSIX` — so recognising them was the bug, not the behaviour.
+  func testTheStampGrammarIsExact() {
+    let base = "app.log"
+    let stamp = "20260731T121530Z_00c0ffee"
+
+    XCTAssertTrue(LogWriter.isArchiveName("\(base).\(stamp)", baseName: base))
+    XCTAssertTrue(LogWriter.isArchiveName("\(base).\(stamp).gz", baseName: base))
+    XCTAssertTrue(LogWriter.isStagingName("\(base).\(stamp).gz.part", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp).gz.part", baseName: base),
+                   "a staging file must never occupy an archive's retention slot")
+    XCTAssertFalse(LogWriter.isStagingName("\(base).\(stamp).gz", baseName: base))
+
+    // Each field one character short, one long, or the wrong alphabet.
+    for bad in [
+      "2026073T121530Z_00c0ffee",     // seven date digits
+      "202607311T121530Z_00c0ffee",   // nine
+      "20260731T12153Z_00c0ffee",     // five time digits
+      "20260731T1215301Z_00c0ffee",   // seven
+      "20260731X121530Z_00c0ffee",    // wrong separator
+      "20260731T121530A_00c0ffee",    // wrong zone letter
+      "20260731T121530Z-00c0ffee",    // wrong joiner
+      "20260731T121530Z_00c0ffe",     // seven hex
+      "20260731T121530Z_00c0ffee0",   // nine
+      "20260731T121530Z_00C0FFEE",    // uppercase hex — rotation never writes it
+      "20260731T121530Z_00g0ffee",    // not hex at all
+    ] {
+      XCTAssertFalse(LogWriter.isArchiveName("\(base).\(bad)", baseName: base), bad)
+      XCTAssertFalse(LogWriter.isStagingName("\(base).\(bad).gz.part", baseName: base), bad)
+    }
+
+    // The ICU loosenesses, closed. A trailing newline is a different file
+    // name, and an Arabic-Indic stamp is not something en_US_POSIX produces.
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp)\n", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp).gz\n", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).٢٠٢٦٠٧٣١T١٢١٥٣٠Z_00c0ffee", baseName: base))
+
+    // Prefix discipline: the base name is part of the grammar too.
+    XCTAssertFalse(LogWriter.isArchiveName(stamp, baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("other.log.\(stamp)", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base)\(stamp)", baseName: base),
+                   "the dot between base and stamp is not optional")
   }
 
   // MARK: - Maintenance without a write
@@ -278,6 +357,61 @@ final class LogRotationTests: LogWriterTestCase {
     XCTAssertEqual(archiveNames().count, 1, "the expired archive goes even though the count cap allows it")
   }
 
+  /// The three passes hand ONE list along — "each pass works on what the
+  /// previous one left" — and every single-cap test leaves that unpinned: a
+  /// pass that deletes files while keeping their entries, or prunes the wrong
+  /// side of its list, is only visible in what the NEXT pass measures.
+  ///
+  /// Here the age pass hands the byte pass a set whose sizes point the other
+  /// way: the expired archives are small and many, the survivor is large. A
+  /// sweep whose byte pass sees the truth deletes the oversized survivor; one
+  /// reading a stale list adds up ghosts, stays under the cap, and keeps it.
+  func testTheBytePassMeasuresWhatTheAgePassLeft() throws {
+    let handle = try makeHandle(
+      policy: sizePolicy(bytes: 64, keep: 100, archiveAge: 3600, totalBytes: 300)
+    )
+    for _ in 0..<8 { write(handle, record) }
+    XCTAssertGreaterThan(archiveNames().count, 1)
+
+    // Everything so far expires. The next batch is larger than the whole
+    // byte cap on its own, so after the age pass clears the expired set the
+    // byte pass MUST see it and take it — a stale list of small ghosts sums
+    // to under the cap and would leave it alive.
+    try backdateArchives(by: 7200)
+    write(handle, String(repeating: "z", count: 400) + "\n")
+    write(handle, record) // rotation → sweep
+
+    XCTAssertEqual(
+      archiveNames().count, 0,
+      "the oversized survivor is what the byte pass must be measuring"
+    )
+    XCTAssertEqual(
+      handle.status().degraded & LogDegradation.prune.rawValue, 0,
+      "every removal in this sweep is of a file that exists; nothing may fail"
+    )
+  }
+
+  /// The count-pass half of the same contract. The byte cap sits between the
+  /// kept set and the pre-count set, so a count pass that deletes its excess
+  /// while leaving the entries in the list pushes the byte pass over cap —
+  /// which then tries to delete a file the count pass already removed, and a
+  /// prune degradation appears that no real failure earned.
+  func testTheBytePassMeasuresWhatTheCountPassLeft() throws {
+    // The honest sweep total is ~240: two kept 80-byte archives plus the
+    // ~80 bytes the live file holds when the sweep reads it. A ghost left by
+    // the count pass adds 80 more. The cap sits between the two.
+    let handle = try makeHandle(
+      policy: sizePolicy(bytes: 64, keep: 2, totalBytes: 280)
+    )
+    for _ in 0..<10 { write(handle, record) }
+
+    XCTAssertEqual(archiveNames().count, 2)
+    XCTAssertEqual(
+      handle.status().degraded & LogDegradation.prune.rawValue, 0,
+      "the kept set is under the byte cap, so no removal here may ever fail"
+    )
+  }
+
   func testPrunesByTotalBytes() throws {
     // 40-byte records, rotating every 64 bytes, so each archive is ~80 bytes.
     let handle = try makeHandle(policy: sizePolicy(bytes: 64, keep: 100, totalBytes: 200))
@@ -317,6 +451,100 @@ final class LogRotationTests: LogWriterTestCase {
   }
 
   // MARK: - Compression
+
+  /// The CRC anchor that keeps `GzipCheck` honest.
+  ///
+  /// `GzipCheck.inflate` verifies an archive's trailer with `Gzip.crc32` —
+  /// the same implementation that wrote it. That makes the round-trip test a
+  /// consistency check, not a correctness check: a table generated from the
+  /// wrong polynomial would write wrong trailers and verify them green, and
+  /// the first tool to notice would be `gunzip` on a support bundle. Both
+  /// expected values here were computed by no code in this repository:
+  /// 0xCBF4_3926 is the CRC-32 check value published with the algorithm
+  /// (ITU-T V.42; every independent implementation prints it for
+  /// "123456789"), and the sweep's 0xD2A7_D615 comes from zlib.
+  ///
+  /// The sweep message is not arbitrary bytes. A lookup-table CRC consults
+  /// `table[(crc ^ byte) & 0xFF]`, so which entries a message exercises
+  /// depends on the running value — "123456789" touches 8 entries, a plain
+  /// 0x00–0xFF ramp only 165, and a probe that corrupted `table[7]` passed
+  /// both. This message was derived by simulation to visit index 0, then 1,
+  /// … then 255, one per byte (each byte is `target ^ (crc & 0xFF)` for the
+  /// running crc at that point — regenerate it the same way if the table
+  /// ever changes). Entry k is therefore reached while every entry consulted
+  /// before it was one of 0..<k, so the running value is still correct when
+  /// the corrupt entry is hit, and a single flipped bit in ANY table entry
+  /// fails this assertion.
+  ///
+  /// What this does NOT prove: that the trailer is read from the right
+  /// offset, or that DEFLATE payloads are valid — the round-trip test owns
+  /// those. This pins only that `Gzip.crc32` is CRC-32.
+  func testCrc32MatchesTheIndependentKnownAnswerVectors() {
+    XCTAssertEqual(Gzip.crc32(Data("123456789".utf8)), 0xCBF4_3926)
+
+    let everyTableIndexInOrder: [UInt8] = [
+      0xFF, 0xFE, 0x6B, 0xE0, 0xD8, 0x34, 0xAA, 0x32, 0x63, 0xBD, 0xAB, 0xE8,
+      0xBF, 0x53, 0xCD, 0x55, 0x14, 0xAE, 0xA8, 0x5C, 0x16, 0xFA, 0x64, 0xFC,
+      0xAD, 0x73, 0x65, 0x26, 0x71, 0x9D, 0x03, 0x9B, 0xFA, 0x88, 0xAE, 0x34,
+      0x45, 0xA9, 0x37, 0xAF, 0xFE, 0x20, 0x36, 0x75, 0x22, 0xCE, 0x50, 0xC8,
+      0x89, 0x33, 0x35, 0xC1, 0x8B, 0x67, 0xF9, 0x61, 0x30, 0xEE, 0xF8, 0xBB,
+      0xEC, 0x00, 0x9E, 0x06, 0x27, 0xC5, 0xA2, 0xE4, 0xE3, 0x0F, 0x91, 0x09,
+      0x58, 0x86, 0x90, 0xD3, 0x84, 0x68, 0xF6, 0x6E, 0x2F, 0x95, 0x93, 0x67,
+      0x2D, 0xC1, 0x5F, 0xC7, 0x96, 0x48, 0x5E, 0x1D, 0x4A, 0xA6, 0x38, 0xA0,
+      0xC1, 0xB3, 0x95, 0x0F, 0x7E, 0x92, 0x0C, 0x94, 0xC5, 0x1B, 0x0D, 0x4E,
+      0x19, 0xF5, 0x6B, 0xF3, 0xB2, 0x08, 0x0E, 0xFA, 0xB0, 0x5C, 0xC2, 0x5A,
+      0x0B, 0xD5, 0xC3, 0x80, 0xD7, 0x3B, 0xA5, 0x3D, 0x9C, 0x5E, 0xBA, 0x44,
+      0xAE, 0x42, 0xDC, 0x44, 0x15, 0xCB, 0xDD, 0x9E, 0xC9, 0x25, 0xBB, 0x23,
+      0x62, 0xD8, 0xDE, 0x2A, 0x60, 0x8C, 0x12, 0x8A, 0xDB, 0x05, 0x13, 0x50,
+      0x07, 0xEB, 0x75, 0xED, 0x8C, 0xFE, 0xD8, 0x42, 0x33, 0xDF, 0x41, 0xD9,
+      0x88, 0x56, 0x40, 0x03, 0x54, 0xB8, 0x26, 0xBE, 0xFF, 0x45, 0x43, 0xB7,
+      0xFD, 0x11, 0x8F, 0x17, 0x46, 0x98, 0x8E, 0xCD, 0x9A, 0x76, 0xE8, 0x70,
+      0x51, 0xB3, 0xD4, 0x92, 0x95, 0x79, 0xE7, 0x7F, 0x2E, 0xF0, 0xE6, 0xA5,
+      0xF2, 0x1E, 0x80, 0x18, 0x59, 0xE3, 0xE5, 0x11, 0x5B, 0xB7, 0x29, 0xB1,
+      0xE0, 0x3E, 0x28, 0x6B, 0x3C, 0xD0, 0x4E, 0xD6, 0xB7, 0xC5, 0xE3, 0x79,
+      0x08, 0xE4, 0x7A, 0xE2, 0xB3, 0x6D, 0x7B, 0x38, 0x6F, 0x83, 0x1D, 0x85,
+      0xC4, 0x7E, 0x78, 0x8C, 0xC6, 0x2A, 0xB4, 0x2C, 0x7D, 0xA3, 0xB5, 0xF6,
+      0xA1, 0x4D, 0xD3, 0x4B,
+    ]
+    XCTAssertEqual(Gzip.crc32(Data(everyTableIndexInOrder)), 0xD2A7_D615)
+
+    XCTAssertEqual(Gzip.crc32(Data()), 0x0000_0000)
+  }
+
+  /// The writer reads creation dates through `stat`'s `st_birthtimespec`
+  /// instead of `FileManager.attributesOfItem` (S7). That the two are the
+  /// same fact is an assumption about the volume, not about Foundation — so
+  /// it is held here as a differential rather than believed. If this ever
+  /// fails on a supported volume type, the `stat` path goes back to
+  /// `FileManager` for dates, per the remediation plan's N5 gate.
+  ///
+  /// What this does NOT prove: agreement on volumes the suite never runs on
+  /// (FAT-family externals have no birth time at all). It pins the volumes
+  /// tests and devices actually use — APFS, and HFS+ behind the /var symlink.
+  func testBirthTimeAgreesWithFileManagersCreationDate() throws {
+    try FileManager.default.createDirectory(
+      at: logsDirectory, withIntermediateDirectories: true
+    )
+    let url = logsDirectory.appendingPathComponent("birthtime-differential.txt")
+    try Data("x".utf8).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    let foundation = try XCTUnwrap(
+      attributes[.creationDate] as? Date,
+      "a volume with no creation date at all would already have failed S7"
+    )
+
+    var info = stat()
+    XCTAssertEqual(stat(url.path, &info), 0)
+    let birth = TimeInterval(info.st_birthtimespec.tv_sec)
+      + TimeInterval(info.st_birthtimespec.tv_nsec) / 1_000_000_000
+
+    XCTAssertEqual(
+      foundation.timeIntervalSince1970, birth, accuracy: 1e-6,
+      "st_birthtimespec and .creationDate must be the same fact on this volume"
+    )
+  }
 
   func testCompressedArchiveIsAValidGzipOfTheOriginal() throws {
     let handle = try makeHandle(policy: sizePolicy(bytes: 64, compress: true))

@@ -382,6 +382,79 @@ describe('Batcher — backpressure', () => {
     expect(writer.lines()).toContain('held');
   });
 
+  test('the loss notice rides on top of the batch budget, not inside it', () => {
+    // `maxBatchBytes` bounds the RECORDS in a batch, and the consolidated loss
+    // notice is appended after that loop has closed — its bytes never join
+    // `entryBytes`. So the batch handed to the sink is up to the budget in
+    // records PLUS one rendered notice.
+    //
+    // That is deliberate headroom rather than an oversight, and this test is
+    // where it stops being an undocumented one. The alternative — counting the
+    // notice against the budget — would let a large enough notice starve the
+    // records out of their own batch, which is the pipeline's diagnostics
+    // jamming the pipeline.
+    //
+    // What is asserted is the general invariant, which is all `Batcher` can
+    // promise: records within budget, exactly one notice on top. How BIG that
+    // notice may be is the caller's, because `renderNotice` is caller-supplied
+    // and this class only asks for a non-empty string — `FileDestination` is
+    // what caps it at `maxEntryBytes`, giving the 320 KB ceiling that applies
+    // to that integration and not to this option in general.
+    const { batcher, sink } = build({
+      batchBytes: 1_000_000, // nothing pushes until the explicit flush
+      maxBatchBytes: 50, // two 21-byte records fit, and no more
+      maxPendingEntries: 2, // so the third is dropped and owed
+    });
+
+    batcher.add(record(20, 'a'));
+    batcher.add(record(20, 'b'));
+    batcher.add(record(20, 'c')); // refused at the entry cap: 1 entry/21 bytes
+    batcher.flush(1000);
+
+    const sent = sink.appendCalls[0]!.batch;
+    const noticeLine = notice({ entries: 1, bytes: 21 });
+    expect(sent.endsWith(`${noticeLine}\n`)).toBe(true);
+
+    // `+ 1` for the notice's own newline, which is the whole of the
+    // difference between "one notice" and what the payload actually grows by:
+    // record terminators are inside `maxBatchBytes` because `add` counts one
+    // into every measurement, and the notice's is inside nothing.
+    const withoutNotice = sent.length - (noticeLine.length + 1);
+    expect(withoutNotice).toBeLessThanOrEqual(50);
+    expect(sent.length).toBeGreaterThan(50);
+  });
+
+  test('a batch that leaves records behind leaves exactly those behind', () => {
+    // A PARTIAL drain: `maxBatchBytes` binds before the buffer is empty, so
+    // the batch takes a prefix and the rest must still be there afterwards.
+    //
+    // This is the case the whole-buffer fast path in `loseHead` must not
+    // claim. It is cheap to widen that condition by one character while
+    // refactoring, and the result would be a batch of two records removing
+    // three — the third never written, never counted as lost, and absent from
+    // the file with nothing anywhere saying so. Before this test exactly one
+    // case noticed, and only incidentally.
+    const { batcher, sink, writer } = build({
+      batchBytes: 1_000_000, // nothing is pushed until the explicit flush
+      maxBatchBytes: 50, // two 21-byte records fit; three do not
+    });
+
+    batcher.add(record(20, 'a'));
+    batcher.add(record(20, 'b'));
+    batcher.add(record(20, 'c'));
+    expect(batcher.bufferedBytes()).toBe(63);
+
+    batcher.flush(1000);
+
+    expect(sink.appendCalls.map((call) => call.entryCount)).toEqual([2, 1]);
+    expect(writer.lines()).toEqual([
+      record(20, 'a'),
+      record(20, 'b'),
+      record(20, 'c'),
+    ]);
+    expect(batcher.bufferedBytes()).toBe(0);
+  });
+
   test('a batch larger than the sink can ever hold is given up, not held forever', () => {
     const { batcher, writer } = build({ batchBytes: 8 });
     writer.capacityBytes = 4; // nothing this batcher builds will ever fit

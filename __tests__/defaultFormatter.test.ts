@@ -159,4 +159,44 @@ describe('DefaultFormatter — log injection', () => {
       )
     ).toBe(' INFO | 12:15:30.842 | [job-1] [net] msg {a=x}');
   });
+
+  /**
+   * Since 0.4.0 a message with nothing to escape skips the split-map-join
+   * entirely, on the strength of one invariant: the class that decides
+   * "nothing to escape" is a strict superset of the line-break alphabet, so a
+   * message it passes cannot contain a break either.
+   *
+   * The line-break cases above are what enforce that — each of them is an
+   * otherwise-clean message whose only special character is the break — and
+   * the two below are the other side of it: what the shortcut must NOT
+   * swallow, and what it must leave exactly alone.
+   */
+  describe('the clean-message shortcut', () => {
+    test('a tab in the message is escaped, not passed through', () => {
+      // A tab is neither a line break nor visible as one, so it is easy to
+      // leave out of an "is this clean" test. It is C0, so it is escaped.
+      expect(formatter.format(entry({ message: 'a\tb' }))).toBe(
+        ' INFO | 12:15:30.842 | a\\tb'
+      );
+    });
+
+    test('characters that only look special are passed through whole', () => {
+      // None of these is a control character or a line break, so the fast
+      // path is exactly right for them — and a shortcut that scanned for the
+      // wrong class would mangle or split them.
+      for (const [name, text] of [
+        ['no-break space', 'a\u00a0b'],
+        ['zero-width space', 'a\u200bb'],
+        ['byte order mark', 'a\ufeffb'],
+        ['astral', 'a🎉b'],
+        ['lone surrogate', 'a\ud800b'],
+        ['ideographic space', 'a\u3000b'],
+      ] as const) {
+        expect(formatter.format(entry({ message: text }))).toBe(
+          ` INFO | 12:15:30.842 | ${text}`
+        );
+        expect(name).toBeTruthy();
+      }
+    });
+  });
 });

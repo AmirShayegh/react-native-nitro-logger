@@ -88,27 +88,52 @@ export class ScopedLogger {
     this.logger.logMessage(message, threaded);
   }
 
+  /**
+   * The six level methods ask the parent whether the level passes before
+   * doing anything else.
+   *
+   * A dropped scoped call used to allocate TWO objects — the
+   * `ScopedLogOptions` literal here, then the threaded `InternalLogOptions`
+   * in {@link log} — both to reach a decision neither of them influences.
+   * The parent's answer is the same one `logMessage` would reach on arrival,
+   * so what is logged is unchanged.
+   *
+   * **One named behaviour change**, for a subclass rather than a caller:
+   * these methods no longer route a FILTERED call through {@link log}, so a
+   * subclass that overrides `log` no longer sees the calls that were going
+   * to be dropped — whatever it overrode `log` for. Not just observation:
+   * an override that would have re-routed such a call, raised its level or
+   * emitted it anyway cannot, because the call does not arrive. Calls that
+   * pass the level check still go through the override as before, and a
+   * direct call to `log` is untouched. Disclosed in the changeset.
+   */
   verbose(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('verbose', this.subsystem)) return;
     this.log(message, { level: 'verbose', metadata });
   }
 
   debug(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('debug', this.subsystem)) return;
     this.log(message, { level: 'debug', metadata });
   }
 
   info(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('info', this.subsystem)) return;
     this.log(message, { level: 'info', metadata });
   }
 
   warning(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('warning', this.subsystem)) return;
     this.log(message, { level: 'warning', metadata });
   }
 
   error(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('error', this.subsystem)) return;
     this.log(message, { level: 'error', metadata });
   }
 
   todo(message: LazyMessage, metadata?: LogMetadata): void {
+    if (!this.logger.passesLevel('todo', this.subsystem)) return;
     this.log(message, { level: 'todo', metadata });
   }
 

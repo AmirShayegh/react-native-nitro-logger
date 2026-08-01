@@ -81,13 +81,21 @@ export function installErrorHandler(options?: ErrorHandlerOptions): Uninstall {
   const logger = options?.logger ?? Log;
   const chain = options?.chain ?? true;
   const fatalFlushMs = flushBudget(options?.fatalFlushMs);
-  const previous = readPrevious(errorUtils);
+
+  // A fresh evaluation of this module installing over a prior evaluation's
+  // handler is a reload, and the prior handler is a leak: its module can
+  // never uninstall it again. Retire it before chaining, and then resolve
+  // `previous` PAST the retired wrappers rather than onto them — the
+  // snapshot is what releases the logger graph each dead wrapper closed
+  // over, which chaining onto it would retain forever.
+  retireStaleInstances(errorUtils);
+  const previous = liveHandler(readPrevious(errorUtils));
 
   const handler = (error: unknown, isFatal?: boolean): void => {
     // Uninstalled, but still the installed handler: something installed over
     // us and then restored us on its way out. Pass straight through rather
     // than logging to a logger the caller has finished with.
-    if (INSTALLED.get(handler)?.active !== true) {
+    if (INSTALLED().get(handler)?.active !== true) {
       liveHandler(previous)?.(error, isFatal);
       return;
     }
@@ -135,11 +143,15 @@ export function installErrorHandler(options?: ErrorHandlerOptions): Uninstall {
     }
   };
 
-  INSTALLED.set(handler, { active: true, previous });
+  INSTALLED().set(handler, {
+    active: true,
+    previous,
+    instance: MODULE_INSTANCE,
+  });
   errorUtils.setGlobalHandler(handler);
 
   return () => {
-    const state = INSTALLED.get(handler);
+    const state = INSTALLED().get(handler);
     if (!state || !state.active) return;
 
     // Marked dead first, and unconditionally. Uninstalling out of order is
@@ -162,16 +174,96 @@ type GlobalHandler = (error: unknown, isFatal?: boolean) => void;
 interface InstallState {
   active: boolean;
   previous: GlobalHandler | undefined;
+  /**
+   * Which evaluation of this module made the install. Compared by identity in
+   * {@link retireStaleInstances}: a state whose instance is not the current
+   * {@link MODULE_INSTANCE} was installed by an evaluation that no longer
+   * exists, and its uninstall closure is unreachable.
+   */
+  instance: object;
 }
 
 /**
- * The handlers this module installed, and whether each is still live.
+ * This evaluation of the module. A reload that re-evaluates the module makes
+ * a fresh one, which is the entire mechanism by which stale installs are
+ * recognised — see {@link INSTALLED}.
+ */
+let MODULE_INSTANCE: object = {};
+
+/**
+ * @internal Test seam — makes this module a stranger to its own installs, the
+ * way a Fast Refresh re-evaluation does.
+ */
+export function __resetErrorHandlers(): void {
+  MODULE_INSTANCE = {};
+}
+
+/**
+ * Where the registry of installed handlers lives, and why it is global.
  *
  * A WeakMap rather than a property on the function: the entry disappears with
- * the handler, and nothing about our bookkeeping is visible to code that
+ * the handler, and nothing about our bookkeeping is enumerable from code that
  * inspects the global handler.
+ *
+ * The WeakMap itself lives on `globalThis` under a registered symbol rather
+ * than in module scope, because module scope does not survive the one event
+ * this registry exists to get right: a dev-time reload that re-evaluates this
+ * module. `ErrorUtils` keeps the old evaluation's handler; a module-scoped
+ * WeakMap would not keep its state, so the new evaluation could neither
+ * recognise the old handler as ours nor retire it, and every reload would
+ * stack one more handler — N reloads, N sanitizer runs per error, N fatal
+ * flushes, N retained logger graphs. `installRejectionHandler` never had this
+ * problem because its `enable()` replaces the tracker's hook wholesale; this
+ * hook chains, so it has to remember across evaluations what it chained.
+ *
+ * The shape of {@link InstallState} is shared across library versions that
+ * meet in one runtime, so changes to it must be additive.
  */
-const INSTALLED = new WeakMap<GlobalHandler, InstallState>();
+const REGISTRY_KEY = Symbol.for('react-native-nitro-logger.errorHandlers');
+
+function INSTALLED(): WeakMap<GlobalHandler, InstallState> {
+  const host = globalThis as Record<symbol, unknown>;
+  const existing = host[REGISTRY_KEY];
+  if (existing instanceof WeakMap) {
+    return existing as WeakMap<GlobalHandler, InstallState>;
+  }
+  const fresh = new WeakMap<GlobalHandler, InstallState>();
+  host[REGISTRY_KEY] = fresh;
+  return fresh;
+}
+
+/**
+ * Retires still-active handlers that a previous evaluation of this module
+ * installed and can no longer uninstall.
+ *
+ * The termination signal here is module re-evaluation, and it is worth being
+ * precise about how much that proves — less than the `invalidate()` signal
+ * that settled SPIKE-C13. Re-evaluation says the old evaluation's uninstall
+ * closures are unreachable from any code that will ever run again; it cannot
+ * distinguish a reload from two copies of this library deliberately installed
+ * side by side, and it resolves that ambiguity in favour of the reload,
+ * because the reload happens every development day and the dual-copy install
+ * of a native-module library is already broken upstream.
+ *
+ * Only handlers in this registry are ever touched. An unbranded handler — the
+ * RedBox, a crash reporter — is left alone AND ends the walk, since its
+ * `previous` is unknowable to us; a stale wrapper buried under one stays
+ * live, which is the recorded limit of this fix.
+ */
+function retireStaleInstances(errorUtils: ErrorUtilsLike): void {
+  const registry = INSTALLED();
+  const seen = new Set<GlobalHandler>();
+  let candidate = readPrevious(errorUtils);
+  while (candidate && !seen.has(candidate)) {
+    seen.add(candidate);
+    const state = registry.get(candidate);
+    if (!state) return;
+    if (state.active && state.instance !== MODULE_INSTANCE) {
+      state.active = false;
+    }
+    candidate = state.previous;
+  }
+}
 
 /**
  * The first handler in the chain that is still installed.
@@ -183,15 +275,20 @@ const INSTALLED = new WeakMap<GlobalHandler, InstallState>();
 function liveHandler(
   handler: GlobalHandler | undefined
 ): GlobalHandler | undefined {
-  const seen = new Set<GlobalHandler>();
+  // Allocated on the second step, not the first: a handler we did not install
+  // is live by definition, so the overwhelmingly common chain answers at its
+  // head without ever consulting the guard. This is the crash path.
+  let seen: Set<GlobalHandler> | undefined;
   let candidate = handler;
   while (candidate) {
-    const state = INSTALLED.get(candidate);
+    const state = INSTALLED().get(candidate);
     if (!state || state.active) return candidate;
     // A cycle needs two of our own handlers pointing at each other, which
     // takes a restore we did not do — but the crash path is the wrong place
-    // to find out the hard way.
-    if (seen.has(candidate)) return undefined;
+    // to find out the hard way. No test pins it for that same reason, which
+    // is worth saying out loud: the check is insurance, not a live path.
+    if (seen === undefined) seen = new Set();
+    else if (seen.has(candidate)) return undefined;
     seen.add(candidate);
     candidate = state.previous;
   }

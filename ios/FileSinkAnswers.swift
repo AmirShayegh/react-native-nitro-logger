@@ -197,7 +197,7 @@ final class FileSinkAnswers {
     }
   }
 
-  func appendBatch(batch: String, entryCount: Double) -> WireAppendResult {
+  func appendBatch(batch: Data, entryCount: Double) -> WireAppendResult {
     guard let handle = current() else {
       return WireAppendResult(accepted: false, rejectReason: .closed,
                               queuedBytes: 0, lostBytes: 0, lostEntries: 0, degraded: 0)

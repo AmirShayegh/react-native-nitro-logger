@@ -13,10 +13,38 @@ import { clampDeadline, startDeadline } from '../deadline';
  * double, with no native runtime and no filesystem.
  */
 export interface BatchTarget {
-  appendBatch(batch: string, entryCount: number): AppendResult;
+  appendBatch(batch: ArrayBuffer, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
   maintain(deadlineMs: number): SinkStatus;
   flush(deadlineMs: number): FlushOutcome;
+}
+
+/**
+ * One encoder for every batch this module ever sends.
+ *
+ * The sink takes UTF-8 bytes (0.4.0; a string through 0.3.x), and this is
+ * the one place they are made: beside the join, once per batch. A string
+ * handed to Nitro crossed the bridge as UTF-16 — roughly 2× the payload for
+ * JSON Lines — and was then re-encoded to UTF-8 on each platform; bytes
+ * cross once and are written as-is.
+ */
+const BATCH_ENCODER = new TextEncoder();
+
+/**
+ * `text` as UTF-8 in a buffer that spans EXACTLY the encoded bytes.
+ *
+ * Exactness is load-bearing: the sink reserves against `byteLength`, and a
+ * buffer wider than its content would reserve for bytes that never arrive
+ * and write garbage after the ones that did. `encode()` allocates exactly on
+ * every engine shipped today; the slice is the written-down fallback for one
+ * that ever over-allocates, not a path anything is expected to take.
+ */
+function encodeBatch(text: string): ArrayBuffer {
+  const bytes = BATCH_ENCODER.encode(text);
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+  return bytes.slice().buffer;
 }
 
 /**
@@ -73,7 +101,37 @@ export interface BatcherOptions {
   readonly maxPendingBytes?: number;
   /** Sink queue depth at which pushing pauses. Default 256 KB. */
   readonly watermarkBytes?: number;
-  /** Largest single batch. Default 256 KB. */
+  /**
+   * Largest single batch of RECORDS. Default 256 KB.
+   *
+   * **Records only, terminators included.** {@link Batcher.add} counts one
+   * byte of framing into every record it measures, so this budget is the
+   * whole of what the records contribute to the payload.
+   *
+   * A consolidated loss notice is appended after that budget has been spent
+   * and does not count against it — neither its own bytes nor the newline the
+   * join gives it. So the batch handed to the sink is up to `maxBatchBytes`
+   * of records plus one rendered notice plus one framing byte. Deliberate:
+   * charging the notice against the same budget would let a large one starve
+   * the records out of their own batch, which is the pipeline's diagnostics
+   * jamming the pipeline.
+   *
+   * The size of that notice is not this class's to bound. `renderNotice` is
+   * caller-supplied and {@link Batcher.noticeText} asks only that it return a
+   * non-empty string, so a direct consumer of `Batcher` gets exactly the
+   * overshoot its own renderer produces. `FileDestination` — the only
+   * in-package consumer — renders every notice through `boundedNotice` under
+   * its `maxEntryBytes`, which is what makes the ceiling 320 KB at the
+   * defaults THERE. Anyone driving this class directly owns that number.
+   *
+   * What does hold in every case: a sink that cannot take the batch answers
+   * `full`, and the batcher then sheds records until it fits or sets the
+   * notice aside — so an oversized notice cannot wedge the pipeline, it can
+   * only cost a round trip.
+   *
+   * Pinned by 'the loss notice rides on top of the batch budget, not inside
+   * it'.
+   */
   readonly maxBatchBytes?: number;
 }
 
@@ -543,14 +601,23 @@ export class Batcher {
       entryCount += 1;
     }
 
-    const snapshot: Cursor = { ...this.observed };
-    const owed = this.delta();
-    let carriesNotice = false;
-    if (!this.noticeBlocked && (owed.entries > 0 || owed.bytes > 0)) {
-      const notice = this.noticeText(owed);
+    // The snapshot and the loss totals are built only when there is loss to
+    // describe, which in a healthy process is never: two objects per push
+    // existed to be read by a branch that did not run. `owesNotice` answers
+    // the same question from scalars.
+    //
+    // Both are still built BEFORE `appendBatch`, and that is the part with a
+    // test on it — 'a loss discovered during the very append is not
+    // acknowledged by it' stages a drop from inside the sink's own
+    // `appendBatch`, so a snapshot taken any later would acknowledge a loss
+    // the notice does not describe and bury it permanently.
+    let noticeSnapshot: Cursor | undefined;
+    if (!this.noticeBlocked && this.owesNotice()) {
+      const snapshot: Cursor = { ...this.observed };
+      const notice = this.noticeText(this.delta());
       if (notice !== undefined) {
         lines.push(notice);
-        carriesNotice = true;
+        noticeSnapshot = snapshot;
       } else if (entryCount === 0) {
         // A notice that will not render, and nothing else to send. Trying
         // again in a hundred milliseconds will produce the same nothing, so
@@ -561,6 +628,11 @@ export class Batcher {
     }
     if (lines.length === 0) return 'empty';
 
+    // Derived from the snapshot rather than tracked beside it: the snapshot
+    // exists exactly when a notice was attached, so one of them cannot go
+    // stale while the other is right.
+    const carriesNotice = noticeSnapshot !== undefined;
+
     // Whether this batch is carrying the notice and nothing else, which is
     // what makes a rejection unrecoverable by retrying: there is no record to
     // give up to make it smaller, and no smaller notice to send.
@@ -568,11 +640,24 @@ export class Batcher {
 
     // The notice goes after the records it does not describe, so a reader
     // meets the surviving entries first and the gap where the others were.
-    const batch = `${lines.join('\n')}\n`;
+    //
+    // Counted BEFORE the sentinel, and that ordering is the whole risk in
+    // this shape: this number is what the sink is told it is receiving, and
+    // what a rejected batch is counted as lost in. An empty sentinel is not a
+    // record. Pinned by 'sends the records it batched, and says how many',
+    // 'holds records until the byte threshold, then sends one batch' and 'a
+    // failed batch is lost whole — the batch is the loss unit'.
+    const batchEntryCount = lines.length;
+    // The record terminator as a final empty element, so one `join` produces
+    // the payload. `${lines.join('\n')}\n` built the joined string and then a
+    // second one a byte longer, which on the catch-up path is a quarter of a
+    // megabyte materialised twice.
+    lines.push('');
+    const batch = lines.join('\n');
 
     let result: AppendResult;
     try {
-      result = this.target.appendBatch(batch, lines.length);
+      result = this.target.appendBatch(encodeBatch(batch), batchEntryCount);
     } catch {
       // A throwing sink is a failing sink. The batch is gone either way.
       this.loseHead(entryCount, entryBytes);
@@ -584,7 +669,7 @@ export class Batcher {
 
     if (result.accepted) {
       this.loseHead(entryCount, 0, false);
-      if (carriesNotice) this.acked = snapshot;
+      if (noticeSnapshot !== undefined) this.acked = noticeSnapshot;
       if (toCount(result.queuedBytes) >= this.watermarkBytes)
         this.paused = true;
       return 'sent';
@@ -634,9 +719,25 @@ export class Batcher {
    */
   private loseHead(count: number, bytes: number, lost = true): void {
     if (count === 0) return;
-    const removed = this.pending.splice(0, count);
-    for (const item of removed) this.pendingBytes -= item.bytes;
-    if (this.pendingBytes < 0) this.pendingBytes = 0;
+    if (count === this.pending.length) {
+      // The whole buffer, which is what a batch normally takes: `batchBytes`
+      // is 4 KB and `maxBatchBytes` 256 KB, so a push has to be starved of
+      // room before it leaves anything behind. `splice` would allocate an
+      // N-element array of records nobody reads, purely to subtract byte
+      // counts that must sum to `pendingBytes` — an empty buffer holds zero
+      // bytes, and it can be said rather than computed.
+      //
+      // Assigning 0 also settles the drift the clamp below exists for,
+      // instead of leaving a residue on an empty buffer. The 5-seed
+      // conservation fuzz asserts `bufferedBytes() === 0` exactly, which is
+      // what stops that from being a claim.
+      this.pending.length = 0;
+      this.pendingBytes = 0;
+    } else {
+      const removed = this.pending.splice(0, count);
+      for (const item of removed) this.pendingBytes -= item.bytes;
+      if (this.pendingBytes < 0) this.pendingBytes = 0;
+    }
     if (lost) {
       this.observed.localEntries += count;
       this.observed.localBytes += bytes;
@@ -700,36 +801,48 @@ export class Batcher {
     return typeof text === 'string' && text.length > 0 ? text : undefined;
   }
 
+  /**
+   * Loss seen but not yet acknowledged, as two numbers.
+   *
+   * Split out of `delta` because every caller but one only wants to compare
+   * them against zero, and building a `LossCounts` to do that allocated an
+   * object per push in the steady state where the answer is "nothing owed".
+   * `delta` remains the single expression of the arithmetic; these are its
+   * two halves under their own names.
+   */
+  private owedEntries(): number {
+    return Math.max(
+      0,
+      this.observed.sinkEntries -
+        this.acked.sinkEntries +
+        (this.observed.localEntries - this.acked.localEntries)
+    );
+  }
+
+  private owedBytes(): number {
+    return Math.max(
+      0,
+      this.observed.sinkBytes -
+        this.acked.sinkBytes +
+        (this.observed.localBytes - this.acked.localBytes)
+    );
+  }
+
   private delta(): LossCounts {
-    return {
-      entries: Math.max(
-        0,
-        this.observed.sinkEntries -
-          this.acked.sinkEntries +
-          (this.observed.localEntries - this.acked.localEntries)
-      ),
-      bytes: Math.max(
-        0,
-        this.observed.sinkBytes -
-          this.acked.sinkBytes +
-          (this.observed.localBytes - this.acked.localBytes)
-      ),
-    };
+    return { entries: this.owedEntries(), bytes: this.owedBytes() };
   }
 
   private owesNotice(): boolean {
-    const owed = this.delta();
-    return owed.entries > 0 || owed.bytes > 0;
+    return this.owedEntries() > 0 || this.owedBytes() > 0;
   }
 
   /** Where the drain has got to: records still buffered, loss still owed. */
   private position(): Position {
-    const owed = this.delta();
     return {
       entries: this.pending.length,
       bytes: this.pendingBytes,
-      owedEntries: owed.entries,
-      owedBytes: owed.bytes,
+      owedEntries: this.owedEntries(),
+      owedBytes: this.owedBytes(),
     };
   }
 

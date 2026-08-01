@@ -170,8 +170,16 @@ export interface FileSink extends HybridObject<{
    * enqueue against the hard shared payload cap; accepted bytes stay
    * reserved until terminal write completion. entryCount travels with the
    * queued item for exact loss accounting.
+   *
+   * `batch` is UTF-8 bytes, encoded ONCE in TypeScript (0.4.0; it was a
+   * string through 0.3.x). A string here crossed the bridge as UTF-16 —
+   * roughly 2× the payload for JSON Lines — and was then re-encoded to UTF-8
+   * on each platform; bytes cross once and are written as-is. The sink
+   * reserves against `byteLength`, so the buffer must span exactly the
+   * encoded batch. NOT OTA-safe against a 0.3.x binary: the registered
+   * native signature disagrees, so 0.4.0 JS requires a 0.4.0 native build.
    */
-  appendBatch(batch: string, entryCount: number): AppendResult;
+  appendBatch(batch: ArrayBuffer, entryCount: number): AppendResult;
 
   /** Non-enqueuing health probe; safe to poll while the writer is stalled. */
   getStatus(): SinkStatus;

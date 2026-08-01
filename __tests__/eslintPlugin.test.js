@@ -646,6 +646,18 @@ describe('no-dynamic-message', () => {
       // `logger`/`log`/`Log` took the call site outside all four rules — on
       // the strength of its spelling, with the object literal that settles
       // the question two lines up.
+      // Two sources of one `Object.assign` installing the same name. Which
+      // one wins is unknowable, so both are candidates and the call is a
+      // finding rather than a guess.
+      //
+      // Also the only fixture where a single write site contributes more than
+      // one candidate, which is why it exists: the I-B1 rewrite made the
+      // candidates of a write site a list, and without a case like this
+      // nothing distinguishes taking the list from taking its first element.
+      {
+        code: `${IMPORT_LOG} const handlers = {}; Object.assign(handlers, { emit: Log.info }, { emit: Log.warn }); handlers.emit(patientName);`,
+        errors: [{ messageId: 'unanalyzable' }],
+      },
       {
         code: `${IMPORT_LOG} const holder = { audit: Log }; holder.audit.info(patientName);`,
         errors: [{ messageId: 'dynamic' }],
@@ -1826,6 +1838,7 @@ describe('plugin configs', () => {
       'metadataKeyCatalog', // key names, checked at runtime instead
       'minimumLevel', // level only
       'newCorrelationId', // generates, never accepts
+      'passesLevel', // a level and a subsystem name; answers, emits nothing
       'privacyDefault', // mode only
       'redactAllMetadata', // no arguments
       'removeDestination', // label only

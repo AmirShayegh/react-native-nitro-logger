@@ -35,6 +35,7 @@ down to be useful ends up not being used at the layers that need it most.
 | `debug(…)` · `info(…)` · `warning(…)` · `error(…)` · `todo(…)` | `void` | Same shape. |
 | `log(message, options?)` | `void` | The general form; takes `LogOptions` instead of positional arguments. |
 | `logMessage(message, options?)` | `void` | What `log` delegates to. Covered by the ESLint rules for the same reason `log` is. |
+| `passesLevel(level, subsystem?)` | `boolean` | Does this level clear the effective minimum for the given subsystem? The level threshold and nothing else — `true` does not promise delivery, since destinations can be absent, disabled, or have their own floor. The level methods and `ScopedLogger` ask it before building an options object a filtered call would discard. Public because `ScopedLogger` needs it; you rarely do. |
 | `minimumLevel(level)` | `this` | Global floor. |
 | `subsystem(name, level)` | `this` | Per-subsystem floor, which overrides the global one. |
 | `resetSubsystem(name)` | `this` | Drop a per-subsystem floor. |
@@ -574,6 +575,44 @@ newlines, indented as continuations, because stack traces go through it —
 
 <!-- api: DefaultFormatter, LogFormatter -->
 
+### `PlatformConsoleFormatter`
+
+The same layout as `DefaultFormatter` with the level and timestamp columns
+left off — `[correlation] [subsystem] message {key=value}` — for
+`NativeConsoleDestination`, whose sinks stamp their own severity and time.
+**Recommended there, and not the default:** it changes what you see in
+Console.app and Xcode, which a package upgrade should not do by itself.
+
+```ts
+import {
+  createNativeConsoleDestination,
+  PlatformConsoleFormatter,
+} from 'react-native-nitro-logger';
+
+createNativeConsoleDestination({ formatter: new PlatformConsoleFormatter() });
+```
+
+The ` INFO | 12:15:30.842 | ` those columns cost is 23 characters, and it is
+paid per line rather than once per entry — every continuation line carries the
+same 23 columns blanked out, against four characters here. A thirty-frame stack
+trace spends 713 characters on framing under the default layout and 120 under
+this one. os_log and logcat both chunk the rendered entry by size, so that is
+593 bytes of budget back — most of an os_log chunk. That can decide whether an
+entry crosses a chunk boundary rather than always deciding it: this trace
+splits in two either way. It tells for entries near a boundary, and near the
+eight-chunk ceiling both writers enforce, past which the tail arrives as a byte
+count instead of as content.
+
+Structured fields are escaped exactly as `DefaultFormatter` escapes them. The
+continuation marker is weaker: with no columns to blank, a message that begins
+`  | ` renders a first line that looks like a continuation. What that could
+impersonate is another line of your app's console output, never a record —
+the durable copy is `FileDestination`'s, and `JsonLinesFormatter` is what makes
+it unforgeable. Keep the default if you want the stronger guarantee in the
+console too.
+
+<!-- api: PlatformConsoleFormatter -->
+
 ---
 
 ## Integrations
@@ -1029,6 +1068,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NativeConsoleSink`
 - `NativeConsoleSinkLike`
 - `NON_ERROR_THROWN`
+- `PlatformConsoleFormatter`
 - `priv`
 - `PrivacyDefault`
 - `PRIVATE_PLACEHOLDER`

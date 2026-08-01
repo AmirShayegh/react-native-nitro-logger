@@ -1,0 +1,155 @@
+# bench — the performance harness
+
+Four instruments, one discipline: **numbers compare two commits on one
+machine in one session, and nothing gates on them.** CI runs executes-only
+passes; a bench case that stops constructing is a failure, a slow number
+never is — shared runners lie about time.
+
+## The JS bench (Node/V8)
+
+```sh
+corepack yarn prepare          # the bench measures lib/commonjs, the shipped artifact
+node bench/run.js              # every case, one child process each, best-of-7
+node bench/run.js --filter utf8
+node bench/run.js --json before.json
+```
+
+Cases live in `bench/cases/*.js`: the per-call hot path (`hotpath`), the
+formatters (`format`), and the batcher plus `utf8Length` corpora
+(`batcher`). One child process per case — a shared process lets one case's
+JIT tiering and heap shape leak into the next case's numbers. The runner
+refuses to run when any part of `lib/commonjs` predates the newest `src`
+edit, because measuring a stale build under a fresh commit message is the
+harness's one silent-lie mode.
+
+### The control floor
+
+`bench/cases/control.js` measures an empty op — the harness's own cost —
+and every full run checks that every other case lands clearly above it
+(`bench/floor.js`, shared with the Hermes harvest). An op whose work an
+engine eliminated compiles to the same thing as an empty op, so it
+collapses onto the control; this is how the harness demonstrates, per run
+and per engine, that it measured real work instead of asserting it. The
+`--filter` flag never removes the control, and `--quick` skips the check —
+its 2 ms batches are too coarse for a ratio, and CI, which runs `--quick`,
+gates on nothing numeric.
+
+## The Hermes mirror
+
+V8 numbers do not transfer: Hermes has its own regex engine, weaker escape
+analysis, and its own `toISOString`. The SAME case files and the SAME
+measurement core (`bench/measure.js`) run on-device through the example app —
+`example/src/BenchHarness.tsx` — and `scripts/bench-hermes-android.sh`
+automates the Android run end to end, harvesting one JSON line per case from
+logcat. Any finding gated on Hermes behaviour (B1, B6 in the 0.4.0 audit) is
+decided by that run, never by the Node one.
+
+### What the first two-engine run said
+
+The 0.4.0 baseline (this laptop's V8 against one emulator's Hermes — one
+machine, one device, indicative and not authoritative) found the gap
+between the engines is not uniform, and the pattern is the useful part:
+
+| shape                                | Hermes ÷ V8 |
+| ------------------------------------ | ----------- |
+| `utf8Length`, batcher bookkeeping    | 10–50×      |
+| logger hot path                      | 2–40×       |
+| formatters (`JSON.stringify`-heavy)  | 1–5×        |
+
+Hermes charges dearly for **interpreted JavaScript** — character loops,
+per-call bookkeeping, small allocations — and comparatively little for
+work that lands in a **built-in** (`JSON.stringify`, `toISOString`). The
+extreme is `utf8Length` on a 163-byte ASCII record: 406 ns on V8, 4.5 µs
+on Hermes, which is ~94% of a batcher `add` there against ~85% on V8.
+
+So the ranking of an optimisation can differ by engine, and the rule of
+thumb is: **removing a hand-written loop is worth more on the engine that
+ships than the V8 numbers suggest; avoiding a built-in call is worth
+less.** Any item whose whole case rests on that distinction (B1, B6) is
+adopted or declined on a Hermes measurement, never a V8 one.
+
+### What the B1/B6 gate decided
+
+Three alternating rounds, medians, one arm64 emulator. `control.empty-loop`
+moved −0.3% across the whole run, and `utf8.ascii-16b` — which is below the
+search gate and therefore byte-identical code on both sides — moved +1.9%,
+which is the noise floor these numbers are read against.
+
+| case                   | V8     | Hermes |
+| ---------------------- | ------ | ------ |
+| `utf8.ascii-3.3kb`     | −74.1% | −79.8% |
+| `utf8.stack-trace-2kb` | −73.2% | −79.2% |
+| `utf8.ascii-163b`      | −48.7% | −55.4% |
+| `utf8.cjk-300b`        | −1.9%  | +1.3%  |
+| `utf8.emoji-mixed-1kb` | −2.1%  | +2.0%  |
+
+**B1 adopted.** The rule of thumb held and then some: handing the ASCII
+scan to the engine is worth more on Hermes than on V8 in every corpus that
+has an ASCII run, and the two shapes it could have hurt sit inside the
+noise floor.
+
+**B6 declined.** Its whole case was that Hermes' weaker escape analysis
+makes a `for...of` iterator cost something an indexed loop does not, and
+the measurement does not show that. The only case that isolates it —
+`batcher.add.steady-163b-precounted`, which passes a precounted length so
+`utf8Length` never runs — read **+4.7%**, on the wrong side of a 2% floor.
+Every other batcher case moved with B1 rather than with B6:
+`batcher.flush.catchup-256kb` looks like a −55.3% win for the push loop
+until you notice its `op` calls `add()` without a precount, so it is
+measuring `utf8Length` some 1600 times per iteration.
+
+Worth stating plainly: no case isolates the push loop cleanly, and one
+that runs it once per 25 adds is a weak instrument. The decision is
+"declined for want of evidence", not "measured to be harmful" — but a
+rewrite adopted on a hypothesis the harness cannot confirm is how a file
+accumulates changes nobody can justify later.
+
+## The native harnesses
+
+- **Swift**: `LogPerfTests.swift` in `swift-tests/`, `measure {}` around the
+  writer burst shapes. Runs with `swift test` like every other suite; XCTest
+  prints the timings, asserts nothing about them.
+- **Kotlin**: allocation-count tests in the Android unit suite, measuring
+  allocated bytes per burst on the JVM via `ThreadMXBean` (the
+  `Debug.startAllocCounting` shape needs a device; the JVM counter gives the
+  same relative signal per-commit on the machine where the work happens, and
+  the trade is recorded in the test file).
+
+## Measuring on a busy machine
+
+The runner prints the one-minute load average when it exceeds one job per
+core, and records it in `--json` output either way. Heed it: during 0.4.0 a
+stuck jest worker from an earlier session held a core for a day, and the
+same case read 122, 130 and 164 ns on three consecutive runs — a 34% spread
+around effects worth single digits. A before/after pair taken across that
+window said a change with no plausible connection to the case had tripled
+its cost.
+
+When the machine cannot be quietened, **alternate the two builds** rather
+than running all of one side then all of the other. Drift then has to be
+present for every repetition of one side and absent from every repetition
+of the other to survive, instead of merely happening to fall between the
+two halves of a single pair.
+
+**Take the median per side, and print the spread.** Earlier this file said
+to take the minimum, on the usual reasoning that contention only ever makes
+a number worse. That is not true here. Measuring B4 across four
+interleaved rounds, one reading of `batcher.add.saturated-drop` came back
+at 130 ns while the other seven readings of the same code ranged 394–410;
+the minimum-per-side rule promoted that single glitch to the reported
+value and produced a confident **−67% on a case the change cannot reach**.
+The same case run six times on its own reads 397–406, so it is not
+bimodal — one reading was simply wrong, and low.
+
+A median needs a majority of the readings to be wrong before it moves, and
+a printed spread makes an outlier something the reader can see instead of
+something the statistic absorbs. If the two spreads overlap, there is no
+result, whatever the medians say.
+
+## What this proves, and does not
+
+It proves a change moved a number on the engine it ran on, and that every
+case still executes. It does not prove device performance, does not compare
+across machines, and does not stand in for the golden suite, the parity
+locks, or any correctness gate — an optimisation whose guard test fails is
+wrong no matter what these numbers say.

@@ -3,7 +3,7 @@ PODS:
   - hermes-engine (250829098.0.10):
     - hermes-engine/Pre-built (= 250829098.0.10)
   - hermes-engine/Pre-built (250829098.0.10)
-  - NitroLogger (0.1.0):
+  - NitroLogger (0.3.0):
     - hermes-engine
     - NitroModules
     - RCTRequired
@@ -2030,7 +2030,7 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   FBLazyVector: c00c20551d40126351a6783c47ce75f5b374851b
   hermes-engine: 8af538fd7832cab80b2d3480d681a4d0be5ee143
-  NitroLogger: 2786ed2cf10bdf5d9f93d5436dc189f9dcb03f3d
+  NitroLogger: 23920347d4bc102ac7d62d41356de7af6152f8f8
   NitroModules: acb39359757028fe18ff08f4357e419a2ac3c88a
   RCTDeprecation: 3bb167081b134461cfeb875ff7ae1945f8635257
   RCTRequired: 74839f55d5058a133a0bc4569b0afec750957f64

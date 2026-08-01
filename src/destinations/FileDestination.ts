@@ -23,7 +23,7 @@ import { utf8Length } from '../utf8';
 export interface FileSinkLike {
   readonly defaultLogDirectory: string;
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
-  appendBatch(batch: string, entryCount: number): AppendResult;
+  appendBatch(batch: ArrayBuffer, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
   /**
    * Run rotation and the retention sweep now, bounded by `deadlineMs`, and
@@ -81,6 +81,26 @@ export interface FileDestinationOptions {
   /**
    * Largest single rendered record, in UTF-8 bytes. Default 64 KB — roomy for
    * a stack trace, far under the sink's payload cap so a batch always fits.
+   *
+   * It is also what bounds the batcher's OVERSHOOT of `maxBatchBytes` **for
+   * this destination**. A consolidated loss notice goes through the same
+   * `boundedNotice` limit as any record and is then appended to a batch whose
+   * record budget is already spent, so the largest batch this destination
+   * hands its sink is `maxBatchBytes + maxEntryBytes + 1` — 320 KB and one
+   * byte at both defaults, not 256 KB. Raising this raises that, which is why
+   * the two numbers are worth reading together.
+   *
+   * The stray byte is the notice's own newline, and it is not an accident of
+   * arithmetic. This limit measures a RENDERED RECORD, which is why
+   * {@link Rendered} says it excludes the terminator: framing is the
+   * batcher's, so a record's newline is counted in `maxBatchBytes` (see
+   * `Batcher.add`, which adds one to every measurement) while the notice's is
+   * counted nowhere, because the notice is appended after the budget closes.
+   *
+   * The bound comes from here, not from `Batcher`: that class takes
+   * `renderNotice` from its caller and does not police the result. See
+   * `maxBatchBytes` in `Batcher.ts` for why the notice is not charged against
+   * the record budget in the first place.
    */
   readonly maxEntryBytes?: number;
   readonly batchBytes?: number;
@@ -180,10 +200,17 @@ const OVERSIZE_MESSAGE = 'a log entry was too large to record';
 /**
  * A record and the size of *that* record.
  *
- * Not exported: this is how rendering hands its own measurement forward so the
- * batcher does not repeat it, and the pair exists only because the two things
- * must not be separated. `bytes` always describes `record` — never an earlier
- * string that rendering looked at and rejected on the way to it.
+ * Not exported. `bytes` always describes `record` — never an earlier string
+ * that rendering looked at and rejected on the way to it.
+ *
+ * Only {@link FileDestination.boundedNotice} returns this now, and only
+ * because it has two callers wanting different halves: the oversize path
+ * needs both to buffer the notice, and `renderLossNotice` needs the string
+ * alone, since the batcher's public `renderNotice` contract is `string |
+ * undefined` and a loss notice goes straight into an outgoing batch where no
+ * byte count is ever wanted. The per-record path no longer allocates one —
+ * {@link FileDestination.bufferRecord} keeps the record and its count
+ * together by buffering both itself.
  *
  * Excludes the newline the batcher frames records with, which is the batcher's
  * to add and therefore the batcher's to count.
@@ -316,12 +343,7 @@ export class FileDestination implements LogDestination {
       this.batcher.noteLoss(1, 0);
       return;
     }
-    const rendered = this.renderRecord(entry);
-    if (rendered === undefined) return;
-    // The byte count travels with the record. Enforcing `maxEntryBytes` means
-    // this side has already measured whatever it is handing over, and letting
-    // the batcher measure it again is a second full pass over every record.
-    this.batcher.add(rendered.record, rendered.bytes);
+    this.bufferRecord(entry);
   }
 
   /**
@@ -727,25 +749,29 @@ export class FileDestination implements LogDestination {
   // ── Internals ───────────────────────────────────────────────────────────
 
   /**
-   * Render one entry, or account for why it could not be rendered.
+   * Render one entry into the pending buffer, or account for why it could not
+   * be. An entry ends up in the file or in the counters, never in neither.
    *
-   * Returns undefined when nothing writable came out; the loss is recorded
-   * before returning, so an entry is either in the file or in the counters
-   * and never in neither.
+   * Every byte count handed to `add` is the count of **the string being handed
+   * over**, never of one measured on the way to it. That is the whole reason
+   * this buffers rather than returning a record for the caller to buffer: on
+   * the oversize path what goes out is a notice, a different and much shorter
+   * string than the entry whose size put it there, and passing the original
+   * number along would inflate every pending-byte total in the pipeline. The
+   * pairing used to be a `Rendered` object per record, returned so the caller
+   * could not separate the two; keeping the `add` here makes them inseparable
+   * without allocating anything to say so.
    *
-   * The byte count comes back **with** the record, and it is the count of the
-   * record being returned — never of the one that was measured on the way to
-   * it. That distinction is the whole reason this returns a pair rather than
-   * letting the caller reuse `bytes`: on the oversize path the returned string
-   * is a notice, a different and much shorter string than the entry whose size
-   * put it there, and handing the batcher the original number would inflate
-   * every pending-byte total in the pipeline.
+   * The counts are passed rather than left to the batcher deliberately:
+   * enforcing `maxEntryBytes` means this side has already measured what it is
+   * handing over, and letting the batcher measure it again is a second full
+   * pass over every record.
    */
-  private renderRecord(entry: LogEntry): Rendered | undefined {
+  private bufferRecord(entry: LogEntry): void {
     const record = this.formatOrUndefined(entry);
     if (record === undefined) {
       this.batcher.noteLoss(1, 0);
-      return undefined;
+      return;
     }
 
     // The ORIGINAL size, held onto for the rest of this method. What gets
@@ -753,7 +779,10 @@ export class FileDestination implements LogDestination {
     // counters and the notice have to carry — not the size of whatever
     // undersized floor the formatter came back with instead.
     const bytes = utf8Length(record);
-    if (bytes <= this.maxEntryBytes) return { record, bytes };
+    if (bytes <= this.maxEntryBytes) {
+      this.batcher.add(record, bytes);
+      return;
+    }
 
     // Structural shedding first: a formatter that knows its own shape can
     // drop whole fields and truncate one at code-point boundaries, and what
@@ -763,7 +792,8 @@ export class FileDestination implements LogDestination {
       if (shorter !== undefined) {
         const shorterBytes = utf8Length(shorter);
         if (shorterBytes <= this.maxEntryBytes) {
-          return { record: shorter, bytes: shorterBytes };
+          this.batcher.add(shorter, shorterBytes);
+          return;
         }
       }
       // Still over: a record has a floor below which it identifies nothing.
@@ -771,10 +801,13 @@ export class FileDestination implements LogDestination {
 
     // Nothing renderable fits, so the entry is replaced whole by a notice in
     // the same format. Never sliced: a fragment of a record is not a record.
+    // The loss is noted BEFORE the notice is offered, so an unrenderable
+    // notice still leaves the entry counted.
     this.batcher.noteLoss(1, bytes);
-    return this.boundedNotice(
+    const notice = this.boundedNotice(
       noticeEntry(entry.timestamp, OVERSIZE_MESSAGE, { droppedBytes: bytes })
     );
+    if (notice !== undefined) this.batcher.add(notice.record, notice.bytes);
   }
 
   private renderLossNotice(lost: LossCounts): string | undefined {

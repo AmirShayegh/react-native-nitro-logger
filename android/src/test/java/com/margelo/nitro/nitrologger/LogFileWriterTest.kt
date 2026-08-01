@@ -96,7 +96,7 @@ class LogFileWriterTest {
     platform: PlatformIo = PlatformIo.Jvm,
     rawWrite: LogFileWriter.RawWrite? = null,
     compressor: LogFileWriter.Compressor? = null,
-    monotonic: (() -> Long)? = null
+    monotonic: LogFileWriter.Clock? = null
   ): LogFileWriter {
     val file = File(directory, name)
     return LogFileWriter.open(
@@ -108,7 +108,7 @@ class LogFileWriterTest {
       rawWrite = rawWrite,
       compressor = compressor,
       clock = { now.get() },
-      monotonic = monotonic ?: { steady.get() }
+      monotonic = monotonic ?: LogFileWriter.Clock { steady.get() }
     ).also { opened.add(it) }
   }
 
@@ -274,6 +274,62 @@ class LogFileWriterTest {
     assertTrue("expected several short writes, saw $chunks", chunks > 1)
   }
 
+  // The tracked counter behind `trackedFileSizeForTesting` is what the size
+  // trigger in `rotateIfNeeded` reads, and it is the append path's fallback
+  // answer for "where does a failed batch roll back to" when `channel.size()`
+  // itself throws. A counter that drifts from the true size rotates at the
+  // wrong moment at best and truncates somebody else's bytes at worst — so it
+  // is pinned to the file at every moment its value changes hands.
+  @Test
+  fun `the tracked size agrees with the file through open, append and rotation`() {
+    // Opened onto existing bytes, the counter must start at the true size. A
+    // writer that assumed zero would place its first record boundary inside
+    // the records that were already there.
+    File(directory, "app.log").writeText("existing\n")
+    val w = writer(policy = LogRotationPolicy.of(maxFileSizeBytes = 32.0))
+    assertEquals(9L, w.trackedFileSizeForTesting)
+
+    w.write("0123456789\n")
+    w.flush(1, 1000.0)
+    assertEquals(20L, w.trackedFileSizeForTesting)
+
+    // Two more pushes it past 32: rotation archives the file, reopens a fresh
+    // one, and the counter must restart from the fresh file's true size.
+    repeat(2) { w.write("0123456789\n") }
+    w.flush(1, 1000.0)
+    w.settleForTesting()
+
+    assertEquals(0L, w.trackedFileSizeForTesting)
+    assertEquals(File(directory, "app.log").length(), w.trackedFileSizeForTesting)
+  }
+
+  @Test
+  fun `the tracked size returns to the record boundary after a rolled-back write`() {
+    var failNext = false
+    val w = writer(rawWrite = { stream, data, offset, length ->
+      if (failNext) {
+        stream.write(data, offset, length / 2)
+        throw java.io.IOException("injected")
+      }
+      stream.write(data, offset, length)
+      length
+    })
+
+    w.write("first\n")
+    w.flush(1, 1000.0)
+    assertEquals(6L, w.trackedFileSizeForTesting)
+
+    failNext = true
+    w.write("second-and-then-some\n")
+    w.flush(1, 1000.0)
+
+    // Not `6 + length/2`, and not the optimistic `6 + length` a writer that
+    // counts what it tried to write would report: the rollback truncated to
+    // the record boundary, and the counter must say so.
+    assertEquals(6L, w.trackedFileSizeForTesting)
+    assertEquals(6L, File(directory, "app.log").length())
+  }
+
   // MARK: - Crash-tail recovery
 
   @Test
@@ -367,6 +423,51 @@ class LogFileWriterTest {
     // on it binds, and every sample after that is the cap exactly.
     assertEquals(listOf(1, 2), counts.take(2))
     assertEquals(List(8) { 2 }, counts.drop(2))
+  }
+
+  @Test
+  fun `the byte cap sheds the oldest archives first`() {
+    val w = writer(
+      policy = LogRotationPolicy.of(
+        maxFileSizeBytes = 16.0,
+        maxArchivedFilesCount = 50.0,
+        maxTotalLogBytes = 60.0
+      )
+    )
+
+    // Each record is 17 bytes; each write past the first rotates the previous
+    // one into a 17-byte archive. The sweep runs before the reopen, so it
+    // charges the just-archived file's 17 tracked bytes plus the archives:
+    // 17 + 2×17 = 51 fits under 60, a third archive (68) does not — the cap
+    // admits exactly two archives, and they must be the two NEWEST.
+    // The clock moves BEFORE each write, so the stamp a rotation takes is
+    // pinned no matter when the executor gets to the append — advancing after
+    // the enqueue would race the increment against the writer thread.
+    val start = now.get()
+    repeat(6) {
+      now.addAndGet(1_000)
+      w.write("0123456789012345\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+    }
+
+    // The expectation is derived from the clock, not sampled from the
+    // directory: a sweep that sheds the NEWEST archive deletes it inside the
+    // very rotation that created it, so a sampling loop only ever sees
+    // survivors and is satisfied by exactly the bug this exists to catch.
+    // Write r happens with the clock at start + r seconds and rotation runs
+    // on writes 2 through 6, so the survivors must carry the stamps of
+    // seconds 5 and 6.
+    val stampFormat = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US)
+      .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+    val expected = listOf(5L, 6L)
+      .map { stampFormat.format(java.util.Date(start + it * 1000)) }
+      .sorted()
+    val survivorStamps = archives()
+      .map { it.removePrefix("app.log.").substringBefore("_") }
+      .sorted()
+    assertEquals("the byte cap must keep the newest two archives",
+                 expected, survivorStamps)
   }
 
   @Test

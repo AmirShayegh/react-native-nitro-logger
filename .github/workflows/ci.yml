@@ -72,7 +72,7 @@ jobs:
       - name: Typecheck the min-rn harness apps
         run: yarn check-harness
 
-      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 19 shell
+      # `eslint` above covers .js/.ts/.tsx and nothing else, so the 20 shell
       # scripts that hold most of this repository's gates are unparsed until
       # something runs them — and several only run inside the emulator and
       # simulator jobs, so an unterminated heredoc or a stray `fi` costs
@@ -82,7 +82,7 @@ jobs:
         run: |
           count=0
           for f in scripts/*.sh; do bash -n "$f"; count=$((count + 1)); done
-          if [ "$count" -lt 19 ]; then
+          if [ "$count" -lt 20 ]; then
             echo "FAIL: parsed only $count scripts; the glob is not matching"
             exit 1
           fi
@@ -346,6 +346,14 @@ jobs:
       # job below prove nothing.
       - name: Inventory the dev-only branches
         run: ./scripts/check-dev-branches.sh
+
+      # Executes-only, never a gate on numbers: a shared runner's timings are
+      # noise, but a bench case that stops constructing — an export it names
+      # renamed, an option shape changed — is a real failure that would
+      # otherwise surface mid-measurement on somebody's laptop. This job is
+      # where `lib/commonjs` was just built, which is what the bench requires.
+      - name: Check every bench case still executes
+        run: node bench/run.js --quick
 
   # Proves the reveal branches are not in shipped JavaScript.
   #

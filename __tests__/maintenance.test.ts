@@ -58,11 +58,23 @@ function wired(currentState: string | undefined = 'active') {
   };
 }
 
-beforeEach(() => {
+/*
+ * Installed once for the file, not per test, and that is load-bearing.
+ *
+ * `scheduleMaintenance` reads the monotonic clock, and `resolveClock`
+ * memoises the `performance.now` it first binds. Re-installing fake timers
+ * between tests swaps in a NEW fake `performance` each time, leaving that
+ * binding pointed at a clock nothing advances any more — so elapsed time
+ * would read as zero and every catch-up guard below would pass vacuously.
+ *
+ * Leaked intervals from earlier tests are harmless: each test sweeps its own
+ * destination, so an old interval reports to an object nobody asserts on.
+ */
+beforeAll(() => {
   jest.useFakeTimers();
 });
 
-afterEach(() => {
+afterAll(() => {
   jest.useRealTimers();
 });
 
@@ -199,6 +211,9 @@ describe('scheduleMaintenance — the foreground', () => {
     scheduleMaintenance({ destination, appState, intervalMs: 60_000 });
 
     appState.change('background');
+    // Long enough away that the catch-up is earned; this test is about the
+    // transition guard, so it has to get past the elapsed-time guard first.
+    jest.advanceTimersByTime(60_000);
     appState.change('active');
     expect(destination.sweeps).toHaveLength(1);
 
@@ -210,6 +225,48 @@ describe('scheduleMaintenance — the foreground', () => {
     expect(destination.sweeps).toHaveLength(1);
 
     jest.advanceTimersByTime(60_000);
+    expect(destination.sweeps).toHaveLength(2);
+  });
+
+  test('a bounce through inactive does not buy a sweep, a real absence does', () => {
+    const { destination, appState } = wired();
+    scheduleMaintenance({ destination, appState, intervalMs: 60_000 });
+
+    // What iOS actually sends when the notification shade comes down, or
+    // control centre, or a call banner, or Face ID, or a screenshot. It is a
+    // real `active -> inactive -> active` transition every time, so the
+    // transition guard alone does not stop it — and each one used to cost a
+    // synchronous sweep of up to `deadlineMs` on the main thread.
+    for (let i = 0; i < 5; i += 1) {
+      appState.change('inactive');
+      jest.advanceTimersByTime(1_000);
+      appState.change('active');
+    }
+    expect(destination.sweeps).toEqual([]);
+
+    // And the sweep that was actually due still lands when it was due. This
+    // is the half that stops the guard becoming starvation: each bounce
+    // clears the interval and returning sets a new one, so without carrying
+    // the remaining time across, five interruptions would push the next
+    // sweep five intervals into the future while the guard declined to sweep
+    // now. 60s were owed at install and 5s were spent bouncing.
+    jest.advanceTimersByTime(55_000);
+    expect(destination.sweeps).toHaveLength(1);
+
+    // A bounce straight after a sweep the TIMER ran is suppressed too, which
+    // is only true if the timer's sweep updated the clock this guard reads.
+    // Measuring from install instead would make the elapsed time a full
+    // interval here and sweep again, one tick after the last one.
+    appState.change('inactive');
+    appState.change('active');
+    expect(destination.sweeps).toHaveLength(1);
+
+    // And a genuine absence — longer than the interval that was frozen with
+    // it — still earns its catch-up on the way back in.
+    appState.change('background');
+    jest.advanceTimersByTime(600_000);
+    expect(destination.sweeps).toHaveLength(1);
+    appState.change('active');
     expect(destination.sweeps).toHaveLength(2);
   });
 

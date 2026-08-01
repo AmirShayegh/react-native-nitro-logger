@@ -168,21 +168,35 @@ type MarkerInspection =
   | { readonly kind: 'private'; readonly payload: LogPrimitive }
   | { readonly kind: 'invalid' };
 
-/** Module-private by design — see the note at the top of this file. */
+/**
+ * Module-private by design — see the note at the top of this file.
+ *
+ * One probe per map rather than `has` followed by `get`. `undefined` from
+ * `get` means absent and can mean nothing else: `pub`/`priv` call `set` only
+ * after `isLogPrimitive` has passed, and `isLogPrimitive(undefined)` is
+ * false, so no registered marker holds `undefined`. The `has` was asking a
+ * question the `get` already answered.
+ *
+ * The re-validation below is NOT the same kind of redundancy and stays.
+ * Construction validated the payload; this validates it again at emit,
+ * which is the stated contract — the WeakMap is module-private but the
+ * check is what makes "validated at construction AND at emit" true rather
+ * than a claim about code nobody re-reads.
+ */
 function inspectMarker(value: unknown): MarkerInspection | null {
   if (value === null || typeof value !== 'object') return null;
   const candidate = value as object;
 
-  if (publicPayloads.has(candidate)) {
-    const payload = publicPayloads.get(candidate);
-    return isLogPrimitive(payload)
-      ? { kind: 'public', payload }
+  const publicPayload = publicPayloads.get(candidate);
+  if (publicPayload !== undefined) {
+    return isLogPrimitive(publicPayload)
+      ? { kind: 'public', payload: publicPayload }
       : { kind: 'invalid' };
   }
-  if (privatePayloads.has(candidate)) {
-    const payload = privatePayloads.get(candidate);
-    return isLogPrimitive(payload)
-      ? { kind: 'private', payload }
+  const privatePayload = privatePayloads.get(candidate);
+  if (privatePayload !== undefined) {
+    return isLogPrimitive(privatePayload)
+      ? { kind: 'private', payload: privatePayload }
       : { kind: 'invalid' };
   }
   if (invalidMarkers.has(candidate)) return { kind: 'invalid' };
@@ -277,11 +291,22 @@ function catalogRequired(settings: PrivacySettings): boolean {
 
 // ── Redaction ───────────────────────────────────────────────────────────────
 
-type Resolution =
-  | { readonly kind: 'value'; readonly value: LogPrimitive }
-  | { readonly kind: 'drop' };
+/**
+ * "This value does not go out", as a value rather than a wrapper.
+ *
+ * A unique Symbol, module-private, so it cannot equal anything a caller can
+ * put in metadata — which is what lets {@link resolveValue} return the
+ * payload itself instead of allocating a `{ kind, value }` object per key.
+ *
+ * The reason it is a Symbol and not `undefined` or `null` is the mistake it
+ * makes unavailable. A resolution tested with `if (!resolution)` would drop
+ * `0`, `false` and `''` — all legitimate, all things a logger is asked to
+ * record, and all silently missing from the output with the dropped-count
+ * dutifully incremented. `=== DROP` cannot express that bug.
+ */
+const DROP: unique symbol = Symbol('privacy.drop');
 
-const DROP: Resolution = { kind: 'drop' };
+type Resolution = LogPrimitive | typeof DROP;
 
 /** Record which source owns each of its keys, without reading any value. */
 function claimKeys(
@@ -298,6 +323,66 @@ function claimKeys(
   for (const key of keys) {
     owner.set(key, source as Record<string, unknown>);
   }
+}
+
+/**
+ * Check one key, and if it earns it, read and resolve its value into
+ * `result`. Returns false when the entry was dropped.
+ *
+ * A module-level function taking every input explicitly, rather than a
+ * closure defined inside {@link redactMetadata}: a closure would allocate
+ * once per call on the delivered path, which is the allocation this unit is
+ * removing elsewhere. It exists at all so the two iteration shapes below —
+ * one source, or two with precedence — share ONE copy of the key rules.
+ * Two copies of a privacy check is how the copies come to disagree.
+ */
+function admitKey(
+  result: Record<string, LogPrimitive>,
+  key: string,
+  source: Record<string, unknown>,
+  catalog: ReadonlySet<string> | undefined,
+  requireCatalog: boolean,
+  settings: PrivacySettings
+): boolean {
+  // The reserved key first, always: it satisfies the key rule and could sit
+  // in a catalog, so no later branch may be reached with it.
+  if (key === DROPPED_COUNT_KEY) return false;
+
+  if (catalog !== undefined) {
+    // Membership IS the key check. `buildCatalog` is fail-closed — one entry
+    // that fails the rule empties the whole catalog — and `metadataKeyCatalog`
+    // only ever intersects, so a key that is in a catalog has already passed
+    // `isValidMetadataKey`. Re-testing it here is a second evaluation of a
+    // regex against a string that provably matches.
+    //
+    // That "provably" is load-bearing, and it is pinned rather than assumed:
+    // `privacy.test.ts` asserts the invariant directly, and
+    // `scripts/mutants/P4-catalog-admits-invalid-key.patch` drops the key-rule
+    // test from `buildCatalog` so an invalid string is ADMITTED to the catalog
+    // — which is what breaks the invariant, and therefore what the suite has
+    // to catch. Merely skipping a bad entry would not: the catalog would still
+    // contain only valid keys, membership would still imply the rule, and the
+    // mutant would prove nothing about the line below.
+    if (!catalog.has(key)) return false;
+  } else {
+    if (requireCatalog) return false;
+    if (!isValidMetadataKey(key)) return false;
+  }
+
+  // Only now — after the key has earned it — is the value touched.
+  let raw: unknown;
+  try {
+    raw = source[key];
+  } catch {
+    return false;
+  }
+
+  // Identity against the sentinel, never truthiness: `0`, `false` and `''`
+  // are values this logger is asked to record, not absences.
+  const resolution = resolveValue(raw, settings);
+  if (resolution === DROP) return false;
+  result[key] = resolution;
+  return true;
 }
 
 function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
@@ -319,12 +404,9 @@ function resolveValue(raw: unknown, settings: PrivacySettings): Resolution {
     return DROP;
   }
 
-  if (settings.redactAll) return { kind: 'value', value: PRIVATE_PLACEHOLDER };
-  if (visibility === 'public') return { kind: 'value', value: payload };
-  return {
-    kind: 'value',
-    value: privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER,
-  };
+  if (settings.redactAll) return PRIVATE_PLACEHOLDER;
+  if (visibility === 'public') return payload;
+  return privateRevealAllowed() ? payload : PRIVATE_PLACEHOLDER;
 }
 
 /**
@@ -363,11 +445,14 @@ export function redactMetadata(
   // in the signature would itself be caller-controlled — a hostile array
   // could throw from Symbol.iterator, iterate forever, or be a revoked
   // Proxy — and guarding it is strictly more work than not having one.
-  const owner = new Map<string, Record<string, unknown>>();
-  claimKeys(owner, scopeMetadata);
-  // Second wins on collision: the call site overrides the scope's default.
-  claimKeys(owner, callSiteMetadata);
-  if (owner.size === 0) return undefined;
+  //
+  // The falsy tests match `claimKeys`, which skips a falsy source, so
+  // "absent" here means exactly what it has always meant.
+  const hasScope = !!scopeMetadata;
+  const hasCallSite = !!callSiteMetadata;
+  // Nothing to settle and nothing to read: every call that passes no
+  // metadata at all, which is most of them.
+  if (!hasScope && !hasCallSite) return undefined;
 
   const catalog = settings.keyCatalog;
   const requireCatalog = catalogRequired(settings);
@@ -375,31 +460,40 @@ export function redactMetadata(
   const result: Record<string, LogPrimitive> = Object.create(null);
   let dropped = 0;
 
-  for (const [key, source] of owner) {
-    if (key === DROPPED_COUNT_KEY || !isValidMetadataKey(key)) {
-      dropped += 1;
-      continue;
-    }
-    if (catalog !== undefined ? !catalog.has(key) : requireCatalog) {
-      dropped += 1;
-      continue;
-    }
-
-    // Only now — after the key has earned it — is the value touched.
-    let raw: unknown;
+  if (!hasScope || !hasCallSite) {
+    // One source, so there is no precedence to settle and no ownership map
+    // to build — every key belongs to the only source there is. Key order
+    // is `Object.keys` order, which is the same order the map would have
+    // been iterated in, and third-party formatters may depend on it even
+    // though both shipped ones sort.
+    const source = (hasScope ? scopeMetadata : callSiteMetadata) as LogMetadata;
+    let keys: string[];
     try {
-      raw = source[key];
+      keys = Object.keys(source);
     } catch {
-      dropped += 1;
-      continue;
+      // A source whose keys cannot be enumerated contributes nothing —
+      // there is no key that could be safely counted or described.
+      return undefined;
     }
+    if (keys.length === 0) return undefined;
+    for (const key of keys) {
+      const record = source as Record<string, unknown>;
+      if (!admitKey(result, key, record, catalog, requireCatalog, settings)) {
+        dropped += 1;
+      }
+    }
+  } else {
+    const owner = new Map<string, Record<string, unknown>>();
+    claimKeys(owner, scopeMetadata);
+    // Second wins on collision: the call site overrides the scope's default.
+    claimKeys(owner, callSiteMetadata);
+    if (owner.size === 0) return undefined;
 
-    const resolution = resolveValue(raw, settings);
-    if (resolution.kind === 'drop') {
-      dropped += 1;
-      continue;
+    for (const [key, source] of owner) {
+      if (!admitKey(result, key, source, catalog, requireCatalog, settings)) {
+        dropped += 1;
+      }
     }
-    result[key] = resolution.value;
   }
 
   if (dropped > 0) result[DROPPED_COUNT_KEY] = dropped;

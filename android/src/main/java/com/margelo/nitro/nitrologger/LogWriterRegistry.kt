@@ -207,8 +207,8 @@ class LogWriterRegistry {
     platform: PlatformIo,
     rawWrite: LogFileWriter.RawWrite? = null,
     compressor: LogFileWriter.Compressor? = null,
-    clock: (() -> Long)? = null,
-    monotonic: (() -> Long)? = null,
+    clock: LogFileWriter.Clock? = null,
+    monotonic: LogFileWriter.Clock? = null,
     /**
      * Holds the open sweep on the executor — see [LogFileWriter.open].
      * Forwarded here for the same reason [clock] and [monotonic] are: writers
@@ -581,7 +581,7 @@ class LogFileHandle internal constructor(
 
   private fun inertStatus() = LogSinkStatus(0, 0, 0, 0)
 
-  fun appendBatch(batch: String, entryCount: Long): LogAppendResult = lock.withLock {
+  fun appendBatch(batch: ByteArray, entryCount: Long): LogAppendResult = lock.withLock {
     if (state != State.ACTIVE) {
       return LogAppendResult(false, LogRejectReason.CLOSED, inertStatus())
     }

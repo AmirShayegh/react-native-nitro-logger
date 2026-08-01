@@ -53,6 +53,27 @@ export interface InternalLogOptions extends LogOptions {
 const MAX_CONSECUTIVE_FAILURES = 5;
 
 /**
+ * How many distinct subsystem names the effective-minimum memo will hold.
+ *
+ * The memo exists because the hierarchy walk runs on the FILTERED path — the
+ * one a production logger spends most of its calls on — and costs a Map
+ * lookup plus a `lastIndexOf` plus an allocated slice per segment.
+ *
+ * The cap is not a tuning knob, it is the answer to what the memo retains.
+ * Keys are caller-supplied strings, so an unbounded memo would be a
+ * process-lifetime record of every subsystem name ever logged, which is a
+ * retention surface this package should not grow — a subsystem name is not
+ * metadata, but "unbounded caller strings kept forever" is the shape the
+ * privacy design says no to elsewhere. Past the cap resolution still answers
+ * correctly, just without memoising, so a caller generating unique names per
+ * call degrades to the old cost rather than to a leak.
+ *
+ * 512 covers every real subsystem tree by a wide margin; the pathological
+ * caller it declines to serve is one that would have been served wrongly.
+ */
+const MAX_MEMOIZED_SUBSYSTEMS = 512;
+
+/**
  * A registered destination plus the label captured once, at registration.
  * The label is never re-read afterwards: a getter that succeeds during
  * registration and throws later would otherwise break removal, and failure
@@ -106,6 +127,19 @@ export interface DestinationStatus {
 export class Logger {
   private globalMinimum: LogLevel = 'debug';
   private readonly subsystemLevels = new Map<string, LogLevel>();
+  /**
+   * Subsystem name → the level it resolves to, walk already done.
+   *
+   * Every entry is a function of `subsystemLevels` and `globalMinimum`, so
+   * the three methods that can change either clear it. That is the whole
+   * invalidation surface, and it is why they clear rather than try to patch:
+   * setting `net` changes the answer for `net.http.client` and for every
+   * other descendant, none of which the setter can enumerate.
+   *
+   * See {@link MAX_MEMOIZED_SUBSYSTEMS} for what this retains and why it is
+   * bounded.
+   */
+  readonly #effectiveMinimums = new Map<string, LogLevel>();
   private registrations: Registration[] = defaultRegistrations();
 
   /** Consecutive write-failure counts per destination label. */
@@ -146,6 +180,7 @@ export class Logger {
     } else if (normalized === 'private') {
       this.privacyDefaultValue = 'private';
     }
+    this.#tighten();
     return this;
   }
 
@@ -153,6 +188,7 @@ export class Logger {
    * One-way: there is no call that undoes it. */
   redactAllMetadata(): this {
     this.redactAll = true;
+    this.#tighten();
     return this;
   }
 
@@ -198,15 +234,39 @@ export class Logger {
     }
 
     warnIfCatalogShrank(current, incoming, this.keyCatalog);
+    this.#tighten();
     return this;
   }
 
-  private privacySettings(): PrivacySettings {
-    return {
+  /**
+   * The settings object every delivered call hands to redaction.
+   *
+   * Rebuilt by {@link #tighten}, never lazily on read: a lazy cache has an
+   * invalidation flag, and an invalidation flag has a state where it is
+   * stale. Here the only way to change privacy state is to go through one of
+   * the three mutators, and each ends by calling `#tighten()`. A fourth
+   * mutator that forgot to would be shipping the previous, LOOSER
+   * configuration to every subsequent call — the one failure in this file
+   * that widens disclosure rather than narrowing it — so the funnel is the
+   * point and the caching is the side effect.
+   */
+  #privacySettingsCache: PrivacySettings = {
+    privacyDefault: 'public',
+    redactAll: false,
+    keyCatalog: undefined,
+  };
+
+  /** Re-derive the settings snapshot. Every privacy mutator ends here. */
+  #tighten(): void {
+    this.#privacySettingsCache = {
       privacyDefault: this.privacyDefaultValue,
       redactAll: this.redactAll,
       keyCatalog: this.keyCatalog,
     };
+  }
+
+  private privacySettings(): PrivacySettings {
+    return this.#privacySettingsCache;
   }
 
   // ── Fluent configuration ────────────────────────────────────────────────
@@ -214,6 +274,9 @@ export class Logger {
   /** Global minimum level; messages below it are discarded. Default 'debug'. */
   minimumLevel(level: LogLevel): this {
     this.globalMinimum = level;
+    // Every memoised answer that fell back to the global minimum is now
+    // wrong, and which ones those were is not recorded.
+    this.#effectiveMinimums.clear();
     return this;
   }
 
@@ -221,11 +284,15 @@ export class Logger {
    * `network.api` unless the child sets its own). */
   subsystem(name: string, level: LogLevel): this {
     this.subsystemLevels.set(name, level);
+    // Not just `name`: this changes the answer for every descendant of it,
+    // and a memo cannot enumerate the descendants it has seen.
+    this.#effectiveMinimums.clear();
     return this;
   }
 
   resetSubsystem(name: string): this {
     this.subsystemLevels.delete(name);
+    this.#effectiveMinimums.clear();
     return this;
   }
 
@@ -419,15 +486,81 @@ export class Logger {
 
   // ── Logging ─────────────────────────────────────────────────────────────
 
+  /**
+   * The effective minimum for a subsystem, memoised.
+   *
+   * ES `#private` rather than TypeScript `private`: `private` is erased by
+   * Babel, so a TS-private method is an ordinary prototype method at runtime
+   * and the ESLint plugin's closed method list — which exists so that a call
+   * to anything the package did not write counts as tampering — would have to
+   * grow an entry for an implementation detail. `#` names are absent from
+   * the prototype, so this stays genuinely internal on both sides.
+   */
+  #effectiveMinimumFor(subsystem: string): LogLevel {
+    const memo = this.#effectiveMinimums;
+    const cached = memo.get(subsystem);
+    if (cached !== undefined) return cached;
+    const resolved =
+      resolveSubsystemLevel(this.subsystemLevels, subsystem) ??
+      this.globalMinimum;
+    // Past the cap the answer is still right, it just is not remembered.
+    if (memo.size < MAX_MEMOIZED_SUBSYSTEMS) memo.set(subsystem, resolved);
+    return resolved;
+  }
+
+  /**
+   * Does this level clear the effective minimum for this subsystem?
+   *
+   * The level threshold and nothing else. It is NOT a prediction that the
+   * message would be delivered: a `true` here says only that the level
+   * passed, and the call can still reach no destination because there are
+   * none registered, because every one is disabled, or because a
+   * destination's own `minimumLevel` turns it away. Those are decided in
+   * `logMessage`, per destination, on the entry.
+   *
+   * Public because `ScopedLogger` has to ask it — the same reason
+   * `logMessage` is public — and for no other. It is the level decision on
+   * its own, split out so a caller can make it BEFORE building the options
+   * object a filtered call would only throw away; `logMessage` still makes
+   * the same decision itself, so a direct caller loses nothing.
+   *
+   * Takes a level and a subsystem name. It reads no caller text, evaluates
+   * no thunk, and emits nothing.
+   */
+  passesLevel(level: LogLevel, subsystem?: string): boolean {
+    return levelAtLeast(
+      level,
+      subsystem !== undefined
+        ? this.#effectiveMinimumFor(subsystem)
+        : this.globalMinimum
+    );
+  }
+
   log(message: LazyMessage, options?: LogOptions): void {
     this.logMessage(message, options);
   }
+
+  // The six level methods each ask {@link passesLevel} before building the
+  // options object. On the filtered path — where a production logger spends
+  // most of its calls — that object was allocated, passed, read once and
+  // dropped. The decision it fed is the same one `logMessage` makes on
+  // arrival, so nothing here changes what is logged; the object is simply
+  // not built when the answer is already no.
+  //
+  // It does change one thing, and `logMessage` being public is why: a
+  // subclass that overrides `logMessage` used to receive every convenience
+  // call, including the ones about to be filtered, and now receives only the
+  // ones that pass. That is a loss of reach, not merely of visibility — an
+  // override cannot re-route, re-level or deliberately emit a call that never
+  // arrives. Direct calls to `logMessage` are unaffected, which is the path
+  // every integration in this package takes. Disclosed in the changeset.
 
   verbose(
     message: LazyMessage,
     metadata?: LogMetadata,
     subsystem?: string
   ): void {
+    if (!this.passesLevel('verbose', subsystem)) return;
     this.logMessage(message, { level: 'verbose', metadata, subsystem });
   }
 
@@ -436,10 +569,12 @@ export class Logger {
     metadata?: LogMetadata,
     subsystem?: string
   ): void {
+    if (!this.passesLevel('debug', subsystem)) return;
     this.logMessage(message, { level: 'debug', metadata, subsystem });
   }
 
   info(message: LazyMessage, metadata?: LogMetadata, subsystem?: string): void {
+    if (!this.passesLevel('info', subsystem)) return;
     this.logMessage(message, { level: 'info', metadata, subsystem });
   }
 
@@ -448,6 +583,7 @@ export class Logger {
     metadata?: LogMetadata,
     subsystem?: string
   ): void {
+    if (!this.passesLevel('warning', subsystem)) return;
     this.logMessage(message, { level: 'warning', metadata, subsystem });
   }
 
@@ -456,11 +592,21 @@ export class Logger {
     metadata?: LogMetadata,
     subsystem?: string
   ): void {
+    if (!this.passesLevel('error', subsystem)) return;
     this.logMessage(message, { level: 'error', metadata, subsystem });
   }
 
-  /** Marks incomplete work; highest severity so it always surfaces. */
+  /**
+   * Marks incomplete work; highest severity so it always surfaces.
+   *
+   * The guard below can never fire — `todo` is the top of `LEVEL_ORDER`, so
+   * it clears every minimum — and it is here anyway. Six methods that look
+   * identical are read as identical; the one written differently because its
+   * author reasoned about the level ordering is the one a later edit gets
+   * wrong. It costs a comparison on the rarest level in the package.
+   */
   todo(message: LazyMessage, metadata?: LogMetadata, subsystem?: string): void {
+    if (!this.passesLevel('todo', subsystem)) return;
     this.logMessage(message, { level: 'todo', metadata, subsystem });
   }
 
@@ -469,16 +615,25 @@ export class Logger {
     const level = options?.level ?? 'info';
     const subsystem = options?.subsystem;
 
-    const effectiveMinimum =
-      (subsystem !== undefined
-        ? resolveSubsystemLevel(this.subsystemLevels, subsystem)
-        : undefined) ?? this.globalMinimum;
-    if (!levelAtLeast(level, effectiveMinimum)) return;
+    // Kept here even though the six level methods have already asked: this is
+    // the entry point every integration uses (the error handler, the
+    // rejection handler, the bridges, `log`), and the check belongs where the
+    // entry is, not where one family of callers happens to be.
+    if (!this.passesLevel(level, subsystem)) return;
 
     // Eligibility BEFORE message evaluation: a lazy thunk must not run when
     // nothing will receive the entry. isEnabled/minimumLevel may be throwing
     // getters, so each read is isolated and charged to the stable label.
-    const eligible: Registration[] = [];
+    //
+    // The first eligible destination is held in a local and the array is
+    // allocated only if a second turns up, because one destination is the
+    // overwhelmingly common shape and it does not need a list to hold it.
+    // Deliberately NOT a scratch array reused across calls: a destination's
+    // `write` can re-enter this method — a destination logging its own
+    // failure, or the installed error handler — and a shared buffer would
+    // let the inner call overwrite the outer call's list mid-fan-out.
+    let onlyEligible: Registration | undefined;
+    let eligible: Registration[] | undefined;
     for (const registration of this.registrations) {
       const { destination, label } = registration;
       if (this.disabledLabels.has(label)) continue;
@@ -494,9 +649,15 @@ export class Logger {
         this.noteFailure(label);
         continue;
       }
-      eligible.push(registration);
+      if (onlyEligible === undefined) {
+        onlyEligible = registration;
+      } else if (eligible === undefined) {
+        eligible = [onlyEligible, registration];
+      } else {
+        eligible.push(registration);
+      }
     }
-    if (eligible.length === 0) return;
+    if (onlyEligible === undefined) return;
 
     let text: string;
     try {
@@ -525,13 +686,33 @@ export class Logger {
       subsystem,
     });
 
-    for (const { destination, label } of eligible) {
-      try {
-        destination.write(entry);
-        this.failureCounts.delete(label);
-      } catch {
-        this.noteFailure(label);
-      }
+    if (eligible === undefined) {
+      this.#deliver(onlyEligible, entry);
+    } else {
+      for (const registration of eligible) this.#deliver(registration, entry);
+    }
+  }
+
+  /**
+   * One destination, one entry, isolated.
+   *
+   * ES `#private` for the reason given on `#effectiveMinimumFor`: a
+   * TypeScript `private` method is an ordinary prototype method at runtime,
+   * and the plugin's closed list is about what the package wrote, not about
+   * what it meant to keep to itself.
+   *
+   * The `delete` is guarded on size because it is a Map operation per
+   * delivery in service of a count that is empty in every healthy process —
+   * the failure path is what maintains it, and `noteFailure` is where the
+   * entry comes from.
+   */
+  #deliver(registration: Registration, entry: LogEntry): void {
+    const { destination, label } = registration;
+    try {
+      destination.write(entry);
+      if (this.failureCounts.size > 0) this.failureCounts.delete(label);
+    } catch {
+      this.noteFailure(label);
     }
   }
 

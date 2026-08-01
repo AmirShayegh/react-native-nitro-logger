@@ -28,6 +28,48 @@ afterEach(() => {
   else globalThis.__DEV__ = originalDev;
 });
 
+/**
+ * Falsy values that are values, not absences.
+ *
+ * `0`, `false` and `''` are the three things a "did it resolve?" check
+ * written as `if (!resolution)` silently deletes, and the deletion is
+ * invisible from the outside: the key is missing and the dropped count says
+ * one value was rejected, which is exactly what a genuinely rejected value
+ * looks like. A retry counter that only appears once it is non-zero is worse
+ * than no counter.
+ *
+ * The suite had no such case before 0.4.0 — every metadata test used a
+ * truthy value — so the bug would have been available to any future rewrite
+ * of the resolution path, which is precisely what that path was about to get.
+ */
+describe('values that are falsy but present', () => {
+  test('zero, false and the empty string survive as themselves', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { retries: 0, ok: false, note: '' });
+    expect(md(dest)).toEqual({ retries: 0, ok: false, note: '' });
+  });
+
+  test('the same three survive when marked public under a private default', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger
+      .privacyDefault('private')
+      .metadataKeyCatalog(['retries', 'ok', 'note']);
+    logger.info('m', { retries: pub(0), ok: pub(false), note: pub('') });
+    expect(md(dest)).toEqual({ retries: 0, ok: false, note: '' });
+  });
+
+  test('nothing is counted as dropped when all three pass', () => {
+    setDev(false);
+    const { logger, dest } = makeLogger();
+    logger.info('m', { retries: 0, ok: false, note: '' });
+    // The count key is absent entirely rather than zero: a falsy value that
+    // was dropped would show up here, and this is what says none was.
+    expect(md(dest)).not.toHaveProperty('droppedMetadataCount');
+  });
+});
+
 describe('privacy default', () => {
   test("'public' (the OSS default) renders bare values", () => {
     setDev(false);
@@ -781,5 +823,121 @@ describe('key validation happens before any value is read', () => {
     );
     expect(() => logger.info('m', hostile as never)).not.toThrow();
     expect(md(dest)).toBeUndefined();
+  });
+});
+
+/**
+ * The one-source path and the two-source path must agree, exactly.
+ *
+ * Redaction has two shapes since 0.4.0: a call with metadata from a single
+ * source skips the ownership map, because with nothing to settle there is no
+ * precedence to compute. That is a second route through the key rules — the
+ * catalog check, the reserved key, the throwing getter, the marker
+ * resolution — and two routes through a privacy check is exactly how the two
+ * come to disagree, quietly, in whichever one is exercised less.
+ *
+ * The oracle is `{}` as the second source. It contributes no keys, so it
+ * cannot change the answer, but it does force the two-source path — which
+ * makes "same inputs, both routes" a comparison this suite can actually run
+ * rather than a claim in a comment.
+ *
+ * Every result is compared including key ORDER and the dropped count, since
+ * a route that silently reordered keys or lost a drop would still look
+ * right to `toEqual` on an object alone.
+ */
+describe('one source and two sources resolve identically', () => {
+  const throwingGetter = () => {
+    const source: Record<string, unknown> = {};
+    Object.defineProperty(source, 'boom', {
+      enumerable: true,
+      get() {
+        throw new Error('getter threw');
+      },
+    });
+    source.after = 'still here';
+    return source;
+  };
+
+  const CORPUS: { name: string; build: () => object; catalog?: string[] }[] = [
+    { name: 'plain values', build: () => ({ a: 'x', b: 2, c: true }) },
+    { name: 'falsy values', build: () => ({ a: 0, b: false, c: '' }) },
+    { name: 'markers', build: () => ({ a: pub('p'), b: priv('s') }) },
+    { name: 'an invalid marker', build: () => ({ a: pub({} as never) }) },
+    { name: 'a non-primitive value', build: () => ({ a: { nested: 1 } }) },
+    { name: 'a malformed key', build: () => ({ 'not a key': 1, 'ok': 2 }) },
+    {
+      name: 'the reserved count key',
+      build: () => ({ [DROPPED_COUNT_KEY]: 9, ok: 1 }),
+    },
+    { name: 'a throwing getter', build: throwingGetter },
+    { name: 'an empty object', build: () => ({}) },
+    {
+      name: 'keys outside a configured catalog',
+      build: () => ({ allowed: 1, denied: 2 }),
+      catalog: ['allowed'],
+    },
+    {
+      name: 'insertion order that is not sorted',
+      build: () => ({ zebra: 1, apple: 2, mango: 3 }),
+    },
+  ];
+
+  for (const { name, build, catalog } of CORPUS) {
+    test(`${name}`, () => {
+      setDev(false);
+
+      const read = (scope: object | undefined, call: object | undefined) => {
+        const { logger, dest } = makeLogger();
+        if (catalog) logger.metadataKeyCatalog(catalog);
+        // The scope source is threaded exactly as ScopedLogger threads it.
+        logger.logMessage('m', {
+          ...(scope ? { scopeMetadata: scope as never } : {}),
+          ...(call ? { metadata: call as never } : {}),
+        });
+        return md(dest);
+      };
+
+      const viaCallSiteOnly = read(undefined, build());
+      const viaScopeOnly = read(build(), undefined);
+      // `{}` adds no keys but forces the two-source route.
+      const viaBothCallSide = read({}, build());
+      const viaBothScopeSide = read(build(), {});
+
+      expect(viaScopeOnly).toEqual(viaCallSiteOnly);
+      expect(viaBothCallSide).toEqual(viaCallSiteOnly);
+      expect(viaBothScopeSide).toEqual(viaCallSiteOnly);
+
+      // Key order too: `toEqual` does not compare it.
+      const order = (m: object | undefined) => (m ? Object.keys(m) : undefined);
+      expect(order(viaScopeOnly)).toEqual(order(viaCallSiteOnly));
+      expect(order(viaBothCallSide)).toEqual(order(viaCallSiteOnly));
+      expect(order(viaBothScopeSide)).toEqual(order(viaCallSiteOnly));
+    });
+  }
+
+  test('a source that cannot be enumerated yields nothing on either route', () => {
+    setDev(false);
+    const hostile = () =>
+      new Proxy(
+        {},
+        {
+          ownKeys() {
+            throw new Error('ownKeys trap threw');
+          },
+        }
+      );
+    const read = (scope: object | undefined, call: object | undefined) => {
+      const { logger, dest } = makeLogger();
+      logger.logMessage('m', {
+        ...(scope ? { scopeMetadata: scope as never } : {}),
+        ...(call ? { metadata: call as never } : {}),
+      });
+      return md(dest);
+    };
+
+    expect(read(undefined, hostile())).toBeUndefined();
+    expect(read(hostile(), undefined)).toBeUndefined();
+    expect(read({}, hostile())).toBeUndefined();
+    expect(read(hostile(), {})).toBeUndefined();
   });
 });

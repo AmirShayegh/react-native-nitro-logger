@@ -1,0 +1,13 @@
+diff --git a/src/privacy.ts b/src/privacy.ts
+index 1e52afa..89e3b8e 100644
+--- a/src/privacy.ts
++++ b/src/privacy.ts
+@@ -265,7 +265,7 @@ export function buildCatalog(keys: unknown): Set<string> {
+     let consumed = 0;
+     for (const key of keys as Iterable<unknown>) {
+       if (++consumed > MAX_CATALOG_SIZE) return new Set();
+-      if (typeof key !== 'string' || !isValidMetadataKey(key)) {
++      if (typeof key !== 'string') {
+         return new Set();
+       }
+       result.add(key);

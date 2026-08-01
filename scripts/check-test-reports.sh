@@ -41,8 +41,8 @@ MODE="${1:-}"
 case "$MODE" in
   swift)
     REPORTS="$(pwd)/.build/test-reports"
-    MINIMUM=247
-    REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
+    MINIMUM=260
+    REQUIRED_SUITES="FileSinkAnswersTests FileSinkLifecycleRowsTests FileSinkLifecycleTests LogBurstTests LogCollectTests LogFileWriterTests LogPerfTests LogRegistryTests LogRotationTests LogSecureFileTests MonotonicConditionTests NativeConsoleWriterTests PackageManifestTests"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     # `--xunit-output` is the only machine-readable result SwiftPM emits, and
@@ -53,16 +53,16 @@ case "$MODE" in
     ;;
   kotlin)
     REPORTS="$(pwd)/android/build/test-results/testDebugUnitTest"
-    MINIMUM=240
-    REQUIRED_SUITES="BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
+    MINIMUM=246
+    REQUIRED_SUITES="AllocationHarnessTest BridgeNumberTest FileSinkAnswersTest FileSinkLifecycleRowsTest FileSinkLifecycleTest FileSinkMessagesTest LogBurstTest LogCollectTest LogFileWriterTest LogWriterRegistryTest NativeConsoleWriterTest ReactInstanceEpochTest"
     rm -rf "$REPORTS"
     (cd example/android && ./gradlew :react-native-nitro-logger:testDebugUnitTest --console=plain)
     RUN_STATUS=$?
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=1108
-    REQUIRED_SUITES="adapterThinness apiReference batcher consoleDestination construction correlation defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError scope subsystem utf8"
+    MINIMUM=1228
+    REQUIRED_SUITES="adapterThinness apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError platformConsoleFormatter scope subsystem timestamp utf8"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     npx jest --ci --json --outputFile="$REPORTS/jest.json"

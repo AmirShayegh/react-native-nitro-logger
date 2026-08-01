@@ -37,6 +37,7 @@ namespace margelo::nitro::nitrologger { struct SinkStatus; }
 #include "RejectReason.hpp"
 #include "RotationConfig.hpp"
 #include "SinkStatus.hpp"
+#include <NitroModules/ArrayBuffer.hpp>
 #include <NitroModules/Result.hpp>
 #include <exception>
 #include <memory>

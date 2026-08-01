@@ -107,6 +107,7 @@ export { levelAtLeast, LEVEL_ORDER } from './levels';
 export { PRIVATE_PLACEHOLDER } from './privacy';
 export type { LogFormatter } from './formatters/types';
 export { DefaultFormatter } from './formatters/DefaultFormatter';
+export { PlatformConsoleFormatter } from './formatters/PlatformConsoleFormatter';
 export { JsonLinesFormatter } from './formatters/JsonLinesFormatter';
 export type {
   JsonTimestampStyle,
