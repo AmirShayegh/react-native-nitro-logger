@@ -53,7 +53,7 @@ class LogFileWriter internal constructor(
    * of which have to mean the same thing across a restart — so this one is
    * allowed to jump when the device clock is corrected.
    */
-  private val clock: () -> Long,
+  private val clock: Clock,
   /**
    * Monotonic millis. Answers "how much of the budget is left" and "has the
    * backoff elapsed", neither of which may ever be affected by an NTP
@@ -64,7 +64,7 @@ class LogFileWriter internal constructor(
    * and a close that was promised 200 ms and takes an hour is an ANR. iOS keeps
    * the same split, using `DispatchTime` for deadlines and `Date` for ages.
    */
-  private val monotonic: () -> Long,
+  private val monotonic: Clock,
   /** See the parameter of the same name on [open]. Null in production. */
   private val openSweepGate: (() -> Unit)? = null
 ) {
@@ -84,6 +84,17 @@ class LogFileWriter internal constructor(
   /** Archive compression, injectable because the interesting case is failure. */
   fun interface Compressor {
     fun compress(source: File, destination: File): Boolean
+  }
+
+  /**
+   * A millisecond clock. A `fun interface` rather than `() -> Long` because
+   * `Function0<Long>`'s `invoke` returns a boxed `java.lang.Long` — read per
+   * append, with values far outside the `Long.valueOf` cache — while a SAM
+   * `invoke` returns the primitive. The `operator` keeps every call site
+   * reading `clock()`.
+   */
+  fun interface Clock {
+    operator fun invoke(): Long
   }
 
   companion object {
@@ -408,8 +419,8 @@ class LogFileWriter internal constructor(
       platform: PlatformIo,
       rawWrite: RawWrite? = null,
       compressor: Compressor? = null,
-      clock: (() -> Long)? = null,
-      monotonic: (() -> Long)? = null,
+      clock: Clock? = null,
+      monotonic: Clock? = null,
       /**
        * Runs on the executor immediately before the open sweep, so a test can
        * hold the sweep there and observe the writer as it is *before* retention
@@ -431,8 +442,8 @@ class LogFileWriter internal constructor(
       platform = platform,
       rawWrite = rawWrite ?: defaultRawWrite,
       compressor = compressor ?: defaultCompressor,
-      clock = clock ?: System::currentTimeMillis,
-      monotonic = monotonic ?: { System.nanoTime() / 1_000_000L },
+      clock = clock ?: Clock { System.currentTimeMillis() },
+      monotonic = monotonic ?: Clock { System.nanoTime() / 1_000_000L },
       openSweepGate = openSweepGate
     ).also { it.start() }
   }
@@ -1724,19 +1735,27 @@ class LogFileWriter internal constructor(
   private fun rotateIfNeeded() {
     val live = stream ?: return
 
-    // Two clocks, deliberately. The backoff asks "has enough time passed since
-    // the last failure", which must not be re-answered by an NTP correction;
-    // the age test asks "how old is this file", which is measured against a
-    // creation time recorded on a previous run and so has to be epoch.
+    // The cheap question first. The size check is a pure field compare, and
+    // under the default policy (no age cap) it is the only question — this
+    // runs per append, and on the no-rotation path neither clock is read at
+    // all. Two clocks remain, deliberately, each read only once its answer
+    // can matter: the age test asks "how old is this file", measured against
+    // a creation time recorded on a previous run, so it has to be epoch and
+    // is allowed to jump with an NTP correction; the backoff asks "has
+    // enough time passed since the last failure", which must never be
+    // re-answered by one.
+    val tooBig = currentFileSize >= policy.maxFileSizeBytes
+    val tooOld = !tooBig && (policy.maxFileAgeSeconds?.let {
+      clock() - currentFileStart >= (it * 1000).toLong()
+    } ?: false)
+    if (!tooBig && !tooOld) return
+
+    // Checked after the thresholds but still before the attempt is counted
+    // or anything moves — rotation happens iff a threshold is crossed AND
+    // the backoff has elapsed, and the order the two are asked in is not
+    // observable.
     val steady = monotonic()
     if (steady < rotationBlockedUntil) return
-
-    val now = clock()
-    val tooBig = currentFileSize >= policy.maxFileSizeBytes
-    val tooOld = policy.maxFileAgeSeconds?.let {
-      now - currentFileStart >= (it * 1000).toLong()
-    } ?: false
-    if (!tooBig && !tooOld) return
     rotationAttempts += 1
 
     try {

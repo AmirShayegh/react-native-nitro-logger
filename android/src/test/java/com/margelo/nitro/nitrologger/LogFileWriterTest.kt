@@ -96,7 +96,7 @@ class LogFileWriterTest {
     platform: PlatformIo = PlatformIo.Jvm,
     rawWrite: LogFileWriter.RawWrite? = null,
     compressor: LogFileWriter.Compressor? = null,
-    monotonic: (() -> Long)? = null
+    monotonic: LogFileWriter.Clock? = null
   ): LogFileWriter {
     val file = File(directory, name)
     return LogFileWriter.open(
@@ -108,7 +108,7 @@ class LogFileWriterTest {
       rawWrite = rawWrite,
       compressor = compressor,
       clock = { now.get() },
-      monotonic = monotonic ?: { steady.get() }
+      monotonic = monotonic ?: LogFileWriter.Clock { steady.get() }
     ).also { opened.add(it) }
   }
 
