@@ -1323,6 +1323,59 @@ function receiverPropertyCandidates(context, node, name, callNode) {
   const variable = resolveVariable(context, current);
   if (!variable) return candidates;
 
+  // The write sites are a property of the binding, not of where the call is,
+  // so they are found once and only the reachability question is asked per
+  // call site. That list is empty for almost every receiver.
+  for (const write of receiverWrites(context, variable, name)) {
+    if (!reachesCall(write.gate, callNode)) continue;
+    for (const value of write.values) candidates.push(value);
+  }
+  return candidates;
+}
+
+/**
+ * Every site that could install `name` on `variable`, paired with the node
+ * whose reachability decides whether it counts.
+ *
+ * Split out of {@link receiverPropertyCandidates} because that function ran
+ * for every member call whose method is not an API method — `_.map`,
+ * `axios.get`, `navigation.navigate` — and rescanned every reference of the
+ * receiver's binding each time, which is O(references x call sites) per file.
+ * Nothing in this scan depends on the call site except `reachesCall`, so the
+ * scan is cached per (context, variable, name) and the call site supplies
+ * only the filter.
+ *
+ * Cached per CONTEXT because `staticPropertyName` and `resolveReceiverObject`
+ * both consult options-derived configuration on the way through.
+ *
+ * Reordering is safe because `reachesCall` is pure: it compares positions in
+ * a syntax tree that is not being modified. The old code asked it before
+ * resolving an `Object.assign` source and this asks it after, which changes
+ * how much work is skipped and not which candidates come back.
+ */
+const receiverWriteCache = new WeakMap();
+
+function receiverWrites(context, variable, name) {
+  let perContext = receiverWriteCache.get(context);
+  if (!perContext) {
+    perContext = new WeakMap();
+    receiverWriteCache.set(context, perContext);
+  }
+  let perVariable = perContext.get(variable);
+  if (!perVariable) {
+    perVariable = new Map();
+    perContext.set(variable, perVariable);
+  }
+  const cached = perVariable.get(name);
+  if (cached !== undefined) return cached;
+
+  const writes = computeReceiverWrites(context, variable, name);
+  perVariable.set(name, writes);
+  return writes;
+}
+
+function computeReceiverWrites(context, variable, name) {
+  const writes = [];
   for (const reference of variable.references) {
     const identifier = reference.identifier;
     const member = identifier.parent;
@@ -1331,8 +1384,7 @@ function receiverPropertyCandidates(context, node, name, callNode) {
       if (
         !call ||
         call.type !== 'CallExpression' ||
-        !call.arguments.includes(identifier) ||
-        !reachesCall(call, callNode)
+        !call.arguments.includes(identifier)
       ) {
         continue;
       }
@@ -1344,13 +1396,15 @@ function receiverPropertyCandidates(context, node, name, callNode) {
         call.arguments[0] === identifier &&
         isNamespaceMethod(context, call, 'Object', 'assign')
       ) {
+        const values = [];
         for (const source of call.arguments.slice(1)) {
           const match = receiverProperty(
             resolveReceiverObject(context, source),
             name
           );
-          if (match) candidates.push(match.value);
+          if (match) values.push(match.value);
         }
+        if (values.length > 0) writes.push({ gate: call, values });
         continue;
       }
 
@@ -1390,13 +1444,12 @@ function receiverPropertyCandidates(context, node, name, callNode) {
     if (
       assignment &&
       assignment.type === 'AssignmentExpression' &&
-      assignment.left === member &&
-      reachesCall(assignment, callNode)
+      assignment.left === member
     ) {
-      candidates.push(assignment.right);
+      writes.push({ gate: assignment, values: [assignment.right] });
     }
   }
-  return candidates;
+  return writes;
 }
 
 /**
