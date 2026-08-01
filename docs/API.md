@@ -575,6 +575,37 @@ newlines, indented as continuations, because stack traces go through it —
 
 <!-- api: DefaultFormatter, LogFormatter -->
 
+### `PlatformConsoleFormatter`
+
+The same layout as `DefaultFormatter` with the level and timestamp columns
+left off — `[correlation] [subsystem] message {key=value}` — for
+`NativeConsoleDestination`, whose sinks stamp their own severity and time.
+**Recommended there, and not the default:** it changes what you see in
+Console.app and Xcode, which a package upgrade should not do by itself.
+
+```ts
+import {
+  createNativeConsoleDestination,
+  PlatformConsoleFormatter,
+} from 'react-native-nitro-logger';
+
+createNativeConsoleDestination({ formatter: new PlatformConsoleFormatter() });
+```
+
+Those 22 characters are not only noise. os_log and logcat both chunk what they
+are given, and the prefix is charged against that budget in every chunk a long
+message is split into.
+
+Structured fields are escaped exactly as `DefaultFormatter` escapes them. The
+continuation marker is weaker: with no columns to blank, a message that begins
+`  | ` renders a first line that looks like a continuation. What that could
+impersonate is another line of your app's console output, never a record —
+the durable copy is `FileDestination`'s, and `JsonLinesFormatter` is what makes
+it unforgeable. Keep the default if you want the stronger guarantee in the
+console too.
+
+<!-- api: PlatformConsoleFormatter -->
+
 ---
 
 ## Integrations
@@ -1030,6 +1061,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NativeConsoleSink`
 - `NativeConsoleSinkLike`
 - `NON_ERROR_THROWN`
+- `PlatformConsoleFormatter`
 - `priv`
 - `PrivacyDefault`
 - `PRIVATE_PLACEHOLDER`

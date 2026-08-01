@@ -2,6 +2,7 @@ import type { LogEntry } from '../types';
 import type { LogFormatter } from './types';
 import { LEVEL_TAG } from '../levels';
 import { formatTime } from './timestamp';
+import { renderBody } from './consoleBody';
 
 /**
  * SwiftLogger's default layout minus the `File.swift:42` column (no call-site
@@ -17,37 +18,12 @@ import { formatTime } from './timestamp';
  *           |              | at foo (bundle.js:1:2)
  *
  * See {@link CONTINUATION} for why that indent is load-bearing rather than
- * decorative.
+ * decorative, and `formatters/consoleBody.ts` for everything to the right of
+ * the second `|`, which {@link PlatformConsoleFormatter} renders identically.
  */
 export class DefaultFormatter implements LogFormatter {
   format(entry: LogEntry): string {
-    let tags = '';
-    if (entry.correlation !== undefined) {
-      tags += `[${escapeControls(entry.correlation)}] `;
-    }
-    if (entry.subsystem !== undefined) {
-      tags += `[${escapeControls(entry.subsystem)}] `;
-    }
-
-    let body = `${tags}${formatMessage(entry.message)}`;
-    if (entry.metadata) {
-      const metadata = entry.metadata;
-      const keys = Object.keys(metadata).sort();
-      if (keys.length > 0) {
-        // Appended in place rather than mapped into an array and joined: the
-        // separator is written between the pairs instead of after them, which
-        // is the whole of the difference from `keys.map(…).join(', ')`.
-        body += ' {';
-        for (let i = 0; i < keys.length; i += 1) {
-          if (i > 0) body += ', ';
-          const key = keys[i]!;
-          body += `${escapeControls(key)}=${escapeControls(String(metadata[key]))}`;
-        }
-        body += '}';
-      }
-    }
-
-    return `${LEVEL_TAG[entry.level]} | ${formatTime(entry.timestamp)} | ${body}`;
+    return `${LEVEL_TAG[entry.level]} | ${formatTime(entry.timestamp)} | ${renderBody(entry, CONTINUATION)}`;
   }
 }
 
@@ -63,127 +39,3 @@ export class DefaultFormatter implements LogFormatter {
  * of digits, so a blank in either column cannot be mistaken for one.
  */
 const CONTINUATION = `${' '.repeat(5)} | ${' '.repeat(12)} | `;
-
-/**
- * Renders the message, keeping its lines but never letting one start a record.
- *
- * SwiftLogger leaves `message` completely alone, and this package did too
- * until review pointed out that matching the reference is not the same as
- * being safe. The forgery is the one escaping the structured fields prevents:
- * an error message or an interpolated string carrying
- * `"\nERROR | 00:00:00.000 | patient discharged"` writes a line a reader
- * cannot tell from a real one. Reachability is not theoretical —
- * `no-dynamic-message` is what normally keeps arbitrary text out of this
- * field, and it cannot see a logger wired through a function call.
- *
- * Escaping newlines outright would fix it and ruin the crash handler, which
- * logs stack traces through this field on purpose. Indenting continuation
- * lines keeps them readable and still leaves nothing that parses as a header.
- *
- * This is a deliberate parity difference; docs/PARITY.md records it.
- */
-function formatMessage(message: string): string {
-  // Almost every message is clean, and for a clean one the whole pipeline
-  // below is the identity: nothing to split on means one part, and a part
-  // with nothing to escape comes back out of `escapeControls` as itself.
-  // See {@link NEEDS_ESCAPE} for why that shortcut is exact rather than
-  // approximately right.
-  if (!NEEDS_ESCAPE.test(message)) return message;
-
-  return message
-    .split(LINE_BREAKS)
-    .map(escapeControls)
-    .join(`\n${CONTINUATION}`);
-}
-
-/**
- * The four things besides `\n` that break a line.
- *
- * A bare `\r` does, and can also drag the cursor back over what was already
- * printed. U+0085 (NEL) does for any Unicode-aware reader. U+2028 and U+2029
- * do for anything treating this as JavaScript-flavoured text. `\r\n` leads so
- * that a CRLF costs one break rather than two.
- *
- * Hoisted to module scope because a regex literal is a fresh `RegExp` on
- * every evaluation on Hermes, and this one is evaluated per record. Safe to
- * share only because it carries no `g` flag: a global regex keeps a
- * `lastIndex` between calls and would be a bug the moment it were hoisted.
- */
-const LINE_BREAKS = /\r\n|[\n\r\u0085\u2028\u2029]/;
-
-/**
- * Anything this formatter will not pass through as itself.
- *
- * **A strict superset of {@link LINE_BREAKS}' alphabet, and it must stay
- * one.** That is what makes the fast path in `formatMessage` exact: a message
- * this rejects cannot contain a line break either, so splitting it would
- * yield one part and escaping that part would return it unchanged. Every
- * member is covered — `\n` (U+000A) and `\r` (U+000D) by the C0 range,
- * U+0085 by the C1 range, and U+2028/U+2029 by name. Add a break form here
- * without adding it there and clean-looking messages stop being split; the
- * line-break test in `__tests__/defaultFormatter.test.ts` is what fails.
- *
- * Hoisted for the same reason as `LINE_BREAKS`, and `test` is likewise safe
- * to share only in the absence of `g`.
- */
-// eslint-disable-next-line no-control-regex
-const NEEDS_ESCAPE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
-
-/**
- * Renders C0, DEL, C1, and the Unicode line/paragraph separators as escapes.
- *
- * C1 (U+0080–U+009F) matters as much as C0 here and is easy to forget:
- * U+009B is a single-character CSI, so a terminal will happily read what
- * follows it as a cursor-movement or erase sequence, and U+0085 is NEL,
- * which Unicode-aware readers treat as a line break.
- *
- * U+2028 and U+2029 are here for exactly the reason U+0085 is. They are not
- * control characters and a plain `\n`-splitting reader ignores them, but a
- * JavaScript one does not: `^` and `$` under the `m` flag treat both as line
- * terminators, so a log viewer written in JS — the likely kind for this
- * package — sees a line break where a terminal sees none. That asymmetry is
- * worse than either alone, because the forged line is invisible in the tool
- * someone checks the raw file with.
- *
- * This layout is one entry per line, so a newline inside a *structured* field
- * lets whoever supplied that field forge whole log entries. A correlation ID,
- * a subsystem, or a metadata key or value can all arrive from a request
- * header, a username, or a URL; without this, `"a\nERROR | 00:00:00.000 | "`
- * writes a convincing fake line into the log, and the reader has no way to
- * tell it from a real one.
- *
- * The message takes a different route — see {@link formatMessage} — because
- * it has to stay multi-line. Everything else is escaped outright.
- *
- * Clean fields — essentially all of them — are scanned once and returned
- * whole, so this costs nothing in the normal case.
- */
-function escapeControls(field: string): string {
-  if (!NEEDS_ESCAPE.test(field)) return field;
-
-  let out = '';
-  for (const character of field) {
-    switch (character) {
-      case '\n':
-        out += '\\n';
-        break;
-      case '\r':
-        out += '\\r';
-        break;
-      case '\t':
-        out += '\\t';
-        break;
-      default: {
-        const code = character.codePointAt(0)!;
-        out +=
-          code < 0x20 ||
-          (code >= 0x7f && code <= 0x9f) ||
-          code === 0x2028 ||
-          code === 0x2029
-            ? `\\u{${code.toString(16).toUpperCase()}}`
-            : character;
-      }
-    }
-  }
-  return out;
-}
