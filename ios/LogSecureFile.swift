@@ -207,18 +207,37 @@ internal enum LogSecureFile {
   /// is `EEXIST` and is inspected rather than claimed through.
   @discardableResult
   static func createDirectory(at url: URL) throws -> Shortfall {
-    // Parents first, so the leaf `mkdir` has somewhere to land — and by the
-    // same `mkdir` rule as the leaf, so "did this call create it" is answered
-    // by the kernel for every level rather than only for the last one.
-    var shortfall = try createIntermediates(below: url)
-
-    // Subject to the umask, which is why `secure` re-asserts the mode and reads
-    // it back rather than trusting this argument.
+    // The leaf first, the ancestors only on a miss. Nearly every call finds
+    // the directory already there — this runs twice per open and once per
+    // rotation, under the registry lock — and the ancestor walk costs ~156 µs
+    // of which ~134 µs is pure URL manipulation before any syscall. Both
+    // outcomes of this first `mkdir` make the walk unnecessary: success means
+    // the parent necessarily existed, and `EEXIST` means the leaf does, and a
+    // leaf cannot exist without its ancestors.
+    //
+    // Subject to the umask, which is why `secure` re-asserts the mode and
+    // reads it back rather than trusting this argument.
+    var shortfall = Shortfall()
     if mkdir(url.path, mode_t(directoryMode)) == 0 {
       shortfall.formUnion(secure(createdDirectory: url))
       return shortfall
     }
-    let failure = errno
+    var failure = errno
+
+    if failure != EEXIST {
+      // Anything else — a missing parent, a file where a parent should be, a
+      // permissions wall — is the walk's to diagnose: it reports the precise
+      // ancestor and errno rather than this leaf-level guess. Parents first,
+      // and by the same `mkdir` rule as the leaf, so "did this call create
+      // it" is answered by the kernel for every level rather than only the
+      // last one. Then the leaf again, exactly as before the reorder.
+      shortfall = try createIntermediates(below: url)
+      if mkdir(url.path, mode_t(directoryMode)) == 0 {
+        shortfall.formUnion(secure(createdDirectory: url))
+        return shortfall
+      }
+      failure = errno
+    }
     guard failure == EEXIST else { throw posixError(failure, at: url) }
 
     // `EEXIST` says something is there, not that it is a directory: a regular
