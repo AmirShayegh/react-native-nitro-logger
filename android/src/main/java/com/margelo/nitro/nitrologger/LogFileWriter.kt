@@ -922,10 +922,12 @@ class LogFileWriter internal constructor(
   fun append(
     handleId: Long,
     handleGeneration: Long,
-    batch: String,
+    data: ByteArray,
     entryCount: Long
   ): LogAppendResult {
-    val data = batch.toByteArray(Charsets.UTF_8)
+    // UTF-8 bytes as they arrived (0.4.0) — encoded once, in TypeScript.
+    // Through 0.3.x this took a String and paid `toByteArray` here, after
+    // JNI had already crossed the payload as UTF-16.
     val bytes = data.size.toLong()
 
     stateLock.lock()

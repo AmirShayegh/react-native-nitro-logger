@@ -9,6 +9,18 @@ import type {
 import type { FileSinkLike } from '../../src/destinations/FileDestination';
 import { utf8Length } from '../../src/utf8';
 
+const DECODER = new TextDecoder();
+const ENCODER = new TextEncoder();
+
+/**
+ * `text` as the wire type `appendBatch` takes since 0.4.0, for tests that
+ * call the sink directly rather than through a Batcher.
+ */
+export function utf8Payload(text: string): ArrayBuffer {
+  const bytes = ENCODER.encode(text);
+  return bytes.buffer as ArrayBuffer;
+}
+
 /**
  * A scriptable stand-in for the native file writer.
  *
@@ -343,7 +355,12 @@ export class MemoryFileSink implements FileSinkLike {
     this.generation = this.writer.generation;
   }
 
-  appendBatch(batch: string, entryCount: number): AppendResult {
+  appendBatch(payload: ArrayBuffer, entryCount: number): AppendResult {
+    // Decoded on receipt, so the double records STRINGS: every suite asserts
+    // on the batch the way the file would show it, and the wire type stays
+    // confined to this line — mirroring what the real sink does with the
+    // bytes it is handed.
+    const batch = DECODER.decode(payload);
     this.appendCalls.push({ batch, entryCount });
     if (this.throwNextAppends > 0) {
       this.throwNextAppends -= 1;

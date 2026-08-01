@@ -2,6 +2,7 @@ package com.margelo.nitro.nitrologger
 
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
+import com.margelo.nitro.core.ArrayBuffer
 
 /**
  * The Nitro adapter: marshalling, and nothing else.
@@ -95,8 +96,17 @@ class HybridFileSink : HybridFileSinkSpec() {
     answers.open(path, policyOf(rotation), lineFramed)
   }
 
-  override fun appendBatch(batch: String, entryCount: Double): AppendResult =
-    wireResult(answers.appendBatch(batch, entryCount))
+  override fun appendBatch(batch: ArrayBuffer, entryCount: Double): AppendResult {
+    // Copied, not borrowed: the buffer is JS-owned and only safe inside this
+    // call, and the writer enqueues. `getBuffer(copyIfNeeded = false)` views
+    // the JS bytes in place; the read into the array is the one copy — where
+    // the String this took through 0.3.x crossed JNI as UTF-16 (~2× for JSON
+    // Lines) and was re-encoded to UTF-8 under the handle lock.
+    val view = batch.getBuffer(copyIfNeeded = false)
+    val bytes = ByteArray(view.remaining())
+    view.get(bytes)
+    return wireResult(answers.appendBatch(bytes, entryCount))
+  }
 
   override fun getStatus(): SinkStatus = wireStatus(answers.getStatus())
 

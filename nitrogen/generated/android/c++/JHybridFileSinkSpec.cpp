@@ -39,6 +39,8 @@ namespace margelo::nitro::nitrologger { struct RotationConfig; }
 #include "JClearOutcome.hpp"
 #include "RotationConfig.hpp"
 #include "JRotationConfig.hpp"
+#include <NitroModules/ArrayBuffer.hpp>
+#include <NitroModules/JArrayBuffer.hpp>
 
 namespace margelo::nitro::nitrologger {
 
@@ -81,9 +83,9 @@ namespace margelo::nitro::nitrologger {
     static const auto method = _javaPart->javaClassStatic()->getMethod<void(jni::alias_ref<jni::JString> /* path */, jni::alias_ref<JRotationConfig> /* rotation */, jni::alias_ref<jni::JBoolean> /* lineFramed */)>("open");
     method(_javaPart, jni::make_jstring(path), rotation.has_value() ? JRotationConfig::fromCpp(rotation.value()) : nullptr, lineFramed.has_value() ? jni::JBoolean::valueOf(lineFramed.value()) : nullptr);
   }
-  AppendResult JHybridFileSinkSpec::appendBatch(const std::string& batch, double entryCount) {
-    static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JAppendResult>(jni::alias_ref<jni::JString> /* batch */, double /* entryCount */)>("appendBatch");
-    auto __result = method(_javaPart, jni::make_jstring(batch), entryCount);
+  AppendResult JHybridFileSinkSpec::appendBatch(const std::shared_ptr<ArrayBuffer>& batch, double entryCount) {
+    static const auto method = _javaPart->javaClassStatic()->getMethod<jni::local_ref<JAppendResult>(jni::alias_ref<JArrayBuffer::javaobject> /* batch */, double /* entryCount */)>("appendBatch");
+    auto __result = method(_javaPart, JArrayBuffer::wrap(batch), entryCount);
     return __result->toCpp();
   }
   SinkStatus JHybridFileSinkSpec::getStatus() {

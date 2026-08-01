@@ -1,5 +1,5 @@
 import rows from '../spec/file-sink-lifecycle.rows.json';
-import { MemoryWriter } from './helpers/MemoryFileSink';
+import { MemoryWriter, utf8Payload } from './helpers/MemoryFileSink';
 import type { MemoryFileSink } from './helpers/MemoryFileSink';
 
 /**
@@ -91,7 +91,7 @@ const DISPATCH: Record<
   (sink: MemoryFileSink) => Record<string, string>
 > = {
   appendBatch: (sink) => {
-    const r = pin('appendBatch', sink.appendBatch('{"m":2}\n', 1));
+    const r = pin('appendBatch', sink.appendBatch(utf8Payload('{"m":2}\n'), 1));
     return {
       accepted: String(r.accepted),
       // `??` and not `||`: an implementation that answered `''` here would be
@@ -189,7 +189,7 @@ function neverOpened(): MemoryFileSink {
 function openedThenClosed(): MemoryFileSink {
   const sink = new MemoryWriter().attach();
   sink.open('/memory/logs/app.log', undefined, true);
-  sink.appendBatch('{"m":1}\n', 1);
+  sink.appendBatch(utf8Payload('{"m":1}\n'), 1);
   sink.close(1000);
   return sink;
 }

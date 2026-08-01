@@ -694,10 +694,12 @@ public final class LogWriter {
   func append(
     handleID: UInt64,
     handleGeneration: UInt64,
-    batch: String,
+    batch data: Data,
     entryCount: Int
   ) -> LogAppendResult {
-    let data = Data(batch.utf8)
+    // UTF-8 bytes as they arrived (0.4.0) — encoded once, in TypeScript.
+    // Through 0.3.x this took a String and paid `Data(batch.utf8)` here,
+    // after the bridge had already crossed the payload as UTF-16.
     let bytes = data.count
 
     stateLock.lock()

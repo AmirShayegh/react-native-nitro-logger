@@ -322,3 +322,22 @@ enum TestFlags {
     }
   }
 }
+
+/// String conveniences over the `Data`-typed production surface (0.4.0).
+///
+/// `appendBatch` takes bytes now — encoding happens once, in TypeScript, and
+/// crosses the bridge as an `ArrayBuffer`. Tests still speak in string
+/// literals; these overloads pay the same `Data(_.utf8)` the production path
+/// paid through 0.3.x and forward straight to the shipping method, so every
+/// call site still exercises the real entry point and the real byte counts.
+extension LogFileHandle {
+  func appendBatch(_ batch: String, entryCount: Int) -> LogAppendResult {
+    appendBatch(Data(batch.utf8), entryCount: entryCount)
+  }
+}
+
+extension FileSinkAnswers {
+  func appendBatch(batch: String, entryCount: Double) -> WireAppendResult {
+    appendBatch(batch: Data(batch.utf8), entryCount: entryCount)
+  }
+}

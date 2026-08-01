@@ -55,7 +55,7 @@ namespace margelo::nitro::nitrologger {
   public:
     // Methods
     void open(const std::string& path, const std::optional<RotationConfig>& rotation, std::optional<bool> lineFramed) override;
-    AppendResult appendBatch(const std::string& batch, double entryCount) override;
+    AppendResult appendBatch(const std::shared_ptr<ArrayBuffer>& batch, double entryCount) override;
     SinkStatus getStatus() override;
     FlushOutcome flush(double deadlineMs) override;
     FlushOutcome close(double deadlineMs) override;

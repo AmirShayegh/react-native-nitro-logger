@@ -23,7 +23,7 @@ import { utf8Length } from '../utf8';
 export interface FileSinkLike {
   readonly defaultLogDirectory: string;
   open(path: string, rotation?: RotationConfig, lineFramed?: boolean): void;
-  appendBatch(batch: string, entryCount: number): AppendResult;
+  appendBatch(batch: ArrayBuffer, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
   /**
    * Run rotation and the retention sweep now, bounded by `deadlineMs`, and

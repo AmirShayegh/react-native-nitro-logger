@@ -327,7 +327,7 @@ final class LogRegistryTests: LogWriterTestCase {
     // Wedge the write queue so the close cannot finish immediately.
     let release = writer.stallForTesting()
     _ = writer.append(handleID: 999, handleGeneration: writer.currentGeneration,
-                      batch: "queued\n", entryCount: 1)
+                      batch: Data("queued\n".utf8), entryCount: 1)
 
     let closing = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {

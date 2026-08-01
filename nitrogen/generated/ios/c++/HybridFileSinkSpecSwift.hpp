@@ -18,6 +18,8 @@ namespace margelo::nitro::nitrologger { struct RotationConfig; }
 namespace margelo::nitro::nitrologger { struct AppendResult; }
 // Forward declaration of `RejectReason` to properly resolve imports.
 namespace margelo::nitro::nitrologger { enum class RejectReason; }
+// Forward declaration of `ArrayBufferHolder` to properly resolve imports.
+namespace NitroModules { class ArrayBufferHolder; }
 // Forward declaration of `SinkStatus` to properly resolve imports.
 namespace margelo::nitro::nitrologger { struct SinkStatus; }
 // Forward declaration of `FlushOutcome` to properly resolve imports.
@@ -32,6 +34,8 @@ namespace margelo::nitro::nitrologger { struct ClearOutcome; }
 #include <optional>
 #include "AppendResult.hpp"
 #include "RejectReason.hpp"
+#include <NitroModules/ArrayBuffer.hpp>
+#include <NitroModules/ArrayBufferHolder.hpp>
 #include "SinkStatus.hpp"
 #include "FlushOutcome.hpp"
 #include <vector>
@@ -97,8 +101,8 @@ namespace margelo::nitro::nitrologger {
         std::rethrow_exception(__result.error());
       }
     }
-    inline AppendResult appendBatch(const std::string& batch, double entryCount) override {
-      auto __result = _swiftPart.appendBatch(batch, std::forward<decltype(entryCount)>(entryCount));
+    inline AppendResult appendBatch(const std::shared_ptr<ArrayBuffer>& batch, double entryCount) override {
+      auto __result = _swiftPart.appendBatch(ArrayBufferHolder(batch), std::forward<decltype(entryCount)>(entryCount));
       if (__result.hasError()) [[unlikely]] {
         std::rethrow_exception(__result.error());
       }

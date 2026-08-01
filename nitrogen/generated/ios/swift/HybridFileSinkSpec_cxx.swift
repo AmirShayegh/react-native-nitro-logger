@@ -148,9 +148,9 @@ open class HybridFileSinkSpec_cxx {
   }
   
   @inline(__always)
-  public final func appendBatch(batch: std.string, entryCount: Double) -> bridge.Result_AppendResult_ {
+  public final func appendBatch(batch: ArrayBuffer, entryCount: Double) -> bridge.Result_AppendResult_ {
     do {
-      let __result = try self.__implementation.appendBatch(batch: String(batch), entryCount: entryCount)
+      let __result = try self.__implementation.appendBatch(batch: batch, entryCount: entryCount)
       let __resultCpp = __result
       return bridge.create_Result_AppendResult_(__resultCpp)
     } catch (let __error) {

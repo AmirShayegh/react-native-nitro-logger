@@ -249,7 +249,7 @@ class FileSinkAnswers(
     }
   }
 
-  fun appendBatch(batch: String, entryCount: Double): WireAppendResult {
+  fun appendBatch(batch: ByteArray, entryCount: Double): WireAppendResult {
     val live = current() ?: return WireAppendResult(
       false, WireRejectReason.CLOSED, 0.0, 0.0, 0.0, 0.0
     )

@@ -14,7 +14,7 @@ public protocol HybridFileSinkSpec_protocol: HybridObject {
 
   // Methods
   func open(path: String, rotation: RotationConfig?, lineFramed: Bool?) throws -> Void
-  func appendBatch(batch: String, entryCount: Double) throws -> AppendResult
+  func appendBatch(batch: ArrayBuffer, entryCount: Double) throws -> AppendResult
   func getStatus() throws -> SinkStatus
   func flush(deadlineMs: Double) throws -> FlushOutcome
   func close(deadlineMs: Double) throws -> FlushOutcome

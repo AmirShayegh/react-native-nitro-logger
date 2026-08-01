@@ -581,7 +581,7 @@ class LogFileHandle internal constructor(
 
   private fun inertStatus() = LogSinkStatus(0, 0, 0, 0)
 
-  fun appendBatch(batch: String, entryCount: Long): LogAppendResult = lock.withLock {
+  fun appendBatch(batch: ByteArray, entryCount: Long): LogAppendResult = lock.withLock {
     if (state != State.ACTIVE) {
       return LogAppendResult(false, LogRejectReason.CLOSED, inertStatus())
     }

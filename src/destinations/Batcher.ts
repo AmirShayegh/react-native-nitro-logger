@@ -13,10 +13,38 @@ import { clampDeadline, startDeadline } from '../deadline';
  * double, with no native runtime and no filesystem.
  */
 export interface BatchTarget {
-  appendBatch(batch: string, entryCount: number): AppendResult;
+  appendBatch(batch: ArrayBuffer, entryCount: number): AppendResult;
   getStatus(): SinkStatus;
   maintain(deadlineMs: number): SinkStatus;
   flush(deadlineMs: number): FlushOutcome;
+}
+
+/**
+ * One encoder for every batch this module ever sends.
+ *
+ * The sink takes UTF-8 bytes (0.4.0; a string through 0.3.x), and this is
+ * the one place they are made: beside the join, once per batch. A string
+ * handed to Nitro crossed the bridge as UTF-16 — roughly 2× the payload for
+ * JSON Lines — and was then re-encoded to UTF-8 on each platform; bytes
+ * cross once and are written as-is.
+ */
+const BATCH_ENCODER = new TextEncoder();
+
+/**
+ * `text` as UTF-8 in a buffer that spans EXACTLY the encoded bytes.
+ *
+ * Exactness is load-bearing: the sink reserves against `byteLength`, and a
+ * buffer wider than its content would reserve for bytes that never arrive
+ * and write garbage after the ones that did. `encode()` allocates exactly on
+ * every engine shipped today; the slice is the written-down fallback for one
+ * that ever over-allocates, not a path anything is expected to take.
+ */
+function encodeBatch(text: string): ArrayBuffer {
+  const bytes = BATCH_ENCODER.encode(text);
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+  return bytes.slice().buffer;
 }
 
 /**
@@ -629,7 +657,7 @@ export class Batcher {
 
     let result: AppendResult;
     try {
-      result = this.target.appendBatch(batch, batchEntryCount);
+      result = this.target.appendBatch(encodeBatch(batch), batchEntryCount);
     } catch {
       // A throwing sink is a failing sink. The batch is gone either way.
       this.loseHead(entryCount, entryBytes);
