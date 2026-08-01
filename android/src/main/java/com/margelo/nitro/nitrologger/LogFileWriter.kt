@@ -317,7 +317,7 @@ class LogFileWriter internal constructor(
       for (name in names) {
         if (!isArchiveName(name, baseName)) continue
         val file = File(directory, name)
-        artifacts.add(Artifact(file, file.lastModified(), file.length()))
+        artifacts.add(Artifact(file, file.lastModified()))
       }
       artifacts.sortWith(
         compareByDescending<Artifact> { it.modified }.thenByDescending { it.file.name }
@@ -1862,7 +1862,15 @@ class LogFileWriter internal constructor(
 
   // MARK: - Retention (executor only)
 
-  data class Artifact(val file: File, val modified: Long, val size: Long)
+  /**
+   * No size field on purpose: `File.length()` is a stat(2) per archive per
+   * enumeration on Android, and the only reader of sizes is the
+   * `maxTotalLogBytes` pass — null by default — which stats the survivors
+   * itself when it runs. (The iOS twin keeps size in its Artifact because it
+   * prefetches both values in the one directory enumeration; the platforms'
+   * listing contracts differ, so the shapes do.)
+   */
+  data class Artifact(val file: File, val modified: Long)
 
   /**
    * Applies all three retention limits. Runs at open, after each rotation, and
@@ -1936,13 +1944,19 @@ class LogFileWriter internal constructor(
     }
 
     policy.maxTotalLogBytes?.let { cap ->
-      var total = currentFileSize + archives.sumOf { it.size }
-      val remaining = archives.toMutableList()
-      // Newest-first order, so dropping from the end sheds the oldest.
-      while (total > cap && remaining.isNotEmpty()) {
-        val oldest = remaining.removeAt(remaining.size - 1)
-        remove(oldest.file)
-        total = if (total > oldest.size) total - oldest.size else 0
+      // Sizes are read here and nowhere else, so they are measured here and
+      // nowhere else — on the survivors of the age and count passes, only
+      // when a byte cap is configured at all. The measurement still happens
+      // before any shedding, so the pass works on one consistent snapshot.
+      val sizes = LongArray(archives.size) { archives[it].file.length() }
+      var total = currentFileSize + sizes.sum()
+      var oldest = archives.size - 1
+      // Newest-first order, so shedding from the end sheds the oldest.
+      while (total > cap && oldest >= 0) {
+        remove(archives[oldest].file)
+        val shed = sizes[oldest]
+        total = if (total > shed) total - shed else 0
+        oldest -= 1
       }
     }
 

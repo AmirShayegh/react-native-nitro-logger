@@ -426,6 +426,51 @@ class LogFileWriterTest {
   }
 
   @Test
+  fun `the byte cap sheds the oldest archives first`() {
+    val w = writer(
+      policy = LogRotationPolicy.of(
+        maxFileSizeBytes = 16.0,
+        maxArchivedFilesCount = 50.0,
+        maxTotalLogBytes = 60.0
+      )
+    )
+
+    // Each record is 17 bytes; each write past the first rotates the previous
+    // one into a 17-byte archive. The sweep runs before the reopen, so it
+    // charges the just-archived file's 17 tracked bytes plus the archives:
+    // 17 + 2×17 = 51 fits under 60, a third archive (68) does not — the cap
+    // admits exactly two archives, and they must be the two NEWEST.
+    // The clock moves BEFORE each write, so the stamp a rotation takes is
+    // pinned no matter when the executor gets to the append — advancing after
+    // the enqueue would race the increment against the writer thread.
+    val start = now.get()
+    repeat(6) {
+      now.addAndGet(1_000)
+      w.write("0123456789012345\n")
+      w.flush(1, 1000.0)
+      w.settleForTesting()
+    }
+
+    // The expectation is derived from the clock, not sampled from the
+    // directory: a sweep that sheds the NEWEST archive deletes it inside the
+    // very rotation that created it, so a sampling loop only ever sees
+    // survivors and is satisfied by exactly the bug this exists to catch.
+    // Write r happens with the clock at start + r seconds and rotation runs
+    // on writes 2 through 6, so the survivors must carry the stamps of
+    // seconds 5 and 6.
+    val stampFormat = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US)
+      .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+    val expected = listOf(5L, 6L)
+      .map { stampFormat.format(java.util.Date(start + it * 1000)) }
+      .sorted()
+    val survivorStamps = archives()
+      .map { it.removePrefix("app.log.").substringBefore("_") }
+      .sorted()
+    assertEquals("the byte cap must keep the newest two archives",
+                 expected, survivorStamps)
+  }
+
+  @Test
   fun `archives older than the age cap are swept`() {
     val w = writer(
       policy = LogRotationPolicy.of(
