@@ -505,6 +505,23 @@ class LogFileWriter internal constructor(
    */
   private val collectLock = ReentrantLock()
   private var reservedBytes = 0L
+
+  /**
+   * Bumped by a purge, compared by the executor before bytes land.
+   *
+   * `@Volatile` so the fence read in [performWrite] is a volatile load
+   * rather than a third [stateLock] acquisition on every append. The bump
+   * stays under [stateLock] — it is paired with the loss and degradation
+   * reset in [clearLogs], and those three must move as one — but the
+   * executor-side read needs only visibility, not atomicity with anything:
+   * the fence holds on BOTH sides of the race. A read that observes the
+   * bump drops the batch; a read the bump has not reached yet lets the
+   * batch land in the pre-purge file, which the sweep — enqueued behind it
+   * on the same executor, after the bump — then deletes. What volatile
+   * guarantees is exactly the part that matters: once bumped, no later
+   * read answers with the old generation.
+   */
+  @Volatile
   private var generation = 1L
   private var closed = false
   private var degraded = LogDegradation.NONE
@@ -975,7 +992,20 @@ class LogFileWriter internal constructor(
         return
       }
 
-      val stale = stateLock.withLock { writeGeneration != generation }
+      // A volatile load, not a lock acquire — see [generation] for why the
+      // fence needs visibility and nothing else from this read.
+      //
+      // (Recorded: the DROP half of this fence is pinned — a mutant that
+      // counts the fenced batch as loss fails "in-flight bytes from before a
+      // purge are dropped without being counted lost" — but a mutant that
+      // never drops survives the suite. The interleaving it would corrupt, a
+      // stale write running AFTER the sweep, needs the enqueue in [append] to
+      // land behind the purge's sweep task, and the only window for that is
+      // between append's stateLock release and its executor.execute — which
+      // has no test seam, and had none when this read held stateLock either.
+      // On the forceable interleavings the executor's FIFO order makes an
+      // unfenced stale write land in the file the sweep then deletes.)
+      val stale = writeGeneration != generation
       if (stale) {
         // A purge landed between acceptance and here. These bytes belong to a
         // file that was deliberately deleted, so they are dropped WITHOUT being
