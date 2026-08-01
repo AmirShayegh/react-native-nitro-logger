@@ -2131,29 +2131,37 @@ function describeCall(context, node) {
   if (!callee) return null;
 
   if (callee.type === 'MemberExpression') {
+    // The callee's own property name, read once and used throughout: it is
+    // `call`/`apply` when the call is forwarded and the API method when it is
+    // direct. This was read twice, and the second read repeated the entire
+    // resolution — for a computed callee, a fresh walk through
+    // `staticStringValue` and everything it resolves.
+    const method = staticPropertyName(context, callee);
+
     // `Log.info.call(thisArg, message, …)` / `.apply(thisArg, argsArray)`
-    const outer = staticPropertyName(context, callee);
-    if (outer === 'call' || outer === 'apply') {
+    if (method === 'call' || method === 'apply') {
       const inner = unwrap(callee.object);
       if (inner && inner.type === 'MemberExpression') {
-        const method = staticPropertyName(context, inner);
-        if (method !== null && API_METHODS.has(method)) {
+        // The method being forwarded TO, which is the one that gets reported.
+        // Named apart from `method` because the two were both called `method`
+        // in their own scopes, and they are different nodes' property names.
+        const target = staticPropertyName(context, inner);
+        if (target !== null && API_METHODS.has(target)) {
           const receiver = receiverOf(context, inner.object, node);
           if (receiver === null) return null;
-          const args = outer === 'call' ? node.arguments.slice(1) : [];
+          const args = method === 'call' ? node.arguments.slice(1) : [];
           return {
-            method,
+            method: target,
             receiver,
             // `.apply` passes an array — positional analysis is meaningless,
             // so report only that the call exists.
             args,
-            spreadArgs: outer === 'apply' || hasSpread(args),
+            spreadArgs: method === 'apply' || hasSpread(args),
           };
         }
       }
     }
 
-    const method = staticPropertyName(context, callee);
     // The container walk runs only when the method says this could be a
     // logger call at all — `cache.get(key)` has no business paying for it —
     // and `receiverOf` is where the precedence between the walk and the name
