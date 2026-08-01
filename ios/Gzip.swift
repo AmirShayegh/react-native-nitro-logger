@@ -9,30 +9,17 @@ import Compression
 /// that `gunzip` and every other standard tool can open means supplying the
 /// gzip header and the trailing CRC-32 and length ourselves.
 ///
-/// Vendored unchanged from SwiftLogger (`Sources/Logger/Gzip.swift`). Kept
-/// byte-identical on purpose: it is the piece with the least reason to diverge
-/// and the most reason to stay diffable against the original.
+/// Vendored from SwiftLogger (`Sources/Logger/Gzip.swift`), since diverged for
+/// throughput: the CRC uses eight lookup tables instead of one and the chunk
+/// loop reuses its buffers instead of allocating per read. The bytes written —
+/// header, DEFLATE stream, trailer — are unchanged, and the CRC is still
+/// CRC-32/ISO-HDLC, pinned by the published check value in the rotation tests
+/// rather than by this file's word.
 internal enum Gzip {
 
     /// Header: magic, DEFLATE method, no flags, no mtime, no extra flags, and
     /// an unknown OS (255) so the output is reproducible.
     private static let header: [UInt8] = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]
-
-    /// Returns `data` as a gzip stream, or `nil` if compression fails.
-    static func compress(_ data: Data) -> Data? {
-        guard let deflated = deflate(data) else { return nil }
-
-        var output = Data(capacity: deflated.count + 18)
-        output.append(contentsOf: header)
-        output.append(deflated)
-
-        // Trailer: CRC-32 of the *uncompressed* data, then its length mod 2^32,
-        // both little-endian.
-        appendLittleEndian(&output, crc32(data))
-        appendLittleEndian(&output, UInt32(truncatingIfNeeded: data.count))
-
-        return output
-    }
 
     /// Size of each read from the source file. Two of these are live at a time,
     /// so peak memory is bounded regardless of how large the archive is.
@@ -41,10 +28,13 @@ internal enum Gzip {
     /// Compresses the file at `source` into a gzip file at `destination`,
     /// streaming in fixed-size chunks.
     ///
-    /// ``compress(_:)`` holds the whole input, the whole DEFLATE output, and
-    /// the assembled container in memory at once — roughly 2.5× a 10 MB archive
-    /// on the write queue. This reads and deflates incrementally instead, so a
-    /// rotation costs two 64 KB buffers no matter how big the log grew.
+    /// Reads and deflates incrementally, so a rotation costs two 64 KB buffers
+    /// no matter how big the log grew — a whole-buffer compress would hold
+    /// roughly 2.5× a 10 MB archive in memory at once on the write queue. Both
+    /// buffers are allocated once and reused for every chunk, and the bytes
+    /// move through `read(2)`/`write(2)` directly rather than through a fresh
+    /// `Data` per chunk; this loop runs on the writer queue that every append
+    /// waits behind.
     ///
     /// Returns `false` and removes any partial output if anything fails, so the
     /// caller can keep the uncompressed original.
@@ -77,6 +67,8 @@ internal enum Gzip {
                 == COMPRESSION_STATUS_OK else { return false }
         defer { compression_stream_destroy(&stream) }
 
+        let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { inputBuffer.deallocate() }
         let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
         defer { outputBuffer.deallocate() }
 
@@ -90,46 +82,43 @@ internal enum Gzip {
             // gunzip happily verifies while the caller deletes the complete
             // original. Silent truncation is far worse than a failed rotation.
             //
-            // `read(upToCount:)` returns nil at EOF and throws on error, so the
-            // two must be distinguished rather than collapsed with `try?`.
-            let chunk: Data
-            do {
-                chunk = try input.read(upToCount: chunkSize) ?? Data()
-            } catch {
-                return false
-            }
-            let isLast = chunk.isEmpty
-            totalRead += chunk.count
-            crc = crc32Update(crc, chunk)
+            // `read(2)` returns 0 at EOF and -1 on error, so the two must be
+            // distinguished rather than collapsed. `EINTR` is neither.
+            // (Recorded: not pinned — a mutant collapsing -1 into EOF survives
+            // the suite, because inducing a read error on a healthy temp file
+            // needs fault injection. The FileHandle throw this replaced was
+            // equally unpinned; the reasoning above is the guard.)
+            var readCount = 0
+            repeat {
+                readCount = Darwin.read(input.fileDescriptor, inputBuffer, chunkSize)
+            } while readCount == -1 && errno == EINTR
+            guard readCount >= 0 else { return false }
 
-            let ok = chunk.withUnsafeBytes { raw -> Bool in
-                // An empty Data has no base address; the encoder accepts a
-                // zero-length source as long as the pointer is non-null.
-                let base = raw.bindMemory(to: UInt8.self).baseAddress
-                    ?? UnsafePointer<UInt8>(bitPattern: -1)!
-                stream.src_ptr = base
-                stream.src_size = chunk.count
-                let flags = isLast ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+            let isLast = readCount == 0
+            totalRead += readCount
+            crc = crc32Update(crc, UnsafeRawBufferPointer(start: inputBuffer, count: readCount))
 
-                // One source chunk can expand into several output chunks, so
-                // keep draining until the encoder stops filling the buffer.
-                repeat {
-                    stream.dst_ptr = outputBuffer
-                    stream.dst_size = chunkSize
-                    let status = compression_stream_process(&stream, flags)
-                    guard status != COMPRESSION_STATUS_ERROR else { return false }
+            stream.src_ptr = UnsafePointer(inputBuffer)
+            stream.src_size = readCount
+            let flags = isLast ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
 
-                    let produced = chunkSize - stream.dst_size
-                    if produced > 0 {
-                        let out = Data(bytes: outputBuffer, count: produced)
-                        guard (try? output.write(contentsOf: out)) != nil else { return false }
+            // One source chunk can expand into several output chunks, so
+            // keep draining until the encoder stops filling the buffer.
+            repeat {
+                stream.dst_ptr = outputBuffer
+                stream.dst_size = chunkSize
+                let status = compression_stream_process(&stream, flags)
+                guard status != COMPRESSION_STATUS_ERROR else { return false }
+
+                let produced = chunkSize - stream.dst_size
+                if produced > 0 {
+                    guard writeFully(output.fileDescriptor, outputBuffer, produced) else {
+                        return false
                     }
-                    if status == COMPRESSION_STATUS_END { break }
-                } while stream.src_size > 0 || (isLast && stream.dst_size == 0)
+                }
+                if status == COMPRESSION_STATUS_END { break }
+            } while stream.src_size > 0 || (isLast && stream.dst_size == 0)
 
-                return true
-            }
-            guard ok else { return false }
             if isLast { break }
         }
 
@@ -147,55 +136,92 @@ internal enum Gzip {
         withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
     }
 
-    private static func deflate(_ data: Data) -> Data? {
-        guard !data.isEmpty else { return Data() }
-
-        // Incompressible input can grow slightly, so leave headroom rather than
-        // letting the encode fail on a tight buffer.
-        let capacity = data.count + (data.count / 2) + 64
-        let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-        defer { destination.deallocate() }
-
-        let written = data.withUnsafeBytes { raw -> Int in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-            return compression_encode_buffer(
-                destination, capacity,
-                base, data.count,
-                nil,
-                COMPRESSION_ZLIB
-            )
+    /// `write(2)` until every byte is out or the error is real. A short write
+    /// is not a failure, and `EINTR` is not an error.
+    private static func writeFully(
+        _ descriptor: Int32, _ buffer: UnsafePointer<UInt8>, _ count: Int
+    ) -> Bool {
+        var done = 0
+        while done < count {
+            let wrote = Darwin.write(descriptor, buffer + done, count - done)
+            if wrote > 0 { done += wrote; continue }
+            if wrote == -1 && errno == EINTR { continue }
+            return false
         }
-
-        guard written > 0 else { return nil }
-        return Data(bytes: destination, count: written)
+        return true
     }
 
     // MARK: - CRC-32
 
-    private static let crcTable: [UInt32] = {
-        (0..<256).map { index -> UInt32 in
+    /// Slicing-by-8: `tables[0]` is the classic single byte-at-a-time table;
+    /// `tables[k][b]` is the CRC of byte `b` followed by `k` zero bytes, so
+    /// eight input bytes fold into the register with eight independent lookups
+    /// instead of eight serially dependent ones. Same polynomial (0xEDB88320,
+    /// reflected), same answer for every input — the published check value and
+    /// the every-table-index vector in the rotation tests are the proof, and
+    /// they cover both the 8-byte stride and the byte-at-a-time tail.
+    private static let crcTables: [[UInt32]] = {
+        var tables = Array(repeating: [UInt32](repeating: 0, count: 256), count: 8)
+        for index in 0..<256 {
             var value = UInt32(index)
             for _ in 0..<8 {
                 value = (value & 1 == 1) ? (0xEDB8_8320 ^ (value >> 1)) : (value >> 1)
             }
-            return value
+            tables[0][index] = value
         }
+        for index in 0..<256 {
+            var value = tables[0][index]
+            for slice in 1..<8 {
+                value = tables[0][Int(value & 0xFF)] ^ (value >> 8)
+                tables[slice][index] = value
+            }
+        }
+        return tables
     }()
 
     static func crc32(_ data: Data) -> UInt32 {
-        crc32Update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+        var value: UInt32 = 0xFFFF_FFFF
+        data.withUnsafeBytes { raw in
+            value = crc32Update(value, raw)
+        }
+        return value ^ 0xFFFF_FFFF
     }
 
-    /// Folds `data` into a running CRC-32. The caller supplies the initial
+    /// Folds `buffer` into a running CRC-32. The caller supplies the initial
     /// `0xFFFF_FFFF` and applies the final inversion, so a checksum can be
     /// accumulated across streamed chunks.
-    private static func crc32Update(_ crc: UInt32, _ data: Data) -> UInt32 {
-        guard !data.isEmpty else { return crc }
+    private static func crc32Update(_ crc: UInt32, _ buffer: UnsafeRawBufferPointer) -> UInt32 {
+        guard let base = buffer.bindMemory(to: UInt8.self).baseAddress else { return crc }
+        let count = buffer.count
         var value = crc
-        data.withUnsafeBytes { raw in
-            for byte in raw.bindMemory(to: UInt8.self) {
-                value = crcTable[Int((value ^ UInt32(byte)) & 0xFF)] ^ (value >> 8)
-            }
+        var index = 0
+
+        // Byte-by-byte composition of the two 32-bit halves keeps this
+        // endian-independent; the table indices, not the load order, carry
+        // the algorithm.
+        while index + 8 <= count {
+            let low = value
+                ^ (UInt32(base[index])
+                    | UInt32(base[index + 1]) << 8
+                    | UInt32(base[index + 2]) << 16
+                    | UInt32(base[index + 3]) << 24)
+            let high = UInt32(base[index + 4])
+                | UInt32(base[index + 5]) << 8
+                | UInt32(base[index + 6]) << 16
+                | UInt32(base[index + 7]) << 24
+            value = crcTables[7][Int(low & 0xFF)]
+                ^ crcTables[6][Int((low >> 8) & 0xFF)]
+                ^ crcTables[5][Int((low >> 16) & 0xFF)]
+                ^ crcTables[4][Int(low >> 24)]
+                ^ crcTables[3][Int(high & 0xFF)]
+                ^ crcTables[2][Int((high >> 8) & 0xFF)]
+                ^ crcTables[1][Int((high >> 16) & 0xFF)]
+                ^ crcTables[0][Int(high >> 24)]
+            index += 8
+        }
+        while index < count {
+            value = crcTables[0][Int((value ^ UInt32(base[index])) & 0xFF)] ^ (value >> 8)
+            index += 1
         }
         return value
     }
