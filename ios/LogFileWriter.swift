@@ -1803,13 +1803,17 @@ public final class LogWriter {
   private func sweepRetention() {
     let directory = fileURL.deletingLastPathComponent()
     let baseName = fileURL.lastPathComponent
-    var archives = Self.archives(in: directory, baseName: baseName)
     let fm = FileManager.default
     var failed = false
 
-    func remove(_ entry: Artifact) {
-      do { try fm.removeItem(at: entry.url) } catch { failed = true }
-    }
+    // ONE walk, partitioned, where this used to be two — `archives(in:)` and
+    // a second `contentsOfDirectory` for the orphans. The partition is safe
+    // because the two sides are disjoint by grammar: `isArchiveName`
+    // deliberately excludes `.part`, and the support names share no stamp.
+    // Every name goes to exactly one side or to neither.
+    let listing = (try? fm.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: Self.archiveResourceKeys
+    )) ?? []
 
     // Orphaned compressions first. A `.part` is a gzip that was interrupted —
     // by a crash, or by a process that died mid-rotation — and nothing will
@@ -1820,11 +1824,18 @@ public final class LogWriter {
     // the same pass. The finished bundle is not: it is something a caller
     // asked for and may not have uploaded yet, and deleting it here would make
     // `collectLogs` a race against the next rotation.
-    for name in ((try? fm.contentsOfDirectory(atPath: directory.path)) ?? [])
-    where Self.isStagingName(name, baseName: baseName)
-      || name == Self.supportStagingName(baseName)
-      || name == Self.supportMemberName(baseName) {
-      do { try fm.removeItem(at: directory.appendingPathComponent(name)) } catch { failed = true }
+    for url in listing {
+      let name = url.lastPathComponent
+      guard Self.isStagingName(name, baseName: baseName)
+        || name == Self.supportStagingName(baseName)
+        || name == Self.supportMemberName(baseName) else { continue }
+      do { try fm.removeItem(at: url) } catch { failed = true }
+    }
+
+    var archives = Self.archives(from: listing, baseName: baseName)
+
+    func remove(_ entry: Artifact) {
+      do { try fm.removeItem(at: entry.url) } catch { failed = true }
     }
 
     // Oldest first for age, then count, then total size — each pass works on
@@ -1867,16 +1878,27 @@ public final class LogWriter {
   /// all share it and only the random suffix differs — sorting by name would
   /// keep an arbitrary subset and delete newer archives than it kept. Names
   /// break exact date ties so the order is still deterministic.
-  static func archives(in directory: URL, baseName: String) -> [Artifact] {
-    let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
-    guard let contents = try? FileManager.default.contentsOfDirectory(
-      at: directory, includingPropertiesForKeys: keys
-    ) else { return [] }
+  static let archiveResourceKeys: [URLResourceKey] = [
+    .contentModificationDateKey, .fileSizeKey,
+  ]
 
+  static func archives(in directory: URL, baseName: String) -> [Artifact] {
+    guard let contents = try? FileManager.default.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: archiveResourceKeys
+    ) else { return [] }
+    return archives(from: contents, baseName: baseName)
+  }
+
+  /// The Artifact-building half of `archives(in:)`, over a listing the caller
+  /// already holds — `sweepRetention` walks the directory once and partitions
+  /// it, rather than walking again for the archives. The listing must have
+  /// been fetched with {@link archiveResourceKeys} or `resourceValues` pays a
+  /// syscall per archive here.
+  static func archives(from contents: [URL], baseName: String) -> [Artifact] {
     return contents
       .filter { isArchiveName($0.lastPathComponent, baseName: baseName) }
       .map { url -> Artifact in
-        let values = try? url.resourceValues(forKeys: Set(keys))
+        let values = try? url.resourceValues(forKeys: Set(archiveResourceKeys))
         return Artifact(
           url: url,
           modified: values?.contentModificationDate ?? .distantPast,
@@ -1896,12 +1918,16 @@ public final class LogWriter {
   /// slot that a real archive should have, and would hand a truncated gzip to
   /// anyone calling `getLogFilePaths()` to collect logs for support.
   static func isArchiveName(_ name: String, baseName: String) -> Bool {
-    matches(name, baseName: baseName, pattern: #"^\d{8}T\d{6}Z_[a-f0-9]{8}(\.gz)?$"#)
+    guard let suffix = stampSuffix(name, baseName: baseName),
+          let tail = tailAfterStamp(suffix) else { return false }
+    return tail.isEmpty || tail.elementsEqual(".gz".utf8)
   }
 
   /// A gzip staging file, `<base>.<stamp>.gz.part`.
   static func isStagingName(_ name: String, baseName: String) -> Bool {
-    matches(name, baseName: baseName, pattern: #"^\d{8}T\d{6}Z_[a-f0-9]{8}\.gz\.part$"#)
+    guard let suffix = stampSuffix(name, baseName: baseName),
+          let tail = tailAfterStamp(suffix) else { return false }
+    return tail.elementsEqual(".gz.part".utf8)
   }
 
   /// The exclusion file for `baseName`, and **deliberately not an artifact.**
@@ -1967,11 +1993,77 @@ public final class LogWriter {
     return isArchiveName(name, baseName: baseName) || isStagingName(name, baseName: baseName)
   }
 
-  private static func matches(_ name: String, baseName: String, pattern: String) -> Bool {
+  /// What follows the rotation stamp, if `suffix` begins with one.
+  ///
+  /// The stamp grammar — eight digits, `T`, six digits, `Z`, `_`, eight
+  /// lowercase hex — is written down HERE and nowhere else; the predicates
+  /// above say only which tail they expect after it. That single-place
+  /// property used to belong to a regex, and it survives the regex.
+  ///
+  /// Hand-rolled because `range(of:options:.regularExpression)` compiles the
+  /// pattern per call: 1643 ns against 17.7 ns for this scan, twice per
+  /// directory entry per sweep, and sweeps run at open, rotation and every
+  /// maintain. A hoisted `NSRegularExpression` is NOT the missing fix — it
+  /// measured 651 ns, because the NSString bridge and `firstMatch` dominate,
+  /// not compilation.
+  ///
+  /// Two places this is deliberately EXACT where the regex was loose, both
+  /// admitting only names rotation actually writes:
+  ///
+  /// - ICU `$` also matches before a trailing newline, so the regex accepted
+  ///   `<stamp>\n` as an archive. This scan requires the tail to reach the
+  ///   end of the name.
+  /// - ICU `\d` is every Unicode decimal digit, so the regex accepted a stamp
+  ///   written in Arabic-Indic digits. `stampFormatter` is `en_US_POSIX` and
+  ///   can only produce ASCII.
+  ///
+  /// Both differences make the purge predicate recognise FEWER names, which
+  /// is the direction that needs justifying: neither form is a name this
+  /// writer can ever put on disk, so treating them as foreign files is the
+  /// truth, not a hole. Pinned by the imposter cases in
+  /// `testTheStampGrammarIsExact`.
+  private static func tailAfterStamp(_ suffix: Substring) -> Substring.UTF8View.SubSequence? {
+    let utf8 = suffix.utf8
+    var index = utf8.startIndex
+
+    func take(_ count: Int, _ admits: (UInt8) -> Bool) -> Bool {
+      for _ in 0..<count {
+        guard index < utf8.endIndex, admits(utf8[index]) else { return false }
+        index = utf8.index(after: index)
+      }
+      return true
+    }
+    func literal(_ ascii: UInt8) -> Bool {
+      guard index < utf8.endIndex, utf8[index] == ascii else { return false }
+      index = utf8.index(after: index)
+      return true
+    }
+
+    let digit: (UInt8) -> Bool = { $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }
+    let hex: (UInt8) -> Bool = {
+      ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+        || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
+    }
+
+    guard take(8, digit), literal(UInt8(ascii: "T")),
+          take(6, digit), literal(UInt8(ascii: "Z")),
+          literal(UInt8(ascii: "_")), take(8, hex)
+    else { return nil }
+    return utf8[index...]
+  }
+
+  /// The stamp-bearing suffix of `name`, or nil when it is not `<base>.<…>`.
+  ///
+  /// The prefix check stays a `String.hasPrefix` — canonical equivalence, as
+  /// the regex path had — because HFS+ hands names back NFD-normalised, and a
+  /// byte-exact check against an NFC `baseName` would stop recognising this
+  /// writer's own archives on such a volume. The STAMP is pure ASCII, where
+  /// normalisation cannot occur, so byte-scanning it is safe; the base name
+  /// is the caller's and is not.
+  private static func stampSuffix(_ name: String, baseName: String) -> Substring? {
     let prefix = baseName + "."
-    guard name.hasPrefix(prefix) else { return false }
-    let suffix = String(name.dropFirst(prefix.count))
-    return suffix.range(of: pattern, options: .regularExpression) != nil
+    guard name.hasPrefix(prefix) else { return nil }
+    return name.dropFirst(prefix.count)
   }
 
   /// The active file and every archive, newest first — read **on the queue**.

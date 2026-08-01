@@ -112,6 +112,54 @@ final class LogRotationTests: LogWriterTestCase {
     }
   }
 
+  /// The stamp grammar, spelled out case by case against the scan that
+  /// replaced the regex. The imposter cases at the end pin two places the
+  /// scan is deliberately EXACT where ICU was loose: `$` also matched before
+  /// a trailing newline, and `\d` admitted every Unicode decimal digit.
+  /// Neither form is a name rotation can write — `stampFormatter` is
+  /// `en_US_POSIX` — so recognising them was the bug, not the behaviour.
+  func testTheStampGrammarIsExact() {
+    let base = "app.log"
+    let stamp = "20260731T121530Z_00c0ffee"
+
+    XCTAssertTrue(LogWriter.isArchiveName("\(base).\(stamp)", baseName: base))
+    XCTAssertTrue(LogWriter.isArchiveName("\(base).\(stamp).gz", baseName: base))
+    XCTAssertTrue(LogWriter.isStagingName("\(base).\(stamp).gz.part", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp).gz.part", baseName: base),
+                   "a staging file must never occupy an archive's retention slot")
+    XCTAssertFalse(LogWriter.isStagingName("\(base).\(stamp).gz", baseName: base))
+
+    // Each field one character short, one long, or the wrong alphabet.
+    for bad in [
+      "2026073T121530Z_00c0ffee",     // seven date digits
+      "202607311T121530Z_00c0ffee",   // nine
+      "20260731T12153Z_00c0ffee",     // five time digits
+      "20260731T1215301Z_00c0ffee",   // seven
+      "20260731X121530Z_00c0ffee",    // wrong separator
+      "20260731T121530A_00c0ffee",    // wrong zone letter
+      "20260731T121530Z-00c0ffee",    // wrong joiner
+      "20260731T121530Z_00c0ffe",     // seven hex
+      "20260731T121530Z_00c0ffee0",   // nine
+      "20260731T121530Z_00C0FFEE",    // uppercase hex — rotation never writes it
+      "20260731T121530Z_00g0ffee",    // not hex at all
+    ] {
+      XCTAssertFalse(LogWriter.isArchiveName("\(base).\(bad)", baseName: base), bad)
+      XCTAssertFalse(LogWriter.isStagingName("\(base).\(bad).gz.part", baseName: base), bad)
+    }
+
+    // The ICU loosenesses, closed. A trailing newline is a different file
+    // name, and an Arabic-Indic stamp is not something en_US_POSIX produces.
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp)\n", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).\(stamp).gz\n", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base).٢٠٢٦٠٧٣١T١٢١٥٣٠Z_00c0ffee", baseName: base))
+
+    // Prefix discipline: the base name is part of the grammar too.
+    XCTAssertFalse(LogWriter.isArchiveName(stamp, baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("other.log.\(stamp)", baseName: base))
+    XCTAssertFalse(LogWriter.isArchiveName("\(base)\(stamp)", baseName: base),
+                   "the dot between base and stamp is not optional")
+  }
+
   // MARK: - Maintenance without a write
 
   /// The whole reason `maintain` exists. Rotation runs from `performWrite` and
