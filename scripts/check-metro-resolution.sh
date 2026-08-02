@@ -127,7 +127,7 @@ CFG
 
 echo "import {createFileDestination} from 'react-native-nitro-logger'; console.log(typeof createFileDestination);" > "$WORK/entry-root.js"
 echo "import {createFileSink} from 'react-native-nitro-logger/unstable'; console.log(typeof createFileSink);" > "$WORK/entry-unstable.js"
-echo "import {defineEvents} from 'react-native-nitro-logger/analytics'; console.log(typeof defineEvents);" > "$WORK/entry-analytics.js"
+echo "import {defineEvents, oneOf} from 'react-native-nitro-logger/analytics'; const events = defineEvents({probe: {value: oneOf('ok')}}); if (events.grammar.additionalEvents !== false || JSON.stringify(events.grammar) !== events.grammarJSON) throw new Error('invalid grammar');" > "$WORK/entry-analytics.js"
 
 mkdir -p "$WORK/out"
 

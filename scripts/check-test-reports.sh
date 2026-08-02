@@ -61,8 +61,8 @@ case "$MODE" in
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=1308
-    REQUIRED_SUITES="adapterThinness analytics apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError platformConsoleFormatter scope subsystem timestamp utf8"
+    MINIMUM=1325
+    REQUIRED_SUITES="adapterThinness analytics analyticsGrammar apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError platformConsoleFormatter scope subsystem timestamp utf8"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     npx jest --ci --json --outputFile="$REPORTS/jest.json"

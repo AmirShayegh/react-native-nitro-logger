@@ -1,4 +1,5 @@
 import { registerConstraintLookup } from '../constraints';
+import { utf8Length } from '../utf8';
 import type {
   EnumConstraint,
   IntegerConstraint,
@@ -45,6 +46,7 @@ export type NormalizedSchema<Definition extends EventDefinition> = {
 const descriptors = new WeakSet<object>();
 export const STRUCTURAL_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
 export const MAX_CONSTRAINT_MEMBERS = 4096;
+export const MAX_CONSTRAINT_MEMBER_BYTES = 256;
 
 function registered<const Value extends object>(value: Value): Readonly<Value> {
   descriptors.add(value);
@@ -55,6 +57,21 @@ function registered<const Value extends object>(value: Value): Readonly<Value> {
     registerConstraintLookup(value as unknown as EnumDescriptor);
   }
   return Object.freeze(value);
+}
+
+function validateUnicodeScalars(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        throw new TypeError('INVALID_CONSTRAINT_MEMBER');
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError('INVALID_CONSTRAINT_MEMBER');
+    }
+  }
 }
 
 function validateMembers(
@@ -69,6 +86,10 @@ function validateMembers(
   for (const value of values) {
     if (typeof value !== 'string' || value.length === 0) {
       throw new TypeError('INVALID_CONSTRAINT_MEMBER');
+    }
+    validateUnicodeScalars(value);
+    if (utf8Length(value) > MAX_CONSTRAINT_MEMBER_BYTES) {
+      throw new TypeError('CONSTRAINT_MEMBER_TOO_LARGE');
     }
     if (seen.has(value)) throw new TypeError('DUPLICATE_CONSTRAINT_MEMBER');
     seen.add(value);
@@ -114,13 +135,7 @@ export function int(bounds: {
   readonly max: number;
 }): IntegerDescriptor {
   const [min, max] = readIntegerBounds(bounds);
-  if (
-    !Number.isFinite(min) ||
-    !Number.isFinite(max) ||
-    !Number.isInteger(min) ||
-    !Number.isInteger(max) ||
-    min > max
-  ) {
+  if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min > max) {
     throw new TypeError('INVALID_INTEGER_BOUNDS');
   }
   return registered({ kind: 'integer', min, max }) as IntegerDescriptor;

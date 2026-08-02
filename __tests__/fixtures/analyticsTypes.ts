@@ -7,6 +7,11 @@ import {
   screenName,
 } from '../../src/analytics';
 import type {
+  AnalyticsGrammar,
+  AnalyticsGrammarConstraint,
+  AnalyticsGrammarEvent,
+  AnalyticsGrammarProperty,
+  AnalyticsGrammarV1,
   EventName,
   EventProperties,
   ValidationResult,
@@ -30,6 +35,39 @@ const events = defineEvents({
     path: namedString('care-path', 'intake', 'follow-up'),
   },
 });
+
+const grammar: AnalyticsGrammar = events.grammar;
+const grammarV1: AnalyticsGrammarV1 = events.grammar;
+const grammarEvent: AnalyticsGrammarEvent = grammar.events[0]!;
+const grammarProperty: AnalyticsGrammarProperty = grammarEvent.properties[0]!;
+const grammarConstraint: AnalyticsGrammarConstraint =
+  grammarProperty.constraint;
+const grammarJSON: string = events.grammarJSON;
+consume(
+  grammar,
+  grammarV1,
+  grammarEvent,
+  grammarProperty,
+  grammarConstraint,
+  grammarJSON
+);
+
+// @ts-expect-error the format version is immutable
+events.grammar.formatVersion = 2;
+// @ts-expect-error the closed-world flag is immutable
+events.grammar.additionalEvents = true;
+// @ts-expect-error grammar event arrays are immutable
+events.grammar.events.push(grammarEvent);
+// @ts-expect-error grammar event records are immutable
+grammarEvent.name = 'replacement';
+// @ts-expect-error grammar property records are immutable
+grammarProperty.required = false;
+if (grammarConstraint.type === 'enum') {
+  // @ts-expect-error constraint member arrays are immutable
+  grammarConstraint.values.push('replacement');
+}
+// @ts-expect-error the authoritative grammar bytes are immutable
+events.grammarJSON = '{}';
 
 type Events = typeof events;
 type Names = EventName<Events>;

@@ -96,6 +96,7 @@
     "check-android-instrumented": "./scripts/check-android-instrumented.sh",
     "check-test-reports": "./scripts/check-test-reports.sh",
     "check-mutants": "./scripts/check-mutants.sh",
+    "check-analytics-grammar-go": "./scripts/check-analytics-grammar-go.sh",
     "check-package-exports": "./scripts/check-package-exports.sh",
     "check-metro-resolution": "./scripts/check-metro-resolution.sh",
     "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",

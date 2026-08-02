@@ -1,4 +1,6 @@
 import type { EventDefinition } from './analytics/descriptors';
+import { emitGrammar } from './analytics/grammar';
+import { GRAMMAR_V1_LIMITS } from './analytics/grammar-format';
 import { normalizeDefinition } from './analytics/schema';
 import type { EventArtifact } from './analytics/types';
 import { createValidator } from './analytics/validator';
@@ -11,6 +13,16 @@ export {
   screenName,
 } from './analytics/descriptors';
 export type {
+  AnalyticsGrammar,
+  AnalyticsGrammarConstraint,
+  AnalyticsGrammarEnumConstraint,
+  AnalyticsGrammarEvent,
+  AnalyticsGrammarIntegerConstraint,
+  AnalyticsGrammarNamedStringConstraint,
+  AnalyticsGrammarProperty,
+  AnalyticsGrammarV1,
+} from './analytics/grammar-format';
+export type {
   EventArtifact,
   EventName,
   EventProperties,
@@ -21,9 +33,12 @@ export type {
 export function defineEvents<const Definition extends EventDefinition>(
   definition: Definition
 ): EventArtifact<Definition> {
-  const schema = normalizeDefinition(definition);
+  const schema = normalizeDefinition(definition, GRAMMAR_V1_LIMITS);
+  const { grammar, grammarJSON } = emitGrammar(schema);
   return Object.freeze({
     schema,
+    grammar,
+    grammarJSON,
     validate: createValidator(schema),
   }) as EventArtifact<Definition>;
 }

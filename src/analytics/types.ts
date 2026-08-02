@@ -8,6 +8,7 @@ import type {
   NormalizedSchema,
   OptionalDescriptor,
 } from './descriptors';
+import type { AnalyticsGrammarV1 } from './grammar-format';
 
 type DescriptorPrimitive<Value> =
   Value extends OptionalDescriptor<infer Inner>
@@ -55,6 +56,8 @@ export interface EventArtifact<
   Definition extends EventDefinition = EventDefinition,
 > {
   readonly schema: NormalizedSchema<Definition>;
+  readonly grammar: AnalyticsGrammarV1;
+  readonly grammarJSON: string;
   readonly [artifactDefinition]: Definition;
   validate(
     eventName: unknown,

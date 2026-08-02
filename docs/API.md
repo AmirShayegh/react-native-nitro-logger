@@ -176,7 +176,8 @@ schema instead of maintaining a second list of names, properties, or bounds.
 ### `defineEvents(definition)` and its inferred types
 
 `defineEvents` returns an immutable `EventArtifact` containing the normalized
-schema and its runtime validator. `EventName<Artifact>` extracts the exact
+schema, its runtime validator, an inspectable `grammar`, and the authoritative
+precomputed `grammarJSON` bytes. `EventName<Artifact>` extracts the exact
 event-name union, while `EventProperties<Artifact, Name>` extracts one event's
 required and optional property object. `ValidationResult<Artifact>` is a
 closed discriminated union: success correlates `eventName` with validated
@@ -190,6 +191,50 @@ range or equality oracle; their descriptor compatibility remains a TypeScript
 guarantee and the server grammar remains authoritative for modified clients.
 
 <!-- api: defineEvents, EventArtifact, EventName, EventProperties, ValidationResult -->
+
+### Canonical analytics grammar
+
+`AnalyticsGrammar` currently aliases `AnalyticsGrammarV1`. Its component types
+are `AnalyticsGrammarEvent`, `AnalyticsGrammarProperty`, and
+`AnalyticsGrammarConstraint`, whose concrete branches are
+`AnalyticsGrammarEnumConstraint`, `AnalyticsGrammarIntegerConstraint`, and
+`AnalyticsGrammarNamedStringConstraint`. The exact portable shape is:
+
+```ts
+type AnalyticsGrammarV1 = {
+  artifact: 'react-native-nitro-logger/analytics-grammar';
+  formatVersion: 1;
+  additionalEvents: false;
+  events: readonly {
+    name: string;
+    additionalProperties: false;
+    properties: readonly {
+      name: string;
+      required: boolean;
+      constraint:
+        | { type: 'enum'; values: readonly string[] }
+        | { type: 'integer'; minimum: number; maximum: number }
+        | { type: 'named-string'; registry: string; values: readonly string[] };
+    }[];
+  }[];
+};
+```
+
+Event and property names are sorted; authored constraint-member order is
+preserved. Both levels are closed, every node is recursively frozen, and the
+stored `grammarJSON` is serialized once from a prototype-independent graph.
+Normal `JSON.stringify(artifact.grammar)` produces the same string, but later
+registration must use `grammarJSON` so ambient serializer changes cannot alter
+approved bytes.
+
+V1 accepts only safe integer bounds, Unicode-scalar constraint members no
+larger than 256 UTF-8 bytes, at most 256 events, 2,048 properties, 16,384
+serialized member references, and 1 MiB of JSON. `formatVersion` identifies
+this document format; it is not the gateway-assigned D10 `schemaVersion`.
+Emission proves neither tenant approval nor registration, active/retired/
+revoked lifecycle state, signature validity, or server enforcement.
+
+<!-- api: AnalyticsGrammar, AnalyticsGrammarConstraint, AnalyticsGrammarEnumConstraint, AnalyticsGrammarEvent, AnalyticsGrammarIntegerConstraint, AnalyticsGrammarNamedStringConstraint, AnalyticsGrammarProperty, AnalyticsGrammarV1 -->
 
 ### `oneOf`, `int`, `namedString`, `screenName`, and `optional`
 
@@ -1043,6 +1088,14 @@ from here fails the suite, and so does an entry here that no longer exists.
 
 - `AppendResult`
 - `AppStateLike`
+- `AnalyticsGrammar`
+- `AnalyticsGrammarConstraint`
+- `AnalyticsGrammarEnumConstraint`
+- `AnalyticsGrammarEvent`
+- `AnalyticsGrammarIntegerConstraint`
+- `AnalyticsGrammarNamedStringConstraint`
+- `AnalyticsGrammarProperty`
+- `AnalyticsGrammarV1`
 - `Batcher`
 - `BatcherOptions`
 - `BatchFlushOutcome`

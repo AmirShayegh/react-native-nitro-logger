@@ -84,6 +84,9 @@ test('the packed CommonJS analytics artifact executes', () => {
   const events = defineEvents({probe: {value: oneOf('ok')}});
   expect(events.validate('probe', {value: 'ok'}).ok).toBe(true);
   expect(events.validate('probe', {value: 'no'}).ok).toBe(false);
+  expect(events.grammar.additionalEvents).toBe(false);
+  expect(events.grammar.events[0].additionalProperties).toBe(false);
+  expect(JSON.stringify(events.grammar)).toBe(events.grammarJSON);
 });
 EOF
 
@@ -149,6 +152,9 @@ ESM_ANALYTICS="$(node --input-type=module -e "
   const events = defineEvents({probe: {value: oneOf('ok')}});
   if (!events.validate('probe', {value: 'ok'}).ok) process.exit(1);
   if (events.validate('probe', {value: 'no'}).ok) process.exit(1);
+  if (events.grammar.additionalEvents !== false) process.exit(1);
+  if (events.grammar.events[0].additionalProperties !== false) process.exit(1);
+  if (JSON.stringify(events.grammar) !== events.grammarJSON) process.exit(1);
   console.log('PASS');
 " 2>&1)"
 if [ "$ESM_ANALYTICS" = "PASS" ]; then
@@ -162,12 +168,24 @@ cat > analytics-consumer.ts <<'EOF'
 import {
   defineEvents,
   oneOf,
+  type AnalyticsGrammar,
+  type AnalyticsGrammarConstraint,
+  type AnalyticsGrammarEvent,
+  type AnalyticsGrammarProperty,
+  type AnalyticsGrammarV1,
   type EventProperties,
 } from 'react-native-nitro-logger/analytics';
 
 const events = defineEvents({probe: {value: oneOf('ok', 'ready')}});
 const properties: EventProperties<typeof events, 'probe'> = {value: 'ok'};
 const result = events.validate('probe', properties);
+const grammar: AnalyticsGrammar = events.grammar;
+const grammarV1: AnalyticsGrammarV1 = grammar;
+const grammarEvent: AnalyticsGrammarEvent = grammar.events[0]!;
+const grammarProperty: AnalyticsGrammarProperty = grammarEvent.properties[0]!;
+const grammarConstraint: AnalyticsGrammarConstraint = grammarProperty.constraint;
+const grammarJSON: string = events.grammarJSON;
+console.log(grammarV1, grammarEvent, grammarProperty, grammarConstraint, grammarJSON);
 if (result.ok && result.eventName === 'probe') {
   const value: 'ok' | 'ready' | object = result.properties.value;
   console.log(value);
@@ -237,7 +255,7 @@ ANALYTICS_NAMES="$(node -e '
   const fs = require("fs"), path = require("path");
   const pkg = process.argv[1];
   const functions = ["defineEvents", "int", "namedString", "oneOf", "optional", "screenName"];
-  const types = ["EventArtifact", "EventName", "EventProperties", "ValidationResult"];
+  const types = ["AnalyticsGrammar", "AnalyticsGrammarConstraint", "AnalyticsGrammarEnumConstraint", "AnalyticsGrammarEvent", "AnalyticsGrammarIntegerConstraint", "AnalyticsGrammarNamedStringConstraint", "AnalyticsGrammarProperty", "AnalyticsGrammarV1", "EventArtifact", "EventName", "EventProperties", "ValidationResult"];
   const jsTargets = [
     ["lib/commonjs/analytics.js", (src, n) =>
       new RegExp("exports\\." + n + "\\s*=").test(src) ||

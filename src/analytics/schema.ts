@@ -16,7 +16,21 @@ type SchemaErrorCode =
   | 'INVALID_EVENT_NAME'
   | 'INVALID_EVENT_PROPERTIES'
   | 'INVALID_PROPERTY_DEFINITION'
-  | 'INVALID_PROPERTY_NAME';
+  | 'INVALID_PROPERTY_NAME'
+  | 'GRAMMAR_EVENT_LIMIT'
+  | 'GRAMMAR_MEMBER_REFERENCE_LIMIT'
+  | 'GRAMMAR_PROPERTY_LIMIT';
+
+export interface NormalizationBudget {
+  readonly maxEvents: number;
+  readonly maxMemberReferences: number;
+  readonly maxProperties: number;
+}
+
+interface NormalizationCounts {
+  memberReferences: number;
+  properties: number;
+}
 
 const schemaErrors = new WeakMap<object, SchemaErrorCode>();
 
@@ -44,7 +58,9 @@ function ownDataValue(source: object, key: string): unknown {
 
 function normalizeProperties(
   value: unknown,
-  descriptorCopies: WeakMap<object, Descriptor>
+  descriptorCopies: WeakMap<object, Descriptor>,
+  budget: NormalizationBudget,
+  counts: NormalizationCounts
 ): Readonly<Record<string, Descriptor>> {
   if (!plainRecord(value)) fail('INVALID_EVENT_PROPERTIES');
   const normalized = Object.create(null) as Record<string, Descriptor>;
@@ -55,21 +71,39 @@ function normalizeProperties(
     }
     const descriptor = ownDataValue(value, key);
     if (!isRegisteredDescriptor(descriptor)) fail('INVALID_DESCRIPTOR');
+    counts.properties += 1;
+    if (counts.properties > budget.maxProperties) {
+      fail('GRAMMAR_PROPERTY_LIMIT');
+    }
+    const primitive =
+      descriptor.kind === 'optional' ? descriptor.value : descriptor;
+    if (primitive.kind !== 'integer') {
+      counts.memberReferences += primitive.values.length;
+      if (counts.memberReferences > budget.maxMemberReferences) {
+        fail('GRAMMAR_MEMBER_REFERENCE_LIMIT');
+      }
+    }
     normalized[key] = copyDescriptor(descriptor, descriptorCopies);
   }
   return Object.freeze(normalized);
 }
 
 function normalizeEvents(
-  definition: Record<string, unknown>
+  definition: Record<string, unknown>,
+  budget: NormalizationBudget
 ): Readonly<Record<string, Readonly<Record<string, Descriptor>>>> {
   const eventKeys = Reflect.ownKeys(definition);
   if (eventKeys.length === 0) fail('EMPTY_EVENT_DEFINITION');
+  if (eventKeys.length > budget.maxEvents) fail('GRAMMAR_EVENT_LIMIT');
   const normalized = Object.create(null) as Record<
     string,
     Readonly<Record<string, Descriptor>>
   >;
   const descriptorCopies = new WeakMap<object, Descriptor>();
+  const counts: NormalizationCounts = {
+    memberReferences: 0,
+    properties: 0,
+  };
 
   for (const key of eventKeys) {
     if (typeof key !== 'string' || !STRUCTURAL_NAME.test(key)) {
@@ -79,17 +113,23 @@ function normalizeEvents(
     if (!descriptor || !('value' in descriptor)) {
       fail('INVALID_EVENT_DEFINITION');
     }
-    normalized[key] = normalizeProperties(descriptor.value, descriptorCopies);
+    normalized[key] = normalizeProperties(
+      descriptor.value,
+      descriptorCopies,
+      budget,
+      counts
+    );
   }
   return Object.freeze(normalized);
 }
 
 export function normalizeDefinition<const Definition extends EventDefinition>(
-  definition: Definition
+  definition: Definition,
+  budget: NormalizationBudget
 ): NormalizedSchema<Definition> {
   try {
     if (!plainRecord(definition)) fail('INVALID_EVENT_DEFINITION');
-    return normalizeEvents(definition) as NormalizedSchema<Definition>;
+    return normalizeEvents(definition, budget) as NormalizedSchema<Definition>;
   } catch (error) {
     const code =
       error !== null && typeof error === 'object'
