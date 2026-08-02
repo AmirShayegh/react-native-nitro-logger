@@ -126,6 +126,10 @@ const PROBE_BASELINE: Record<string, readonly unknown[]> = {
   __revealBranchSentinel: [],
   normalizePrivacyDefault: ['public'],
   buildCatalog: [['ok', 'probe']],
+  validateMarkerForConstraint: [
+    priv('baseline'),
+    { kind: 'enum', values: ['baseline'] },
+  ],
   redactMetadata: [
     { ok: 'scope value' },
     { ok: 'call-site value' },
@@ -248,6 +252,8 @@ describe('privacy markers', () => {
       'redactMetadata:0',
       'redactMetadata:1',
       'redactMetadata:2',
+      'validateMarkerForConstraint:0',
+      'validateMarkerForConstraint:1',
     ]);
   });
 

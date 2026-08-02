@@ -30,6 +30,18 @@
       },
       "default": "./lib/module/unstable.js"
     },
+    "./analytics": {
+      "react-native-nitro-logger-source": "./src/analytics.ts",
+      "require": {
+        "types": "./lib/typescript/commonjs/src/analytics.d.ts",
+        "default": "./lib/commonjs/analytics.js"
+      },
+      "import": {
+        "types": "./lib/typescript/module/src/analytics.d.ts",
+        "default": "./lib/module/analytics.js"
+      },
+      "default": "./lib/module/analytics.js"
+    },
     "./eslint-plugin": "./eslint-plugin/index.js",
     "./package.json": "./package.json"
   },

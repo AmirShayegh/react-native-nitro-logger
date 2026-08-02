@@ -79,8 +79,9 @@ const ts = require('typescript');
 /**
  * Every barrel a consumer can import from, keyed by the specifier they write.
  *
- * Two of them since 0.3.0: the root, and `react-native-nitro-logger/unstable`,
- * which holds the raw Nitro sinks. Both are public surface, so both are held
+ * Three of them once analytics schemas land: the root,
+ * `react-native-nitro-logger/unstable`, which holds the raw Nitro sinks, and
+ * `react-native-nitro-logger/analytics`. All are public surface, so all are held
  * to the same standard — a name reachable from an export map entry and absent
  * from the reference is undocumented no matter which entry point it came
  * through. Adding a third means adding it here; the export map and this list
@@ -90,6 +91,7 @@ const ts = require('typescript');
 const SOURCES = {
   '.': join(__dirname, '..', 'src', 'index.tsx'),
   './unstable': join(__dirname, '..', 'src', 'unstable.ts'),
+  './analytics': join(__dirname, '..', 'src', 'analytics.ts'),
 };
 const REFERENCE = join(__dirname, '..', 'docs', 'API.md');
 const MANIFEST = join(__dirname, '..', 'package.json');
@@ -441,7 +443,7 @@ describe('docs/API.md', () => {
 
     // Not vacuous: the map has at least the root, and the filter above is what
     // would silently empty this list if the condition were ever renamed.
-    expect(fromMap.length).toBeGreaterThanOrEqual(2);
+    expect(fromMap.length).toBeGreaterThanOrEqual(3);
 
     const asPaths = Object.fromEntries(
       Object.entries(SOURCES).map(([specifier, path]) => [

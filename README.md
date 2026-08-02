@@ -236,20 +236,22 @@ The scope's six level methods (`scope.info(msg, meta)` and siblings) did not
 change. Most callers of `createFileSink` want `createFileDestination()`
 instead, which is a root export and does both steps.
 
-### `/unstable` needs one line of Metro config on React Native 0.78
+### Package subpaths need one line of Metro config on React Native 0.78
 
 That third row is the only change that is not purely an import edit, and only
-at the bottom of the supported range. `react-native-nitro-logger/unstable` is a
-**subpath export**, and Metro resolves subpath exports only when
+at the bottom of the supported range. `react-native-nitro-logger/unstable` and
+`react-native-nitro-logger/analytics` are **subpath exports**, and Metro
+resolves subpath exports only when
 `unstable_enablePackageExports` is on:
 
-| Metro | Ships with | Default | `…/unstable` resolves |
+| Metro | Ships with | Default | Package subpaths resolve |
 | --- | --- | --- | --- |
 | 0.81 | React Native 0.78 | `false` | no — `Unable to resolve module` |
 | 0.82+ | React Native ≥ 0.79 | `true` | yes |
 
-So on **React Native 0.78 only**, a project that imports `/unstable` sets the
-flag in its existing `metro.config.js`. Merged into the stock 0.78 template,
+So on **React Native 0.78 only**, a project that imports `/unstable` or
+`/analytics` sets the flag in its existing `metro.config.js`. Merged into the
+stock 0.78 template,
 which is what `npx @react-native-community/cli init` writes:
 
 ```js
@@ -276,8 +278,9 @@ thing.
 React Native 0.78.0, React 19.0.0, Metro 0.81 and the packed tarball, then
 bundles each entry point twice — once under the stock template
 `metro.config.js` and once under the config above. It requires the root to
-bundle both times, requires `/unstable` to fail under the stock config *naming
-that specifier*, and requires the snippet above to fix it. So both the problem
+bundle both times, requires `/unstable` and `/analytics` to fail under the
+stock config *naming each specifier*, and requires the snippet above to fix
+both. So both the problem
 and the workaround are executed on every run. `min-rn-ios` and `min-rn-android`
 stay stock and import only the root entry point, because their value is in
 standing for an unmodified consumer app.
@@ -290,7 +293,7 @@ was bundled once locally on Metro 0.82, not in CI. Nothing re-checks it, so
 read it as accurate when written rather than as enforced.
 
 The **root** entry point resolved under every combination tried — this affects
-`/unstable` and nothing else, so a project that only ever imports from
+package subpaths only, so a project that only ever imports from
 `react-native-nitro-logger` never meets any of it.
 
 ## Writing to a file

@@ -3,8 +3,8 @@
 # Which of this package's entry points a stock app at the MINIMUM supported
 # React Native can actually resolve.
 #
-# `exports` gained a second entry in 0.3.0: the raw sinks moved from the root to
-# `react-native-nitro-logger/unstable`. Subpath exports are the one part of the
+# The raw sinks and analytics schema API live at package subpaths. Subpath
+# exports are the one part of the
 # export map Metro does not honour unconditionally — `unstable_enablePackageExports`
 # was added off by default and turned on later — so the migration the release
 # notes ask for ("change one import line") is not, at the bottom of the
@@ -127,11 +127,12 @@ CFG
 
 echo "import {createFileDestination} from 'react-native-nitro-logger'; console.log(typeof createFileDestination);" > "$WORK/entry-root.js"
 echo "import {createFileSink} from 'react-native-nitro-logger/unstable'; console.log(typeof createFileSink);" > "$WORK/entry-unstable.js"
+echo "import {defineEvents} from 'react-native-nitro-logger/analytics'; console.log(typeof defineEvents);" > "$WORK/entry-analytics.js"
 
 mkdir -p "$WORK/out"
 
-# Four bundles, and the expected outcome of each. `expect` is the whole point:
-# three of these must succeed and one must fail, and the one that fails must
+# Six bundles, and the expected outcome of each. `expect` is the whole point:
+# four of these must succeed and two must fail, and each failure must
 # fail by naming the specifier — an unrelated resolution error would otherwise
 # sign off the claim that subpath exports are what is broken.
 cat > "$WORK/drive.js" <<'JS'
@@ -140,16 +141,16 @@ const path = require('path');
 
 const CASES = [
   {config: 'stock', entry: 'entry-root.js', expect: 'resolves'},
-  {config: 'stock', entry: 'entry-unstable.js', expect: 'fails'},
+  {config: 'stock', entry: 'entry-unstable.js', expect: 'fails', specifier: 'react-native-nitro-logger/unstable'},
+  {config: 'stock', entry: 'entry-analytics.js', expect: 'fails', specifier: 'react-native-nitro-logger/analytics'},
   {config: 'flag', entry: 'entry-root.js', expect: 'resolves'},
   {config: 'flag', entry: 'entry-unstable.js', expect: 'resolves'},
+  {config: 'flag', entry: 'entry-analytics.js', expect: 'resolves'},
 ];
-
-const SUBPATH = 'react-native-nitro-logger/unstable';
 
 (async () => {
   let failures = 0;
-  for (const {config: cfg, entry, expect} of CASES) {
+  for (const {config: cfg, entry, expect, specifier} of CASES) {
     const loaded = await Metro.loadConfig({
       cwd: __dirname,
       config: path.join(__dirname, `metro.config.${cfg}.js`),
@@ -176,9 +177,9 @@ const SUBPATH = 'react-native-nitro-logger/unstable';
 
     let ok = outcome === expect;
     // The failing case has to fail for the documented reason.
-    if (ok && expect === 'fails' && !detail.includes(SUBPATH)) {
+    if (ok && expect === 'fails' && !detail.includes(specifier)) {
       ok = false;
-      detail += `  <-- expected the error to name ${SUBPATH}`;
+      detail += `  <-- expected the error to name ${specifier}`;
     }
     if (!ok) failures += 1;
     const label = `${cfg} + ${entry}`;
@@ -195,7 +196,7 @@ if node "$WORK/drive.js"; then
 
 the export map resolves as documented at React Native $RN_VERSION:
   the root entry point bundles with or without unstable_enablePackageExports
-  the /unstable subpath bundles only with it
+  the /unstable and /analytics subpaths bundle only with it
 EOM
 else
   echo

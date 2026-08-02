@@ -9,6 +9,7 @@ it rather than restating it badly: [PRIVACY.md](PRIVACY.md) for the redaction
 contract, [PARITY.md](PARITY.md) for where the two native writers differ.
 
 - [Logging](#logging)
+- [Analytics schemas](#analytics-schemas)
 - [Privacy](#privacy)
 - [Destinations](#destinations)
 - [Formatters](#formatters)
@@ -163,6 +164,43 @@ reaches a destination, privacy has already been applied — a destination cannot
 un-redact, and is not trusted to.
 
 <!-- api: LogOptions, LazyMessage, LogLevel, LogEntry -->
+
+---
+
+## Analytics schemas
+
+Import this surface from `react-native-nitro-logger/analytics`. It authors a
+closed event grammar once; later analytics tooling consumes the same frozen
+schema instead of maintaining a second list of names, properties, or bounds.
+
+### `defineEvents(definition)` and its inferred types
+
+`defineEvents` returns an immutable `EventArtifact` containing the normalized
+schema and its runtime validator. `EventName<Artifact>` extracts the exact
+event-name union, while `EventProperties<Artifact, Name>` extracts one event's
+required and optional property object. `ValidationResult<Artifact>` is a
+closed discriminated union: success correlates `eventName` with validated
+`properties`; failures carry fixed codes and never rejected caller data.
+
+The validator accepts unknown runtime input for JavaScript and decoded-data
+callers. Bare and `pub()` values must satisfy their descriptors. Authentic
+`priv()` markers are checked for authenticity but never compared with a
+caller-selected constraint, because a payload-dependent result would become a
+range or equality oracle; their descriptor compatibility remains a TypeScript
+guarantee and the server grammar remains authoritative for modified clients.
+
+<!-- api: defineEvents, EventArtifact, EventName, EventProperties, ValidationResult -->
+
+### `oneOf`, `int`, `namedString`, `screenName`, and `optional`
+
+`oneOf` defines a non-empty exact string enum. `int` defines an inclusive,
+finite integer range. `namedString` binds a non-empty exact string set to a
+structural registry name, and `screenName` is its screen-registry shorthand.
+`optional` marks one descriptor optional without widening its inferred value.
+Every constructor copies and freezes its input, rejects duplicates or invalid
+bounds at definition time, and exposes no free-form string descriptor.
+
+<!-- api: oneOf, int, namedString, screenName, optional -->
 
 ---
 
@@ -1032,6 +1070,9 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `ERROR_METADATA_KEYS`
 - `ErrorHandlerOptions`
 - `ErrorUtilsLike`
+- `EventArtifact`
+- `EventName`
+- `EventProperties`
 - `FenceReason`
 - `FileDestination`
 - `FileDestinationOptions`
@@ -1042,6 +1083,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `FlushOutcome`
 - `installErrorHandler`
 - `installRejectionHandler`
+- `int`
 - `JsonLinesFormatter`
 - `JsonLinesFormatterOptions`
 - `JsonTimestampStyle`
@@ -1067,8 +1109,11 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NativeConsoleDestinationOptions`
 - `NativeConsoleSink`
 - `NativeConsoleSinkLike`
+- `namedString`
 - `NON_ERROR_THROWN`
 - `PlatformConsoleFormatter`
+- `oneOf`
+- `optional`
 - `priv`
 - `PrivacyDefault`
 - `PRIVATE_PLACEHOLDER`
@@ -1091,6 +1136,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `SanitizeErrorOptions`
 - `scheduleMaintenance`
 - `ScheduleMaintenanceOptions`
+- `screenName`
 - `ScopedLogger`
 - `ScopedLogOptions`
 - `SinkStatus`
@@ -1099,4 +1145,6 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `Uninstall`
 - `UNKNOWN_ERROR_NAME`
 - `UNREADABLE_VALUE`
+- `ValidationResult`
+- `defineEvents`
 - `utf8Length`
