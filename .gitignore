@@ -108,3 +108,7 @@ android/generated
 # Written by `yarn test:coverage`. Like .jest-reports above, a build
 # artifact of a gate rather than anything to keep.
 coverage/
+
+# private: backlog and scoping documents stay local
+.story/
+docs/internal/
