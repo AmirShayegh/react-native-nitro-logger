@@ -152,6 +152,16 @@ android {
         inputs.file(new File(projectDir.parentFile, "spec/file-sink-lifecycle.rows.json"))
           .withPropertyName("fileSinkLifecycleRows")
           .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+
+        // The wire contract is consumed by a JVM suite exactly as the shared
+        // lifecycle table is. Make both files task inputs so changing either
+        // cannot hand back yesterday's UP-TO-DATE result.
+        inputs.files(
+          new File(projectDir.parentFile, "spec/wire/v1/contract.json"),
+          new File(projectDir.parentFile, "spec/wire/v1/golden-vectors.json")
+        )
+          .withPropertyName("wireContractV1")
+          .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
       }
     }
   }

@@ -1,0 +1,140 @@
+{
+  "contractVersion": 1,
+  "upstream": {
+    "otlpSpecification": "1.11.0",
+    "protobufDefinitions": "v1.10.0"
+  },
+  "identifiers": {
+    "maxBytes": 128,
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+  },
+  "header": {
+    "magicHex": "4e4c4f4753454700",
+    "version": 1,
+    "byteOrder": "big-endian",
+    "hash": "sha256",
+    "fields": [
+      { "name": "magic", "encoding": "fixed-bytes", "bytes": 8 },
+      { "name": "headerVersion", "encoding": "u16", "bytes": 2 },
+      { "name": "headerLength", "encoding": "u32", "bytes": 4 },
+      { "name": "segmentId", "encoding": "fixed-bytes", "bytes": 16 },
+      {
+        "name": "contentHash",
+        "encoding": "fixed-bytes",
+        "bytes": 32,
+        "zeroWhenHashing": true
+      },
+      {
+        "name": "tenantId",
+        "encoding": "ascii",
+        "lengthPrefix": "u16",
+        "maxBytes": 128
+      },
+      {
+        "name": "streamId",
+        "encoding": "ascii",
+        "lengthPrefix": "u16",
+        "maxBytes": 128
+      },
+      {
+        "name": "sourceEpoch",
+        "encoding": "ascii",
+        "lengthPrefix": "u16",
+        "maxBytes": 128
+      },
+      { "name": "schemaVersion", "encoding": "u32", "bytes": 4 },
+      { "name": "consentGeneration", "encoding": "u64", "bytes": 8 },
+      { "name": "recordCount", "encoding": "u32", "bytes": 4 },
+      { "name": "payloadLength", "encoding": "u64", "bytes": 8 }
+    ]
+  },
+  "otlp": {
+    "producerUnknownFieldPolicy": "forbid",
+    "baseReceiverUnknownFieldPolicy": "ignore",
+    "strictReceiverUnknownFieldPolicy": "reject-original-tree",
+    "messages": {
+      "ExportLogsServiceRequest": ["resourceLogs"],
+      "ResourceLogs": ["resource", "scopeLogs", "schemaUrl"],
+      "Resource": ["attributes", "droppedAttributesCount"],
+      "ScopeLogs": ["scope", "logRecords", "schemaUrl"],
+      "InstrumentationScope": [
+        "name",
+        "version",
+        "attributes",
+        "droppedAttributesCount"
+      ],
+      "LogRecord": [
+        "timeUnixNano",
+        "observedTimeUnixNano",
+        "severityNumber",
+        "severityText",
+        "body",
+        "attributes",
+        "droppedAttributesCount",
+        "flags",
+        "traceId",
+        "spanId"
+      ],
+      "KeyValue": ["key", "value"],
+      "AnyValue": [
+        "stringValue",
+        "boolValue",
+        "intValue",
+        "doubleValue",
+        "bytesValue",
+        "arrayValue",
+        "kvlistValue"
+      ],
+      "ArrayValue": ["values"],
+      "KeyValueList": ["values"]
+    },
+    "children": {
+      "ExportLogsServiceRequest": {
+        "resourceLogs": { "message": "ResourceLogs", "repeated": true }
+      },
+      "ResourceLogs": {
+        "resource": { "message": "Resource", "repeated": false },
+        "scopeLogs": { "message": "ScopeLogs", "repeated": true }
+      },
+      "Resource": {
+        "attributes": { "message": "KeyValue", "repeated": true }
+      },
+      "ScopeLogs": {
+        "scope": { "message": "InstrumentationScope", "repeated": false },
+        "logRecords": { "message": "LogRecord", "repeated": true }
+      },
+      "InstrumentationScope": {
+        "attributes": { "message": "KeyValue", "repeated": true }
+      },
+      "LogRecord": {
+        "body": { "message": "AnyValue", "repeated": false },
+        "attributes": { "message": "KeyValue", "repeated": true }
+      },
+      "KeyValue": {
+        "value": { "message": "AnyValue", "repeated": false }
+      },
+      "AnyValue": {
+        "arrayValue": { "message": "ArrayValue", "repeated": false },
+        "kvlistValue": { "message": "KeyValueList", "repeated": false }
+      },
+      "ArrayValue": {
+        "values": { "message": "AnyValue", "repeated": true }
+      },
+      "KeyValueList": {
+        "values": { "message": "KeyValue", "repeated": true }
+      }
+    },
+    "anyValueArms": [
+      "stringValue",
+      "boolValue",
+      "intValue",
+      "doubleValue",
+      "bytesValue",
+      "arrayValue",
+      "kvlistValue"
+    ],
+    "severityNumber": { "minimum": 0, "maximum": 24 },
+    "intValue": { "encoding": "signed-decimal-string", "bits": 64 },
+    "timeUnixNano": { "encoding": "unsigned-decimal-string", "bits": 64 }
+  }
+}

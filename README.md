@@ -18,6 +18,10 @@ native file and system-console sinks built on [Nitro Modules][nitro].
   from, but the unlinked file and anything written before detection are gone.
 - **New Architecture only**, iOS and Android, no bridge fallback.
 
+The versioned remote-ingest byte contract is public in
+[`docs/WIRE.md`](docs/WIRE.md). It defines syntax and immutable segment
+identity; it does not make client-written tenant fields authoritative.
+
 ```sh
 npm install react-native-nitro-logger react-native-nitro-modules
 ```

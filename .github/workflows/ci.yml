@@ -57,6 +57,12 @@ jobs:
       - name: Decode the analytics grammar in Go
         run: yarn check-analytics-grammar-go
 
+      # The machine descriptor is the structural authority for the public
+      # wire document. Hand-edited tables would otherwise look plausible while
+      # disagreeing with the independently consumed bytes.
+      - name: Check the wire contract document
+        run: yarn check-wire-contract
+
       # Every ```ts block in the shipped docs, compiled against this tree.
       # A sample is the first thing a reader copies, so a renamed export should
       # break the documentation at the same moment it breaks the code rather

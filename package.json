@@ -48,7 +48,8 @@
   "files": [
     "src",
     "lib",
-    "docs",
+    "docs/*.md",
+    "spec/wire",
     "CHANGELOG.md",
     "eslint-plugin",
     "android",
@@ -106,7 +107,11 @@
     "check-podspec-tag": "./scripts/check-podspec-tag.sh",
     "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish",
     "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag",
-    "check-coverage-groups": "./scripts/check-coverage-groups.sh"
+    "check-coverage-groups": "./scripts/check-coverage-groups.sh",
+    "check-wire-contract": "node scripts/check-wire-contract.mjs",
+    "wire:manifest": "node scripts/build-wire-contract-manifest.mjs --source-commit $(git rev-parse HEAD) --verify-source-commit --output spec/wire/manifest.json",
+    "prepack": "node scripts/build-wire-contract-manifest.mjs --source-commit $(git rev-parse HEAD) --verify-source-commit --output spec/wire/manifest.json --pack-state-output .wire-pack-state.json --pack-lock .wire-pack-lock --lock-owner-pid $PPID",
+    "postpack": "node scripts/verify-wire-contract-manifest.mjs"
   },
   "keywords": [
     "react-native",
