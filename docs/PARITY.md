@@ -29,11 +29,11 @@ is a deliberate act with a number attached rather than a refresh.
 
 ## How much of this is actually enforced
 
-<!-- test-counts: js=2173/33 swift=260/13 kotlin=246/12 -->
+<!-- test-counts: js=2177/34 swift=260/13 kotlin=246/12 -->
 
 | Target                           | Tests | Suites |
 | -------------------------------- | ----- | ------ |
-| JavaScript / TypeScript (`jest`) | 2173  | 33     |
+| JavaScript / TypeScript (`jest`) | 2177  | 34     |
 | iOS (`swift test`)               | 260   | 13     |
 | Android (`testDebugUnitTest`)    | 246   | 12     |
 
