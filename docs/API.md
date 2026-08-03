@@ -177,11 +177,14 @@ schema instead of maintaining a second list of names, properties, or bounds.
 
 `defineEvents` returns an immutable `EventArtifact` containing the normalized
 schema, its runtime validator, an inspectable `grammar`, and the authoritative
-precomputed `grammarJSON` bytes. `EventName<Artifact>` extracts the exact
-event-name union, while `EventProperties<Artifact, Name>` extracts one event's
-required and optional property object. `ValidationResult<Artifact>` is a
-closed discriminated union: success correlates `eventName` with validated
-`properties`; failures carry fixed codes and never rejected caller data.
+precomputed `grammarJSON` bytes. Its `lint` member is an
+`AnalyticsLintArtifactV1`: `{ formatVersion: 1, grammar }`, frozen over the
+same grammar object for schema-dependent ESLint rules. `EventName<Artifact>`
+extracts the exact event-name union, while `EventProperties<Artifact, Name>`
+extracts one event's required and optional property object.
+`ValidationResult<Artifact>` is a closed discriminated union: success
+correlates `eventName` with validated `properties`; failures carry fixed codes
+and never rejected caller data.
 
 The validator accepts unknown runtime input for JavaScript and decoded-data
 callers. Bare and `pub()` values must satisfy their descriptors. Authentic
@@ -190,7 +193,7 @@ caller-selected constraint, because a payload-dependent result would become a
 range or equality oracle; their descriptor compatibility remains a TypeScript
 guarantee and the server grammar remains authoritative for modified clients.
 
-<!-- api: defineEvents, EventArtifact, EventName, EventProperties, ValidationResult -->
+<!-- api: defineEvents, AnalyticsLintArtifactV1, EventArtifact, EventName, EventProperties, ValidationResult -->
 
 ### Canonical analytics grammar
 
@@ -1096,6 +1099,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `AnalyticsGrammarNamedStringConstraint`
 - `AnalyticsGrammarProperty`
 - `AnalyticsGrammarV1`
+- `AnalyticsLintArtifactV1`
 - `Batcher`
 - `BatcherOptions`
 - `BatchFlushOutcome`

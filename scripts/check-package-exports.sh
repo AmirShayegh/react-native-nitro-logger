@@ -87,12 +87,15 @@ test('the packed CommonJS analytics artifact executes', () => {
   expect(events.grammar.additionalEvents).toBe(false);
   expect(events.grammar.events[0].additionalProperties).toBe(false);
   expect(JSON.stringify(events.grammar)).toBe(events.grammarJSON);
+  expect(events.lint).toEqual({formatVersion: 1, grammar: events.grammar});
+  expect(events.lint.grammar).toBe(events.grammar);
 });
 EOF
 
 echo "==> installing the tarball into a consumer project"
 if ! npm install --silent --no-audit --no-fund --no-package-lock \
   "$TARBALL" react-native react-native-nitro-modules \
+  @react-native/metro-config \
   jest@29 babel-jest@29 @babel/core @babel/runtime \
   typescript \
   @react-native/babel-preset @react-native/jest-preset \
@@ -155,6 +158,8 @@ ESM_ANALYTICS="$(node --input-type=module -e "
   if (events.grammar.additionalEvents !== false) process.exit(1);
   if (events.grammar.events[0].additionalProperties !== false) process.exit(1);
   if (JSON.stringify(events.grammar) !== events.grammarJSON) process.exit(1);
+  if (events.lint.formatVersion !== 1) process.exit(1);
+  if (events.lint.grammar !== events.grammar) process.exit(1);
   console.log('PASS');
 " 2>&1)"
 if [ "$ESM_ANALYTICS" = "PASS" ]; then
@@ -171,6 +176,7 @@ import {
   type AnalyticsGrammar,
   type AnalyticsGrammarConstraint,
   type AnalyticsGrammarEvent,
+  type AnalyticsLintArtifactV1,
   type AnalyticsGrammarProperty,
   type AnalyticsGrammarV1,
   type EventProperties,
@@ -185,7 +191,8 @@ const grammarEvent: AnalyticsGrammarEvent = grammar.events[0]!;
 const grammarProperty: AnalyticsGrammarProperty = grammarEvent.properties[0]!;
 const grammarConstraint: AnalyticsGrammarConstraint = grammarProperty.constraint;
 const grammarJSON: string = events.grammarJSON;
-console.log(grammarV1, grammarEvent, grammarProperty, grammarConstraint, grammarJSON);
+const lint: AnalyticsLintArtifactV1 = events.lint;
+console.log(grammarV1, grammarEvent, grammarProperty, grammarConstraint, grammarJSON, lint);
 if (result.ok && result.eventName === 'probe') {
   const value: 'ok' | 'ready' | object = result.properties.value;
   console.log(value);
@@ -255,7 +262,7 @@ ANALYTICS_NAMES="$(node -e '
   const fs = require("fs"), path = require("path");
   const pkg = process.argv[1];
   const functions = ["defineEvents", "int", "namedString", "oneOf", "optional", "screenName"];
-  const types = ["AnalyticsGrammar", "AnalyticsGrammarConstraint", "AnalyticsGrammarEnumConstraint", "AnalyticsGrammarEvent", "AnalyticsGrammarIntegerConstraint", "AnalyticsGrammarNamedStringConstraint", "AnalyticsGrammarProperty", "AnalyticsGrammarV1", "EventArtifact", "EventName", "EventProperties", "ValidationResult"];
+  const types = ["AnalyticsGrammar", "AnalyticsGrammarConstraint", "AnalyticsGrammarEnumConstraint", "AnalyticsGrammarEvent", "AnalyticsGrammarIntegerConstraint", "AnalyticsGrammarNamedStringConstraint", "AnalyticsGrammarProperty", "AnalyticsGrammarV1", "AnalyticsLintArtifactV1", "EventArtifact", "EventName", "EventProperties", "ValidationResult"];
   const jsTargets = [
     ["lib/commonjs/analytics.js", (src, n) =>
       new RegExp("exports\\." + n + "\\s*=").test(src) ||
@@ -362,21 +369,58 @@ echo "==> what Metro selects"
 # from the installed Metro rather than written down here, so this stops being
 # true the moment Metro changes it.
 METRO="$(node -e '
+  (async () => {
   const fs = require("fs"), path = require("path");
   const [pkgDir, fixture] = process.argv.slice(1);
   const all = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).exports;
 
-  // The condition sets Metro actually uses, read from Metro itself.
+  // Load both real defaults. Omitting a source, substituting a documented
+  // fallback, or accepting a malformed result makes the checks below vacuous:
+  // they would prove only the condition set this script invented.
+  const sources = [
+    ["metro-config default", "metro-config"],
+    ["@react-native/metro-config default", "@react-native/metro-config"],
+  ];
   const sets = {};
-  try {
-    const mc = require(require.resolve("metro-config", { paths: [fixture] }));
-    sets["metro default"] = [];   // getDefaultConfig is async; [] is its documented default
-  } catch {}
-  try {
-    const rn = require(require.resolve("@react-native/metro-config", { paths: [fixture] }));
-    const d = rn.getDefaultConfig(fixture);
-    sets["react native"] = d.resolver.unstable_conditionNames ?? [];
-  } catch { sets["react native"] = ["react-native"]; }
+  const loadProblems = [];
+  for (const [label, moduleName] of sources) {
+    try {
+      const loaded = require(require.resolve(moduleName, { paths: [fixture] }));
+      if (!loaded || typeof loaded.getDefaultConfig !== "function") {
+        throw new TypeError("getDefaultConfig is not a function");
+      }
+      const config = await loaded.getDefaultConfig(fixture);
+      const resolver = config && config.resolver;
+      if (!resolver || !("unstable_conditionNames" in resolver)) {
+        throw new TypeError("resolver.unstable_conditionNames is missing");
+      }
+      const conditions = resolver.unstable_conditionNames;
+      if (!Array.isArray(conditions)) {
+        throw new TypeError("resolver.unstable_conditionNames is not an array");
+      }
+      if (
+        conditions.some(
+          (condition) => typeof condition !== "string" || condition.length === 0
+        )
+      ) {
+        throw new TypeError(
+          "resolver.unstable_conditionNames contains a non-string or empty condition"
+        );
+      }
+      sets[label] = [...conditions];
+    } catch (error) {
+      loadProblems.push(`${label}: ${String(error)}`);
+    }
+  }
+  for (const [label] of sources) {
+    if (!(label in sets) && !loadProblems.some((problem) => problem.startsWith(`${label}:`))) {
+      loadProblems.push(`${label}: condition set was not loaded`);
+    }
+  }
+  if (loadProblems.length > 0 || Object.keys(sets).length !== sources.length) {
+    console.log("FAIL|" + loadProblems.join("; "));
+    return;
+  }
 
   // The spec walk: first key whose condition is active wins; `default` always is.
   const pick = (node, active) => {
@@ -407,6 +451,9 @@ METRO="$(node -e '
     }
   }
   console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + Object.keys(sets).join(", "));
+  })().catch((error) => {
+    console.log("FAIL|Metro condition-set loader: " + String(error));
+  });
 ' "$PKG" "$FIXTURE" 2>&1)"
 if [[ "$METRO" == PASS* ]]; then
   note ok "all entries fall through to default -> lib/module (${METRO#PASS|})"

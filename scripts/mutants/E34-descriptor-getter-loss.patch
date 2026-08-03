@@ -1,0 +1,13 @@
+diff --git a/eslint-plugin/receiver-builtin-write-analysis.js b/eslint-plugin/receiver-builtin-write-analysis.js
+--- a/eslint-plugin/receiver-builtin-write-analysis.js
++++ b/eslint-plugin/receiver-builtin-write-analysis.js
+@@ -25,8 +25,5 @@
+     const object = resolveReceiverObject(context, descriptor);
+     const value = descriptorProperty(object, 'value');
+     if (value?.kind === 'init' && !value.method) return [value.value];
+-    const getter = descriptorProperty(object, 'get');
+-    return getter?.kind === 'init'
+-      ? receiverGetterValues(context, getter.value)
+-      : [opaqueNode];
++    return [opaqueNode];
+   }

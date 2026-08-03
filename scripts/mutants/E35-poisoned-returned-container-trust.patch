@@ -1,0 +1,12 @@
+diff --git a/eslint-plugin/event-method.js b/eslint-plugin/event-method.js
+--- a/eslint-plugin/event-method.js
++++ b/eslint-plugin/event-method.js
+@@ -312,7 +312,4 @@
+-  if (
+-    suspiciousReturnTargetWrapper(context, node) ||
+-    suspiciousShadowedIdentityWrapper(context, node)
+-  ) {
++  if (suspiciousShadowedIdentityWrapper(context, node)) {
+     return true;
+   }
+   const current = eventReference(context, node);

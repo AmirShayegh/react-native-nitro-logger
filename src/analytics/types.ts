@@ -10,6 +10,12 @@ import type {
 } from './descriptors';
 import type { AnalyticsGrammarV1 } from './grammar-format';
 
+/** Versioned ESLint input derived from the authoritative event grammar. */
+export interface AnalyticsLintArtifactV1 {
+  readonly formatVersion: 1;
+  readonly grammar: AnalyticsGrammarV1;
+}
+
 type DescriptorPrimitive<Value> =
   Value extends OptionalDescriptor<infer Inner>
     ? DescriptorPrimitive<Inner>
@@ -58,6 +64,7 @@ export interface EventArtifact<
   readonly schema: NormalizedSchema<Definition>;
   readonly grammar: AnalyticsGrammarV1;
   readonly grammarJSON: string;
+  readonly lint: AnalyticsLintArtifactV1;
   readonly [artifactDefinition]: Definition;
   validate(
     eventName: unknown,

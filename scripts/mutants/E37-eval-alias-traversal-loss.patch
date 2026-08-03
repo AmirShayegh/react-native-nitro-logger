@@ -1,0 +1,24 @@
+diff --git a/eslint-plugin/builtin-forwarder-analysis.js b/eslint-plugin/builtin-forwarder-analysis.js
+--- a/eslint-plugin/builtin-forwarder-analysis.js
++++ b/eslint-plugin/builtin-forwarder-analysis.js
+@@ -526,5 +526,8 @@ function createBuiltinForwarderUnit(dependencies, state) {
+       const current = record.value;
+-      if (possibleEvalReference(context, current)) {
++      if (
++        current.type !== 'MemberExpression' &&
++        possibleEvalReference(context, current)
++      ) {
+         record.direct = true;
+         continue;
+       }
+@@ -556,10 +559,6 @@ function createBuiltinForwarderUnit(dependencies, state) {
+         continue;
+       }
+       if (current.type === 'MemberExpression') {
+-        const projection = staticContainerMemberValues(current);
+-        for (const value of projection.values) {
+-          dependOn(record, 'node', value);
+-        }
+         continue;
+       }
+       if (current.type === 'CallExpression') {

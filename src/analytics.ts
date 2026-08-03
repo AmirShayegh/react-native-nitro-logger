@@ -23,6 +23,7 @@ export type {
   AnalyticsGrammarV1,
 } from './analytics/grammar-format';
 export type {
+  AnalyticsLintArtifactV1,
   EventArtifact,
   EventName,
   EventProperties,
@@ -35,10 +36,12 @@ export function defineEvents<const Definition extends EventDefinition>(
 ): EventArtifact<Definition> {
   const schema = normalizeDefinition(definition, GRAMMAR_V1_LIMITS);
   const { grammar, grammarJSON } = emitGrammar(schema);
+  const lint = Object.freeze({ formatVersion: 1 as const, grammar });
   return Object.freeze({
     schema,
     grammar,
     grammarJSON,
+    lint,
     validate: createValidator(schema),
   }) as EventArtifact<Definition>;
 }

@@ -1,5 +1,52 @@
 'use strict';
 
+const {
+  createBuiltinCallableProvenanceTools,
+} = require('./builtin-callable-provenance');
+const { createProjectionTools } = require('./event-projection');
+const {
+  OPAQUE_GETTER_VALUE,
+  createReceiverAliasTools,
+} = require('./receiver-alias-analysis');
+const { createClassReceiverTools } = require('./receiver-class-analysis');
+const { createReceiverPropertyTools } = require('./receiver-property-analysis');
+const { createReceiverObjectResolver } = require('./receiver-object-analysis');
+const { createReceiverWriteTools } = require('./receiver-write-analysis');
+const {
+  createStaticContainerProjectionUnit,
+} = require('./static-container-analysis');
+const { planStrongComponents } = require('./strong-component-analysis');
+
+const receiverAnalysisStats = new WeakMap();
+
+function attachReceiverAnalysisStats(context, stats) {
+  for (const name of [
+    'bindingSetEphemeralPeak',
+    'bindingSetEphemeralRemaining',
+    'bindingSetSccEdgeVisits',
+    'bindingSetSccSolveVisits',
+    'bindingSetSccVariables',
+    'evalBindingCacheHits',
+    'evalBindingComputations',
+    'evalSourceScans',
+    'staticContainerMemberWriteIndexComputations',
+    'staticContainerMemberWriteOverlapVisits',
+    'staticContainerMemberWriteReferenceVisits',
+    'staticContainerSourceCacheHits',
+    'staticContainerSourceDedupVisits',
+    'staticContainerSourceReferenceVisits',
+    'staticContainerSourceSummaryComputations',
+    'staticContainerPropertyIndexCacheHits',
+    'staticContainerPropertyIndexComputations',
+    'staticContainerPropertyIndexExactCandidateVisits',
+    'staticContainerPropertyIndexPropertyVisits',
+    'staticContainerPropertyIndexWildcardCandidateVisits',
+  ]) {
+    if (!Number.isFinite(stats[name])) stats[name] = 0;
+  }
+  receiverAnalysisStats.set(context, stats);
+}
+
 /**
  * Shared call-site analysis for the privacy lint rules.
  *
@@ -304,6 +351,130 @@ function propertyKeyName(property) {
   return null;
 }
 
+function contextWeakCache(root, context) {
+  let perContext = root.get(context);
+  if (!perContext) {
+    perContext = new WeakMap();
+    root.set(context, perContext);
+  }
+  return perContext;
+}
+
+function getOrCreateMap(parent, key) {
+  let map = parent.get(key);
+  if (!map) {
+    map = new Map();
+    parent.set(key, map);
+  }
+  return map;
+}
+
+function contextKeyedMap(root, context, key) {
+  return getOrCreateMap(contextWeakCache(root, context), key);
+}
+
+const {
+  expandedArrayElements,
+  expandedObjectProperties,
+  projectPatternBinding,
+  projectReferenceWrite,
+} = createProjectionTools({
+  analysisStats: (context) => receiverAnalysisStats.get(context),
+  bindingInit,
+  propertyKeyName,
+  resolveVariable,
+  unwrap,
+});
+
+const { classReceiverCandidates, classReceiverIdentity } =
+  createClassReceiverTools({
+    analysisStats: (context) => receiverAnalysisStats.get(context),
+    contextWeakCache,
+    identityWrappedValue,
+    isPoisonedIdentityWrapper,
+    projectPatternBinding,
+    projectReferenceWrite,
+    resolveVariable,
+    singleDef,
+    staticPropertyName,
+    unwrap,
+  });
+
+let resolveReceiverObject;
+
+const receiverAliasTools = createReceiverAliasTools({
+  analysisStats: (context) => receiverAnalysisStats.get(context),
+  bindingInit,
+  contextKeyedMap,
+  contextWeakCache,
+  expandedArrayElements,
+  expandedObjectProperties,
+  projectPatternBinding,
+  projectReferenceWrite,
+  propertyKeyName,
+  resolveReceiverObject: (...args) => resolveReceiverObject(...args),
+  resolveVariable,
+  singleDef,
+  staticPropertyName,
+  unwrap,
+});
+
+({ resolveReceiverObject } = createReceiverObjectResolver({
+  OPAQUE_GETTER_VALUE,
+  analysisStats: (context) => receiverAnalysisStats.get(context),
+  bindingInit,
+  contextWeakCache,
+  identityWrappedValue,
+  isBuiltinNamespaceUntampered,
+  propertyKeyName,
+  receiverGetterValues: (...args) =>
+    receiverAliasTools.receiverGetterValues(...args),
+  resolveVariable,
+  returnTargetWrapper,
+  staticStringValue,
+  unwrapFreeze,
+}));
+
+const receiverWriteTools = createReceiverWriteTools({
+  aliasTools: receiverAliasTools,
+  analysisStats: (context) => receiverAnalysisStats.get(context),
+  contextKeyedMap,
+  contextWeakCache,
+  expandedObjectProperties,
+  getOrCreateMap,
+  isDeferred,
+  isNamespaceMethod,
+  propertyKeyName,
+  receiverProperty,
+  resolveReceiverObject,
+  resolveVariable,
+  staticPropertyName,
+  staticStringValue,
+  unwrap,
+});
+
+const {
+  graphClosure,
+  receiverCallIsDeferred,
+  receiverPropertyCandidates,
+  receiverPropertyChangePoints,
+  receiverPropertyIsCallSensitive,
+  receiverWriteReachesCall,
+} = createReceiverPropertyTools({
+  aliasTools: receiverAliasTools,
+  analysisStats: (context) => receiverAnalysisStats.get(context),
+  classReceiverCandidates,
+  classReceiverIdentity,
+  contextKeyedMap,
+  isDeferred,
+  reachesCall,
+  receiverProperty,
+  resolveReceiverObject,
+  resolveVariable,
+  unwrap,
+  writeTools: receiverWriteTools,
+});
+
 /* -------------------------------------------------------------------------
  * Binding resolution
  * ---------------------------------------------------------------------- */
@@ -490,8 +661,233 @@ const NON_MUTATING_STATICS = new Set([
   'has',
   'ownKeys',
 ]);
-const BUILTIN_NAMESPACES = new Set(['Object', 'Reflect', 'JSON']);
+const BUILTIN_NAMESPACES = new Set([
+  'Object',
+  'Reflect',
+  'JSON',
+  'Proxy',
+  'Function',
+]);
+const BUILTIN_CALLABLE_NAMESPACES = new Set(['Function', 'Object', 'Proxy']);
 const GLOBAL_OBJECT_NAMES = new Set(['globalThis', 'global', 'window', 'self']);
+const IDENTITY_OBJECT_METHODS = new Set([
+  'freeze',
+  'preventExtensions',
+  'seal',
+]);
+const RETURN_TARGET_OBJECT_METHOD_ARITY = new Map([
+  ['assign', 1],
+  ['defineProperties', 2],
+  ['defineProperty', 3],
+  ['setPrototypeOf', 2],
+]);
+const staticArrayAliasReadOnlyCaches = new WeakMap();
+const staticArrayAliasResolutionCaches = new WeakMap();
+const STATIC_ARRAY_ALIAS_IN_PROGRESS = Symbol('static-array-alias-in-progress');
+const STATIC_ARRAY_ALIAS_RESOLUTION_IN_PROGRESS = Symbol(
+  'static-array-alias-resolution-in-progress'
+);
+const STATIC_ARRAY_ALIAS_OPAQUE = Symbol('static-array-alias-opaque');
+
+function readonlyArrayAliasSuccessors(context, variable) {
+  const def = singleDef(variable);
+  if (
+    !def ||
+    def.type !== 'Variable' ||
+    def.parent?.kind !== 'const' ||
+    def.node.id.type !== 'Identifier'
+  ) {
+    return null;
+  }
+  const successors = [];
+  for (const reference of variable.references) {
+    if (reference.isWrite()) {
+      if (reference.init !== true) return null;
+      continue;
+    }
+    const identifier = reference.identifier;
+    const parent = identifier?.parent;
+    if (parent?.type === 'SpreadElement') continue;
+    if (
+      parent?.type === 'VariableDeclarator' &&
+      parent.init === identifier &&
+      parent.id.type === 'Identifier' &&
+      parent.parent?.kind === 'const'
+    ) {
+      const alias = resolveVariable(context, parent.id);
+      if (!alias) return null;
+      successors.push(alias);
+      continue;
+    }
+    return null;
+  }
+  return successors;
+}
+
+function staticArrayAliasIsReadOnly(context, start) {
+  const cache = contextWeakCache(staticArrayAliasReadOnlyCaches, context);
+  const cached = cache.get(start);
+  if (cached !== undefined) return cached === true;
+  const pending = [start];
+  const visited = new Set();
+  let readOnly = true;
+  while (pending.length > 0) {
+    const variable = pending.pop();
+    const known = cache.get(variable);
+    if (known === true) continue;
+    if (known === false || known === STATIC_ARRAY_ALIAS_IN_PROGRESS) {
+      readOnly = false;
+      break;
+    }
+    cache.set(variable, STATIC_ARRAY_ALIAS_IN_PROGRESS);
+    visited.add(variable);
+    const stats = receiverAnalysisStats.get(context);
+    if (stats) stats.staticArrayAliasBindingVisits += 1;
+    const successors = readonlyArrayAliasSuccessors(context, variable);
+    if (!successors) {
+      readOnly = false;
+      break;
+    }
+    pending.push(...successors);
+  }
+  for (const variable of visited) cache.set(variable, readOnly);
+  return readOnly;
+}
+
+function staticArgumentArray(context, node) {
+  let current = unwrap(node);
+  const cache = contextWeakCache(staticArrayAliasResolutionCaches, context);
+  const path = [];
+  const seen = new Set();
+  let array = null;
+  while (current?.type === 'Identifier') {
+    const variable = resolveVariable(context, current);
+    if (!variable || seen.has(variable)) break;
+    const cached = cache.get(variable);
+    if (cached !== undefined) {
+      array =
+        cached === STATIC_ARRAY_ALIAS_OPAQUE ||
+        cached === STATIC_ARRAY_ALIAS_RESOLUTION_IN_PROGRESS
+          ? null
+          : cached;
+      break;
+    }
+    seen.add(variable);
+    path.push(variable);
+    cache.set(variable, STATIC_ARRAY_ALIAS_RESOLUTION_IN_PROGRESS);
+    const stats = receiverAnalysisStats.get(context);
+    if (stats) stats.staticArrayAliasResolutionHops += 1;
+    if (!staticArrayAliasIsReadOnly(context, variable)) break;
+    current = immutableInit(variable);
+  }
+  if (current?.type === 'ArrayExpression') array = current;
+  for (const variable of path) {
+    cache.set(variable, array ?? STATIC_ARRAY_ALIAS_OPAQUE);
+  }
+  return array;
+}
+
+function normalizeStaticArguments(context, elements) {
+  const args = [];
+  const active = new Set();
+  const root = { elements };
+  const pending = [{ array: root, index: 0 }];
+  active.add(root);
+  while (pending.length > 0) {
+    const frame = pending[pending.length - 1];
+    if (frame.index >= frame.array.elements.length) {
+      active.delete(frame.array);
+      pending.pop();
+      continue;
+    }
+    const element = frame.array.elements[frame.index];
+    frame.index += 1;
+    if (element?.type !== 'SpreadElement') {
+      args.push(element);
+      continue;
+    }
+    const array = staticArgumentArray(context, element.argument);
+    if (!array || active.has(array)) return { args: [], opaque: true };
+    active.add(array);
+    pending.push({ array, index: 0 });
+  }
+  return { args, opaque: false };
+}
+
+function identityWrapper(context, node) {
+  const call = unwrap(node);
+  if (call?.type !== 'CallExpression' || call.arguments.length !== 1) {
+    return null;
+  }
+  const callee = unwrap(call.callee);
+  const method =
+    callee?.type === 'MemberExpression'
+      ? staticPropertyName(context, callee)
+      : null;
+  return method &&
+    IDENTITY_OBJECT_METHODS.has(method) &&
+    builtinNamespaceOf(context, callee.object) === 'Object'
+    ? call
+    : null;
+}
+
+function identityWrappedValue(context, node) {
+  const call = identityWrapper(context, node);
+  return call &&
+    isUntamperedBuiltinReference(context, call.callee.object, 'Object')
+    ? call.arguments[0]
+    : null;
+}
+
+function isPoisonedIdentityWrapper(context, node) {
+  const call = identityWrapper(context, node);
+  return (
+    !!call &&
+    !isUntamperedBuiltinReference(context, call.callee.object, 'Object')
+  );
+}
+
+function returnTargetWrapper(context, node) {
+  const call = unwrap(node);
+  if (call?.type !== 'CallExpression') return null;
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  poisonedGlobals(context);
+  return (
+    builtinSourceAnalysisCache.get(sourceCode)?.resolveReturnTargetCall(call) ??
+    null
+  );
+}
+
+function returnTargetWrappedValue(context, node) {
+  const wrapper = returnTargetWrapper(context, node);
+  return wrapper &&
+    !wrapper.opaque &&
+    isBuiltinNamespaceUntampered(context, 'Object')
+    ? wrapper.arguments[0]
+    : null;
+}
+
+function isPoisonedReturnTargetWrapper(context, node) {
+  const wrapper = returnTargetWrapper(context, node);
+  return (
+    !!wrapper &&
+    (wrapper.opaque || !isBuiltinNamespaceUntampered(context, 'Object'))
+  );
+}
+
+function isUntamperedBuiltinReference(context, node, namespace) {
+  if (builtinNamespaceOf(context, node) !== namespace) return false;
+  return isBuiltinNamespaceUntampered(context, namespace);
+}
+
+function isBuiltinNamespaceUntampered(context, namespace) {
+  const poisoned = poisonedGlobals(context);
+  return !poisoned.has(ALL_NAMESPACES_POISONED) && !poisoned.has(namespace);
+}
+
+function isBuiltinNamespaceReference(context, node, namespace) {
+  return builtinNamespaceOf(context, node) === namespace;
+}
 
 /**
  * Builtin namespaces this file tampers with, in any of the ways that leave
@@ -511,7 +907,7 @@ const GLOBAL_OBJECT_NAMES = new Set(['globalThis', 'global', 'window', 'self']);
  *
  * One walk per file, cached.
  */
-const poisonedGlobalsCache = new WeakMap();
+const builtinSourceAnalysisCache = new WeakMap();
 const ALL_NAMESPACES_POISONED = Symbol('all');
 
 /**
@@ -549,6 +945,8 @@ function memberChain(node) {
 function builtinNamespaceOf(context, node, seen = new Set()) {
   const current = unwrap(node);
   if (!current) return null;
+  const stats = receiverAnalysisStats.get(context);
+  if (stats) stats.builtinNamespaceDirectVisits += 1;
 
   // `globalThis.Object`, and `const O = globalThis.Object` behind it.
   if (current.type === 'MemberExpression') {
@@ -581,236 +979,804 @@ function isGlobalObjectRef(context, node, seen = new Set()) {
   return isGlobalObjectRef(context, immutableInit(variable), seen);
 }
 
-function poisonedGlobals(context) {
-  // Keyed on the SOURCE, not the rule. What this computes is a function of
-  // the syntax tree alone: the nine functions reachable from here —
-  // `unwrap`, `memberChain`, `builtinNamespaceOf`, `isGlobalObjectRef`,
-  // `resolveVariable`, `lookUpVariable`, `immutableInit`, `singleDef` and
-  // this one — read no rule options between them, so four rules over one
-  // file were doing the same whole-file walk four times.
-  //
-  // This is the opposite call from `mutabilityCache` and the option name
-  // sets, which MUST stay per-context because they really do depend on
-  // configuration. The distinction is the whole reason to check rather than
-  // copy whichever neighbour is nearest.
-  const sourceCode = context.sourceCode ?? context.getSourceCode();
-  const cached = poisonedGlobalsCache.get(sourceCode);
+const possibleBuiltinNamespaceCaches = new WeakMap();
+const incompleteBuiltinNamespaceSets = new WeakSet();
+
+function incompleteBindingSet(incompleteSets) {
+  const values = new Set();
+  incompleteSets.add(values);
+  return values;
+}
+
+function sameSetValues(left, right) {
+  if (left === right) return true;
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
+}
+
+/**
+ * Resolve a graph of binding-to-Set dependencies without putting the JS call
+ * stack (or a copied `seen` Set) on every alias hop. Components are solved
+ * dependency-first. Empty placeholders make cycles explicitly incomplete;
+ * once one member finds evidence, a reverse worklist propagates that evidence
+ * through the component. Evidence-free cycles remain incomplete and uncached.
+ */
+function resolveBindingSetComponents({
+  analysisStats,
+  cache,
+  createPlaceholder = () => incompleteBindingSet(incompleteSets),
+  dependenciesOf,
+  evaluate,
+  hasEvidence = (resolution) => resolution.values.size > 0,
+  incompleteSets,
+  merge,
+  omitPlaceholders = true,
+  onDiscover,
+  read,
+  rootVariable,
+}) {
+  const cached = cache.get(rootVariable);
   if (cached) return cached;
 
-  const poisoned = new Set();
-  // A namespace handed to a function can be wrapped on the way:
-  // `tamper(...[Object])` and `tamper({ ns: Object })` pass the real thing.
-  const poisonNamespaceOf = (node, seen = new Set()) => {
-    const current = unwrap(node);
-    if (!current || seen.has(current)) return;
-    seen.add(current);
-    // A cycle or a pathological nesting depth must not end the search
-    // quietly: an unfinished search is exactly the case where a namespace
-    // could be in there somewhere.
-    if (seen.size > 64) {
-      poisoned.add(ALL_NAMESPACES_POISONED);
-      return;
-    }
-
-    const name = builtinNamespaceOf(context, current);
-    if (name !== null) {
-      poisoned.add(name);
-      return;
-    }
-    switch (current.type) {
-      case 'SpreadElement':
-        poisonNamespaceOf(current.argument, seen);
-        return;
-      case 'ArrayExpression':
-        for (const element of current.elements) {
-          poisonNamespaceOf(element, seen);
-        }
-        return;
-      case 'ObjectExpression':
-        for (const property of current.properties) {
-          poisonNamespaceOf(
-            property.type === 'SpreadElement'
-              ? property.argument
-              : property.value,
-            seen
-          );
-        }
-        return;
-      case 'ConditionalExpression':
-        poisonNamespaceOf(current.consequent, seen);
-        poisonNamespaceOf(current.alternate, seen);
-        return;
-      case 'LogicalExpression':
-        poisonNamespaceOf(current.left, seen);
-        poisonNamespaceOf(current.right, seen);
-        return;
-      case 'Identifier': {
-        // `const namespaces = { object: Object }; tamper(namespaces)` — the
-        // wrapper is a name, and the namespace is inside what it holds.
-        const variable = resolveVariable(context, current);
-        if (!variable || seen.has(variable)) return;
-        seen.add(variable);
-        poisonNamespaceOf(immutableInit(variable), seen);
-
-        // The wrapper may have been filled in after it was declared:
-        // `const bag = {}; bag.namespace = Object; tamper(bag)`. Its
-        // declaration says nothing, so the writes have to be read too —
-        // at any depth (`bag.inner.namespace = Object`) and through any
-        // alias (`const b = bag; b.namespace = Object`).
-        for (const reference of variable.references) {
-          const parent = reference.identifier.parent;
-          if (!parent) continue;
-
-          if (
-            parent.type === 'VariableDeclarator' &&
-            parent.init === reference.identifier &&
-            parent.id.type === 'Identifier'
-          ) {
-            poisonNamespaceOf(parent.id, seen);
-            continue;
-          }
-
-          if (
-            parent.type !== 'MemberExpression' ||
-            parent.object !== reference.identifier
-          ) {
-            continue;
-          }
-          let member = parent;
-          for (;;) {
-            const owner = member.parent;
-            if (!owner) break;
-            if (
-              owner.type === 'AssignmentExpression' &&
-              owner.left === member
-            ) {
-              poisonNamespaceOf(owner.right, seen);
-              break;
-            }
-            if (owner.type === 'MemberExpression' && owner.object === member) {
-              member = owner;
-              continue;
-            }
-            break;
-          }
-        }
-        return;
+  const records = new Map();
+  const pending = [rootVariable];
+  while (pending.length > 0) {
+    const variable = pending.pop();
+    if (cache.has(variable) || records.has(variable)) continue;
+    const descriptor = read(variable);
+    const dependencies = new Set();
+    for (const source of descriptor.sources) {
+      for (const dependency of dependenciesOf(source)) {
+        if (!cache.has(dependency)) dependencies.add(dependency);
       }
-      default:
-        return;
     }
+    records.set(variable, { dependencies, descriptor });
+    onDiscover?.(variable);
+    for (const dependency of dependencies) pending.push(dependency);
+  }
+
+  const {
+    componentOf,
+    components,
+    cyclic: cyclicComponents,
+    order,
+    reverse,
+  } = planStrongComponents(records);
+
+  // The placeholders are observable only while this synchronous solve is in
+  // progress. They prevent an evaluator from recursively starting the same
+  // graph when it reaches a dependency nested in a conditional/container.
+  const ephemeral = new Set();
+  const placeholders = new WeakSet();
+  for (const variable of records.keys()) {
+    const placeholder = createPlaceholder();
+    placeholders.add(placeholder);
+    cache.set(variable, placeholder);
+    ephemeral.add(variable);
+  }
+  if (analysisStats) {
+    analysisStats.bindingSetEphemeralPeak = Math.max(
+      analysisStats.bindingSetEphemeralPeak,
+      ephemeral.size
+    );
+    analysisStats.bindingSetEphemeralRemaining = ephemeral.size;
+  }
+
+  const publish = (variable, resolution) => {
+    cache.set(variable, resolution.values);
+    if (resolution.incomplete) incompleteSets.add(resolution.values);
+    if (resolution.cache === false) ephemeral.add(variable);
+    else ephemeral.delete(variable);
   };
-  const poisonWriteTarget = (target) => {
-    const { root, path } = memberChain(target);
-    if (!root || root.type !== 'Identifier' || path.length === 0) return;
-
-    // `Object.keys = …`, and `const O = Object; O.keys = …` — a method on the
-    // real namespace, however the namespace was spelled.
-    const namespace = builtinNamespaceOf(context, root);
-    if (namespace !== null) {
-      poisoned.add(namespace);
-      return;
-    }
-
-    // `globalThis.JSON = …`, `globalThis['JSON'].parse = …`,
-    // `const g = globalThis; g.JSON = …` — replacement reached through the
-    // global object, at any depth.
-    if (!isGlobalObjectRef(context, root)) return;
-    const key = path[0];
-    if (key === null) poisoned.add(ALL_NAMESPACES_POISONED);
-    else if (BUILTIN_NAMESPACES.has(key)) poisoned.add(key);
+  const solve = (variable) => {
+    const record = records.get(variable);
+    const evaluated = record.descriptor.sources.map(evaluate);
+    const candidates = evaluated.filter(
+      (candidate) => !omitPlaceholders || !placeholders.has(candidate)
+    );
+    return {
+      ...merge(record.descriptor, candidates),
+      // A definite empty value from outside the component is still an
+      // anchor. Propagating that third state distinguishes an ordinary cycle
+      // from a cycle whose only observations are in-progress placeholders.
+      anchored: evaluated.some((candidate) => !placeholders.has(candidate)),
+    };
   };
-
-  // A write target can be a whole destructuring pattern:
-  // `({ keys: Object.keys } = { keys: fake })` replaces the builtin without
-  // any assignment whose left side is a member expression.
-  const poisonPattern = (node) => {
-    if (!node) return;
-    switch (node.type) {
-      case 'ObjectPattern':
-        for (const property of node.properties) {
-          poisonPattern(
-            property.type === 'RestElement' ? property.argument : property.value
-          );
+  for (const componentIndex of order) {
+    const component = components[componentIndex];
+    if (!cyclicComponents[componentIndex]) {
+      publish(component[0], solve(component[0]));
+    } else {
+      if (analysisStats) {
+        analysisStats.bindingSetSccVariables += component.length;
+      }
+      // Keep every SCC member eligible after its first evidence. The old
+      // one-shot worklist removed it permanently, so evidence reaching a
+      // neighbour later never flowed back and the result depended on source
+      // order. Cache entries here are component-private provisional values;
+      // final publication still occurs only after the worklist converges.
+      const worklist = [...component];
+      const queued = new Set(component);
+      while (worklist.length > 0) {
+        const variable = worklist.pop();
+        queued.delete(variable);
+        if (analysisStats) analysisStats.bindingSetSccSolveVisits += 1;
+        const resolution = solve(variable);
+        if (!hasEvidence(resolution) && !resolution.anchored) continue;
+        const previous = cache.get(variable);
+        if (
+          !placeholders.has(previous) &&
+          sameSetValues(previous, resolution.values)
+        ) {
+          continue;
         }
-        return;
-      case 'ArrayPattern':
-        for (const element of node.elements) poisonPattern(element);
-        return;
-      case 'AssignmentPattern':
-        poisonPattern(node.left);
-        return;
-      case 'RestElement':
-        poisonPattern(node.argument);
-        return;
-      default:
-        poisonWriteTarget(node);
+        cache.set(variable, resolution.values);
+        for (const dependent of reverse.get(variable)) {
+          if (componentOf.get(dependent) !== componentIndex) continue;
+          if (analysisStats) analysisStats.bindingSetSccEdgeVisits += 1;
+          if (!queued.has(dependent)) {
+            queued.add(dependent);
+            worklist.push(dependent);
+          }
+        }
+      }
+
+      // One last read sees the converged component. Evidence-free cycles stay
+      // ephemeral and incomplete; evidence-bearing members publish together.
+      const converged = component.map((variable) => {
+        if (analysisStats) analysisStats.bindingSetSccSolveVisits += 1;
+        return [variable, solve(variable)];
+      });
+      for (const [variable, resolution] of converged) {
+        publish(
+          variable,
+          hasEvidence(resolution) || resolution.anchored
+            ? resolution
+            : { ...resolution, cache: false, incomplete: true }
+        );
+      }
     }
-  };
+  }
 
-  const visitorKeys = sourceCode.visitorKeys ?? {};
+  const values = cache.get(rootVariable);
+  for (const variable of ephemeral) cache.delete(variable);
+  ephemeral.clear();
+  if (analysisStats) analysisStats.bindingSetEphemeralRemaining = 0;
+  return values;
+}
 
-  // Retained deliberately, and NOT pinned by any test — recorded here rather
-  // than left to look load-bearing. Removing it leaves all 407 plugin tests
-  // passing and the walk terminating, because nothing in the corpus reaches
-  // one node under two visitor keys. That is a fact about the fixtures, not
-  // a proof about TS-ESTree, and the cost of being wrong is a walk that does
-  // not finish inside someone's editor. It stays until the stronger claim is
-  // actually proven.
+function builtinNamespaceDependency(context, node) {
+  let current = unwrap(node);
+  if (!current) return [];
+  if (current.type !== 'Identifier') {
+    if (builtinNamespaceOf(context, current) !== null) return [];
+    const chain = memberChain(current);
+    if (!chain.root || chain.root === current) return [];
+    current = chain.root;
+  }
+  if (current.type !== 'Identifier') return [];
+  const variable = resolveVariable(context, current);
+  return variable?.defs.length > 0 ? [variable] : [];
+}
+
+function builtinNamespaceSources(context, variable) {
+  const sources = [];
+  const def = singleDef(variable);
+  if (def?.type === 'Variable' && def.node.init) {
+    sources.push(
+      ...projectPatternBinding(
+        def.node.id,
+        def.name ?? def.node.id,
+        def.node.init,
+        context
+      ).values
+    );
+  }
+  for (const reference of variable.references) {
+    if (!reference.isWrite() || reference.init === true) continue;
+    sources.push(...projectReferenceWrite(reference, context).values);
+  }
+  return sources;
+}
+
+function possibleBuiltinNamespaces(context, node) {
+  const current = unwrap(node);
+  if (!current) return new Set();
+  if (current.type !== 'Identifier') {
+    const direct = builtinNamespaceOf(context, current);
+    if (direct !== null) return new Set([direct]);
+    const { root } = memberChain(current);
+    return root && root !== current
+      ? possibleBuiltinNamespaces(context, root)
+      : new Set();
+  }
+  const variable = resolveVariable(context, current);
+  if (!variable || variable.defs.length === 0) {
+    return BUILTIN_NAMESPACES.has(current.name)
+      ? new Set([current.name])
+      : new Set();
+  }
+  const cache = contextWeakCache(possibleBuiltinNamespaceCaches, context);
+  return resolveBindingSetComponents({
+    analysisStats: receiverAnalysisStats.get(context),
+    cache,
+    dependenciesOf: (source) => builtinNamespaceDependency(context, source),
+    evaluate: (source) => possibleBuiltinNamespaces(context, source),
+    incompleteSets: incompleteBuiltinNamespaceSets,
+    merge(_descriptor, sourceNamespaceSets) {
+      const stats = receiverAnalysisStats.get(context);
+      const incomplete = sourceNamespaceSets.some((sourceNamespaces) =>
+        incompleteBuiltinNamespaceSets.has(sourceNamespaces)
+      );
+      if (
+        incomplete &&
+        sourceNamespaceSets.every(
+          (sourceNamespaces) => sourceNamespaces.size === 0
+        )
+      ) {
+        return { cache: false, incomplete: true, values: new Set() };
+      }
+      if (
+        !incomplete &&
+        sourceNamespaceSets.length > 0 &&
+        sourceNamespaceSets.every(
+          (sourceNamespaces) => sourceNamespaces === sourceNamespaceSets[0]
+        )
+      ) {
+        return { values: sourceNamespaceSets[0] };
+      }
+      const namespaces = incomplete ? new Set(BUILTIN_NAMESPACES) : new Set();
+      for (const sourceNamespaces of sourceNamespaceSets) {
+        if (stats) {
+          stats.builtinNamespaceMergeVisits += sourceNamespaces.size;
+        }
+        for (const namespace of sourceNamespaces) namespaces.add(namespace);
+      }
+      return { values: namespaces };
+    },
+    onDiscover() {
+      const stats = receiverAnalysisStats.get(context);
+      if (stats) stats.builtinNamespaceBindingComputations += 1;
+    },
+    read: (binding) => ({
+      sources: builtinNamespaceSources(context, binding),
+    }),
+    rootVariable: variable,
+  });
+}
+
+function possibleGlobalObjectRef(context, node, seen = new Set()) {
+  if (isGlobalObjectRef(context, node)) return true;
+  const current = unwrap(node);
+  if (current?.type !== 'Identifier') return false;
+  const variable = resolveVariable(context, current);
+  if (!variable || seen.has(variable)) return false;
+  const nextSeen = new Set(seen);
+  nextSeen.add(variable);
+  const sources = [];
+  const def = singleDef(variable);
+  if (def?.type === 'Variable' && def.node.init) {
+    sources.push(
+      ...projectPatternBinding(
+        def.node.id,
+        def.name ?? def.node.id,
+        def.node.init,
+        context
+      ).values
+    );
+  }
+  for (const reference of variable.references) {
+    if (!reference.isWrite() || reference.init === true) continue;
+    sources.push(...projectReferenceWrite(reference, context).values);
+  }
+  return sources.some((source) =>
+    possibleGlobalObjectRef(context, source, nextSeen)
+  );
+}
+
+const EVAL_REFERENCE = Symbol('eval-reference');
+const possibleEvalBindingCaches = new WeakMap();
+const possibleEvalContainerCaches = new WeakMap();
+const possibleEvalFactCaches = new WeakMap();
+const incompleteEvalReferenceSets = new WeakSet();
+const staticContainerProjectionFacades = new WeakMap();
+
+function possibleEvalContainerReference(context, node) {
+  const current = unwrap(node);
+  if (current?.type !== 'Identifier') return true;
+  const variable = resolveVariable(context, current);
+  if (!variable || variable.defs.length === 0) return false;
+  const cache = contextWeakCache(possibleEvalContainerCaches, context);
+  if (cache.has(variable)) return cache.get(variable);
+
+  // Publish the negative provisional value before projection so a container
+  // that selects itself cannot recursively restart the same query. Exact
+  // eval evidence replaces it before any external caller observes the cache.
+  cache.set(variable, false);
+  const projection = staticContainerProjectionFacades.get(context);
+  const selected = projection?.staticContainerKeyValues(current, null);
+  const reachesEval =
+    selected?.values.some((value) => possibleEvalReference(context, value)) ??
+    false;
+  cache.set(variable, reachesEval);
+  return reachesEval;
+}
+
+function possibleEvalFacts(context, node) {
+  const factCache = contextWeakCache(possibleEvalFactCaches, context);
+  const root = unwrap(node);
+  if (!root) return Object.freeze({ dependencies: new Set(), direct: false });
+  const cached = factCache.get(root);
+  if (cached) return cached;
+
+  const stats = receiverAnalysisStats.get(context);
+  if (stats) stats.evalSourceScans += 1;
+  const dependencies = new Set();
+  let direct = false;
+  const pending = [root];
   const seenNodes = new Set();
-  const visit = (node) => {
-    if (!node || typeof node.type !== 'string' || seenNodes.has(node)) return;
-    seenNodes.add(node);
-
-    switch (node.type) {
-      case 'AssignmentExpression':
-        poisonPattern(node.left);
-        break;
-      case 'ForOfStatement':
-      case 'ForInStatement':
-        // `for (Object.keys of [fake]) {}`. A `VariableDeclaration` here
-        // declares a fresh binding and falls through harmlessly.
-        poisonPattern(node.left);
-        break;
-      case 'UpdateExpression':
-        poisonWriteTarget(node.argument);
-        break;
-      case 'UnaryExpression':
-        if (node.operator === 'delete') poisonWriteTarget(node.argument);
-        break;
-      case 'CallExpression':
-      case 'NewExpression':
-        // A namespace handed to a function is a namespace that function can
-        // rewrite, whatever the function is.
-        for (const argument of node.arguments) poisonNamespaceOf(argument);
-        break;
-      default:
-        break;
+  const projection = staticContainerProjectionFacades.get(context);
+  while (pending.length > 0) {
+    const current = unwrap(pending.pop());
+    if (!current || seenNodes.has(current)) continue;
+    seenNodes.add(current);
+    if (
+      current.type === 'ConditionalExpression' ||
+      current.type === 'LogicalExpression'
+    ) {
+      if (current.type === 'ConditionalExpression') {
+        pending.push(current.consequent, current.alternate);
+      } else {
+        pending.push(current.left, current.right);
+      }
+      continue;
     }
-
-    // The parser's own child-key table, which skips `loc`, `range`, `type`
-    // and the rest that `Object.keys` was walking on every node.
-    //
-    // The fallback is MANDATORY and must never become a `continue`. A node
-    // type missing from the table is a node type this walk has never seen,
-    // which is exactly when it must look hardest: skipping it means missing
-    // a write to a namespace, which means treating a poisoned `Object.keys`
-    // as trustworthy, which means reading a metadata key set that is not
-    // really there. In a privacy rule the failure is a FALSE NEGATIVE — a
-    // patient identifier logged because the rule decided it had checked.
-    // Walking a few extra properties is the cheap side of that trade.
-    const keys = visitorKeys[node.type] ?? Object.keys(node);
-    for (const key of keys) {
-      if (key === 'parent') continue;
-      const value = node[key];
-      if (Array.isArray(value)) value.forEach(visit);
-      else if (value && typeof value.type === 'string') visit(value);
+    if (current.type === 'MemberExpression') {
+      const key =
+        projection?.staticMemberKey(current) ??
+        (current.computed && current.property.type === 'Literal'
+          ? String(current.property.value)
+          : !current.computed && current.property.type === 'Identifier'
+            ? current.property.name
+            : null);
+      if (key === 'eval' && possibleGlobalObjectRef(context, current.object)) {
+        direct = true;
+        continue;
+      }
+      if (key === 'call' || key === 'apply') pending.push(current.object);
+      const selected =
+        projection && possibleEvalContainerReference(context, current.object)
+          ? projection.staticContainerMemberValues(current)
+          : null;
+      if (selected) pending.push(...selected.values);
+      continue;
     }
+    if (current.type !== 'Identifier') continue;
+    const variable = resolveVariable(context, current);
+    if (!variable || variable.defs.length === 0) {
+      if (current.name === 'eval') direct = true;
+      continue;
+    }
+    dependencies.add(variable);
+  }
+  const facts = Object.freeze({ dependencies, direct });
+  factCache.set(root, facts);
+  return facts;
+}
+
+function possibleEvalBinding(context, variable) {
+  const cache = contextWeakCache(possibleEvalBindingCaches, context);
+  if (cache.has(variable)) {
+    const stats = receiverAnalysisStats.get(context);
+    if (stats) stats.evalBindingCacheHits += 1;
+    return cache.get(variable);
+  }
+  return resolveBindingSetComponents({
+    // Eval reachability has dedicated counters below. Do not blend this
+    // independent graph into the legacy binding-set SCC budget.
+    analysisStats: null,
+    cache,
+    dependenciesOf: (source) => possibleEvalFacts(context, source).dependencies,
+    evaluate: (source) =>
+      possibleEvalReference(context, source)
+        ? new Set([EVAL_REFERENCE])
+        : new Set(),
+    incompleteSets: incompleteEvalReferenceSets,
+    merge(_descriptor, sourceSets) {
+      if (sourceSets.some((sourceSet) => sourceSet.has(EVAL_REFERENCE))) {
+        return { values: new Set([EVAL_REFERENCE]) };
+      }
+      if (
+        sourceSets.some((sourceSet) =>
+          incompleteEvalReferenceSets.has(sourceSet)
+        )
+      ) {
+        return { cache: false, incomplete: true, values: new Set() };
+      }
+      return { values: new Set() };
+    },
+    onDiscover() {
+      const stats = receiverAnalysisStats.get(context);
+      if (stats) stats.evalBindingComputations += 1;
+    },
+    read: (binding) => ({ sources: builtinNamespaceSources(context, binding) }),
+    rootVariable: variable,
+  });
+}
+
+function possibleEvalReference(context, node) {
+  const facts = possibleEvalFacts(context, node);
+  if (facts.direct) return true;
+  for (const dependency of facts.dependencies) {
+    if (possibleEvalBinding(context, dependency).has(EVAL_REFERENCE)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Build the mutation-only half of builtin callable provenance. */
+
+function createStaticContainerProjectionFacade(context) {
+  const projection = createStaticContainerProjectionUnit({
+    builtinNamespaceOf,
+    context,
+    expandedArrayElements,
+    immutableInit,
+    isWriteTarget,
+    projectPatternBinding,
+    projectReferenceWrite,
+    propertyKeyName,
+    receiverAnalysisStats,
+    resolveVariable,
+    singleDef,
+    unwrap,
+  });
+  staticContainerProjectionFacades.set(context, projection);
+  return projection;
+}
+function createBuiltinNamespaceValueUnit({ context, containerProjection }) {
+  const {
+    referenceStaticContainerPatternValues,
+    staticContainerMemberValues,
+    staticContainerPatternValues,
+  } = containerProjection;
+  const state = Object.freeze({
+    cache: new WeakMap(),
+    incompleteSets: new WeakSet(),
+  });
+  const builtinNamespaceValueSources = (variable) => {
+    const sources = [];
+    const seenSources = new Set();
+    let opaque = false;
+    const append = (staticProjection, projection) => {
+      for (const candidate of [
+        ...staticProjection.values,
+        ...projection.values,
+      ]) {
+        if (!seenSources.has(candidate)) {
+          seenSources.add(candidate);
+          sources.push(candidate);
+        }
+      }
+      opaque ||=
+        staticProjection.values.length > 0
+          ? staticProjection.opaque
+          : staticProjection.opaque || projection.opaque;
+    };
+    const def = singleDef(variable);
+    if (def?.type === 'Variable' && def.node.init) {
+      append(
+        staticContainerPatternValues(
+          def.node.id,
+          def.name ?? def.node.id,
+          def.node.init
+        ),
+        projectPatternBinding(
+          def.node.id,
+          def.name ?? def.node.id,
+          def.node.init,
+          context
+        )
+      );
+    }
+    for (const reference of variable.references) {
+      if (!reference.isWrite() || reference.init === true) continue;
+      append(
+        referenceStaticContainerPatternValues(reference),
+        projectReferenceWrite(reference, context)
+      );
+    }
+    return { opaque, sources };
   };
-  visit(sourceCode.ast);
 
-  poisonedGlobalsCache.set(sourceCode, poisoned);
-  return poisoned;
+  const builtinNamespaceValueDependencies = (node) => {
+    const dependencies = new Set();
+    const pending = [node];
+    const visited = new Set();
+    while (pending.length > 0) {
+      const current = unwrap(pending.pop());
+      if (!current || visited.has(current)) continue;
+      visited.add(current);
+      if (
+        current.type === 'ConditionalExpression' ||
+        current.type === 'LogicalExpression'
+      ) {
+        pending.push(
+          current.type === 'ConditionalExpression'
+            ? current.consequent
+            : current.left,
+          current.type === 'ConditionalExpression'
+            ? current.alternate
+            : current.right
+        );
+        continue;
+      }
+      if (current.type === 'MemberExpression') {
+        if (builtinNamespaceOf(context, current) !== null) continue;
+        const projection = staticContainerMemberValues(current, visited);
+        pending.push(...projection.values);
+        continue;
+      }
+      if (current.type !== 'Identifier') continue;
+      const variable = resolveVariable(context, current);
+      if (variable?.defs.length > 0) dependencies.add(variable);
+    }
+    return dependencies;
+  };
+
+  const possibleBuiltinNamespaceValues = (node, seen = new Set()) => {
+    const current = unwrap(node);
+    if (!current) return new Set();
+    if (
+      current.type === 'ConditionalExpression' ||
+      current.type === 'LogicalExpression'
+    ) {
+      const candidates = [
+        possibleBuiltinNamespaceValues(
+          current.type === 'ConditionalExpression'
+            ? current.consequent
+            : current.left,
+          seen
+        ),
+        possibleBuiltinNamespaceValues(
+          current.type === 'ConditionalExpression'
+            ? current.alternate
+            : current.right,
+          seen
+        ),
+      ];
+      const namespaces = new Set(
+        candidates.flatMap((candidate) => [...candidate])
+      );
+      if (
+        namespaces.size > 0 &&
+        candidates.some(
+          (candidate) =>
+            candidate.size === 0 || state.incompleteSets.has(candidate)
+        )
+      ) {
+        for (const namespace of BUILTIN_NAMESPACES) namespaces.add(namespace);
+      } else if (
+        candidates.some((candidate) => state.incompleteSets.has(candidate))
+      ) {
+        state.incompleteSets.add(namespaces);
+      }
+      return namespaces;
+    }
+    if (current.type === 'MemberExpression') {
+      const direct = builtinNamespaceOf(context, current);
+      if (direct !== null) return new Set([direct]);
+      if (seen.has(current)) {
+        return incompleteBindingSet(state.incompleteSets);
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(current);
+      const projection = staticContainerMemberValues(current, nextSeen);
+      const candidates = projection.values.map((value) =>
+        possibleBuiltinNamespaceValues(value, nextSeen)
+      );
+      const namespaces = new Set(
+        candidates.flatMap((candidate) => [...candidate])
+      );
+      const incomplete = candidates.some((candidate) =>
+        state.incompleteSets.has(candidate)
+      );
+      if (projection.namespaceOpaque) {
+        for (const namespace of BUILTIN_NAMESPACES) namespaces.add(namespace);
+      }
+      if (
+        namespaces.size > 0 &&
+        (projection.opaque ||
+          incomplete ||
+          candidates.some((candidate) => candidate.size === 0))
+      ) {
+        for (const namespace of BUILTIN_NAMESPACES) namespaces.add(namespace);
+      } else if (incomplete) {
+        state.incompleteSets.add(namespaces);
+      }
+      return namespaces;
+    }
+    if (current.type !== 'Identifier') {
+      const direct = builtinNamespaceOf(context, current);
+      return direct === null ? new Set() : new Set([direct]);
+    }
+    const variable = resolveVariable(context, current);
+    if (!variable || variable.defs.length === 0) {
+      return BUILTIN_NAMESPACES.has(current.name)
+        ? new Set([current.name])
+        : new Set();
+    }
+    if (seen.has(variable)) {
+      return incompleteBindingSet(state.incompleteSets);
+    }
+    return resolveBindingSetComponents({
+      analysisStats: receiverAnalysisStats.get(context),
+      cache: state.cache,
+      dependenciesOf: builtinNamespaceValueDependencies,
+      evaluate: (source) => possibleBuiltinNamespaceValues(source),
+      incompleteSets: state.incompleteSets,
+      merge(descriptor, sourceNamespaceSets) {
+        const namespaces = new Set();
+        const incomplete = sourceNamespaceSets.some((sourceNamespaces) =>
+          state.incompleteSets.has(sourceNamespaces)
+        );
+        let mixed = false;
+        for (const sourceNamespaces of sourceNamespaceSets) {
+          mixed ||= sourceNamespaces.size === 0;
+          for (const namespace of sourceNamespaces) {
+            namespaces.add(namespace);
+          }
+        }
+        if (incomplete && namespaces.size === 0) {
+          return { cache: false, incomplete: true, values: namespaces };
+        }
+        if (
+          incomplete ||
+          ((descriptor.opaque || mixed) && namespaces.size > 0)
+        ) {
+          for (const namespace of BUILTIN_NAMESPACES) {
+            namespaces.add(namespace);
+          }
+        }
+        return { values: namespaces };
+      },
+      read: builtinNamespaceValueSources,
+      rootVariable: variable,
+    });
+  };
+
+  const namespacePatternMethods = (pattern, target, source) => {
+    if (pattern?.type !== 'ObjectPattern') return new Set();
+    let current = target;
+    let property = null;
+    while (current && current !== pattern) {
+      const parent = current.parent;
+      if (!parent) return new Set();
+      if (parent.type === 'Property' && parent.value === current) {
+        property = parent;
+      }
+      current = parent;
+    }
+    if (!property || property.parent !== pattern || property.computed) {
+      return new Set();
+    }
+    const method = propertyKeyName(property);
+    if (method === null) return new Set();
+    return new Set(
+      [...possibleBuiltinNamespaceValues(source)].map(
+        (namespace) => `${namespace}:${method}`
+      )
+    );
+  };
+
+  const referenceNamespacePatternMethods = (reference) => {
+    const identifier = reference.identifier;
+    if (!identifier) return new Set();
+    let current = identifier;
+    for (let parent = current.parent; parent; parent = current.parent) {
+      const transparent =
+        parent.type === 'AssignmentPattern'
+          ? parent.left === current
+          : parent.type === 'Property'
+            ? parent.value === current
+            : parent.type === 'ObjectPattern' || parent.type === 'RestElement';
+      if (transparent) {
+        current = parent;
+        continue;
+      }
+      if (
+        parent.type === 'AssignmentExpression' &&
+        parent.left === current &&
+        ['=', '&&=', '||=', '??='].includes(parent.operator)
+      ) {
+        return namespacePatternMethods(current, identifier, parent.right);
+      }
+      break;
+    }
+    return new Set();
+  };
+
+  return Object.freeze({
+    namespacePatternMethods,
+    possibleBuiltinNamespaceValues,
+    referenceNamespacePatternMethods,
+  });
+}
+
+function createStaticContainerAndNamespaceUnit(context) {
+  const projection = createStaticContainerProjectionFacade(context);
+  const namespace = createBuiltinNamespaceValueUnit({
+    containerProjection: projection,
+    context,
+  });
+  return Object.freeze({ ...projection, ...namespace });
+}
+
+const { createBuiltinCallableProvenance, scanBuiltinPoisoning } =
+  createBuiltinCallableProvenanceTools({
+    ALL_NAMESPACES_POISONED,
+    BUILTIN_CALLABLE_NAMESPACES,
+    BUILTIN_NAMESPACES,
+    RETURN_TARGET_OBJECT_METHOD_ARITY,
+    builtinNamespaceOf,
+    createStaticContainerAndNamespaceUnit,
+    identityWrapper,
+    immutableInit,
+    memberChain,
+    normalizeStaticArguments,
+    possibleBuiltinNamespaces,
+    possibleEvalReference,
+    possibleGlobalObjectRef,
+    projectPatternBinding,
+    projectReferenceWrite,
+    propertyKeyName,
+    receiverAnalysisStats,
+    resolveBindingSetComponents,
+    resolveVariable,
+    singleDef,
+    unwrap,
+  });
+
+function poisonedGlobals(context) {
+  // Keyed on the SOURCE, not the rule. This analysis is syntax-derived, so
+  // every privacy rule over one file shares both the poison scan and callable
+  // provenance facade. Option-derived caches elsewhere remain per-context.
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const cached = builtinSourceAnalysisCache.get(sourceCode);
+  if (cached) return cached.poisoned;
+
+  // Publication is deliberately atomic. No consumer can observe the draft
+  // while the scan is still discovering a later Object/Function mutation.
+  const draft = createBuiltinCallableProvenance(context);
+  scanBuiltinPoisoning(sourceCode, draft.poisonScan);
+  const analysis = draft.publishAfterPoisonScan();
+  builtinSourceAnalysisCache.set(sourceCode, analysis);
+  return analysis.poisoned;
+}
+
+function indirectBoundCallable(context, node) {
+  const current = unwrap(node);
+  if (current?.type !== 'CallExpression') return null;
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  poisonedGlobals(context);
+  return (
+    builtinSourceAnalysisCache.get(sourceCode)?.indirectBindResult(current) ??
+    null
+  );
+}
+
+function reflectiveBuiltinCall(context, node) {
+  const current = unwrap(node);
+  if (current?.type !== 'CallExpression') return null;
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  poisonedGlobals(context);
+  return (
+    builtinSourceAnalysisCache.get(sourceCode)?.reflectiveCall(current) ?? null
+  );
 }
 
 /** Is this identifier an untouched global with the given name? */
@@ -1219,12 +2185,7 @@ function computeIsMutable(context, variable) {
 
 /** Is this identifier the untouched global `Object`? */
 function isGlobalObject(context, node) {
-  if (!node || node.type !== 'Identifier' || node.name !== 'Object') {
-    return false;
-  }
-  const variable = resolveVariable(context, node);
-  // Absent, or present as a declared global with no definition of its own.
-  return !variable || variable.defs.length === 0;
+  return isUntamperedBuiltinReference(context, node, 'Object');
 }
 
 /** `Object.freeze({...})` → the object literal, via the real `Object`. */
@@ -1371,19 +2332,6 @@ function resolveObjectLiteral(context, node, seen = new Set()) {
  * without the executable-literal gate. It keeps the key-ambiguity checks: a
  * spread or computed key really can mean the method is not the one named.
  */
-function resolveReceiverObject(context, node, seen = new Set()) {
-  const current = unwrapFreeze(context, node);
-  if (!current) return null;
-  if (current.type === 'ObjectExpression') return current;
-  if (current.type === 'Identifier') {
-    const variable = resolveVariable(context, current);
-    if (!variable || seen.has(variable)) return null;
-    seen.add(variable);
-    return resolveReceiverObject(context, bindingInit(variable), seen);
-  }
-  return null;
-}
-
 /**
  * Every value the property `name` of this container could hold: whatever the
  * literal gives it, plus anything a later `container.name = …` assigns.
@@ -1394,156 +2342,27 @@ function resolveReceiverObject(context, node, seen = new Set()) {
  * resolves to the stale non-logger value and falls silent on a call that is
  * a logger call by the time it runs.
  */
-function receiverPropertyCandidates(context, node, name, callNode) {
-  const candidates = [];
-  const property = receiverProperty(resolveReceiverObject(context, node), name);
-  if (property) candidates.push(property.value);
-
-  const current = unwrap(node);
-  if (!current || current.type !== 'Identifier') return candidates;
-  const variable = resolveVariable(context, current);
-  if (!variable) return candidates;
-
-  // The write sites are a property of the binding, not of where the call is,
-  // so they are found once and only the reachability question is asked per
-  // call site. That list is empty for almost every receiver.
-  for (const write of receiverWrites(context, variable, name)) {
-    if (!reachesCall(write.gate, callNode)) continue;
-    for (const value of write.values) candidates.push(value);
-  }
-  return candidates;
-}
-
-/**
- * Every site that could install `name` on `variable`, paired with the node
- * whose reachability decides whether it counts.
- *
- * Split out of {@link receiverPropertyCandidates} because that function ran
- * for every member call whose method is not an API method — `_.map`,
- * `axios.get`, `navigation.navigate` — and rescanned every reference of the
- * receiver's binding each time, which is O(references x call sites) per file.
- * Nothing in this scan depends on the call site except `reachesCall`, so the
- * scan is cached per (context, variable, name) and the call site supplies
- * only the filter.
- *
- * Cached per CONTEXT because `staticPropertyName` and `resolveReceiverObject`
- * both consult options-derived configuration on the way through.
- *
- * Reordering is safe because `reachesCall` is pure: it compares positions in
- * a syntax tree that is not being modified. The old code asked it before
- * resolving an `Object.assign` source and this asks it after, which changes
- * how much work is skipped and not which candidates come back.
- */
-const receiverWriteCache = new WeakMap();
-
-function receiverWrites(context, variable, name) {
-  let perContext = receiverWriteCache.get(context);
-  if (!perContext) {
-    perContext = new WeakMap();
-    receiverWriteCache.set(context, perContext);
-  }
-  let perVariable = perContext.get(variable);
-  if (!perVariable) {
-    perVariable = new Map();
-    perContext.set(variable, perVariable);
-  }
-  const cached = perVariable.get(name);
-  if (cached !== undefined) return cached;
-
-  const writes = computeReceiverWrites(context, variable, name);
-  perVariable.set(name, writes);
-  return writes;
-}
-
-function computeReceiverWrites(context, variable, name) {
-  const writes = [];
-  for (const reference of variable.references) {
-    const identifier = reference.identifier;
-    const member = identifier.parent;
-    if (!member || member.type !== 'MemberExpression') {
-      const call = member;
-      if (
-        !call ||
-        call.type !== 'CallExpression' ||
-        !call.arguments.includes(identifier)
-      ) {
-        continue;
-      }
-
-      // `Object.assign(handlers, { emit: Log.info })`, and the same thing one
-      // refactor out as `Object.assign(handlers, methods)`, install the
-      // method without ever naming `handlers.emit`.
-      if (
-        call.arguments[0] === identifier &&
-        isNamespaceMethod(context, call, 'Object', 'assign')
-      ) {
-        const values = [];
-        for (const source of call.arguments.slice(1)) {
-          const match = receiverProperty(
-            resolveReceiverObject(context, source),
-            name
-          );
-          if (match) values.push(match.value);
-        }
-        if (values.length > 0) writes.push({ gate: call, values });
-        continue;
-      }
-
-      // `function configure(target, fn) { target.emit = fn }` called as
-      // `configure(handlers, Log.info)` installs a logger this analysis does
-      // not follow, and DELIBERATELY so. Following it means reproducing
-      // interprocedural dataflow inside a lint rule: parameter defaults,
-      // destructuring at any depth, rest patterns, spread arguments,
-      // reassignment, shadowing, and every way a function can be invoked.
-      // Seven review rounds went into an implementation that kept finding new
-      // spellings, and the last one had started reporting ordinary code —
-      // `{ [key]: () => Log.info('setup') }` is a callback that logs a
-      // literal, not a logger installed on `handlers`.
-      //
-      // A lint rule that cries wolf gets switched off, and a rule that is
-      // switched off protects nothing.
-      //
-      // Being in the same file is NOT what makes a logger followable — the
-      // local `configure` above is exactly as invisible as an imported one.
-      // What is followed is a logger that reaches the call site without
-      // passing through a call: a direct call, a `Log.scoped(...)` result, a
-      // `const` alias of a method, a property assignment, an object literal,
-      // or `Object.assign`. Note that a call site this misses is outside ALL
-      // FOUR rules, metadata keys included. The runtime redacts metadata
-      // VALUES; keys are only stopped by the catalog, which is mandatory
-      // under privacyDefault('private') and absent by default otherwise.
-      // The README states the split in those terms.
-      continue;
-    }
-    if (
-      member.object !== identifier ||
-      staticPropertyName(context, member) !== name
-    ) {
-      continue;
-    }
-    const assignment = member.parent;
-    if (
-      assignment &&
-      assignment.type === 'AssignmentExpression' &&
-      assignment.left === member
-    ) {
-      writes.push({ gate: assignment, values: [assignment.right] });
-    }
-  }
-  return writes;
-}
-
-/**
 
 /** Is this a call to `Namespace.method(…)` on the untampered global? */
-function isNamespaceMethod(context, call, namespace, method) {
-  const callee = unwrap(call.callee);
+function isNamespaceReference(context, node, namespace, method) {
+  const callee = unwrap(node);
+  if (
+    !callee ||
+    callee.type !== 'MemberExpression' ||
+    staticPropertyName(context, callee) !== method
+  ) {
+    return false;
+  }
+  const namespaces = possibleBuiltinNamespaces(context, callee.object);
   return (
-    !!callee &&
-    callee.type === 'MemberExpression' &&
-    builtinNamespaceOf(context, callee.object) === namespace &&
-    staticPropertyName(context, callee) === method
+    namespaces.size === 1 &&
+    namespaces.has(namespace) &&
+    isBuiltinNamespaceUntampered(context, namespace)
   );
+}
+
+function isNamespaceMethod(context, call, namespace, method) {
+  return isNamespaceReference(context, call.callee, namespace, method);
 }
 
 /**
@@ -2806,6 +3625,10 @@ module.exports = {
   RECEIVER_OPTION_PROPERTIES,
   classifyConstruction,
   classifyReceiver,
+  classReceiverIdentity,
+  attachReceiverAnalysisStats,
+  contextKeyedMap,
+  contextWeakCache,
   correlationArguments,
   describeCall,
   describeIntegrationCall,
@@ -2813,6 +3636,15 @@ module.exports = {
   describeScopedCall,
   describeSubsystemConfigCall,
   integrationSubsystemArguments,
+  identityWrappedValue,
+  indirectBoundCallable,
+  isBuiltinNamespaceReference,
+  isBuiltinNamespaceUntampered,
+  isPoisonedIdentityWrapper,
+  isPoisonedReturnTargetWrapper,
+  isUntamperedBuiltinReference,
+  isNamespaceMethod,
+  isNamespaceReference,
   isMutable,
   isOmitted,
   isStaticMessage,
@@ -2820,8 +3652,20 @@ module.exports = {
   isTrustedLogger,
   maybeLogger,
   metadataArguments,
+  getOrCreateMap,
   objectProperty,
   optionsProperty,
+  possibleEvalReference,
+  projectPatternBinding,
+  projectReferenceWrite,
+  graphClosure,
+  receiverCallIsDeferred,
+  receiverPropertyCandidates,
+  receiverPropertyChangePoints,
+  receiverPropertyIsCallSensitive,
+  receiverWriteReachesCall,
+  reflectiveBuiltinCall,
+  returnTargetWrappedValue,
   resolveObjectLiteral,
   resolveVariable,
   singleDef,

@@ -71,6 +71,77 @@ Both fail closed on metadata: an object the rules cannot open is reported,
 because that is exactly the case where they cannot tell a reviewed key from a
 patient identifier.
 
+## Typed event rules
+
+`defineEvents()` also emits `events.lint`, an immutable, versioned view of the
+same closed grammar used by the runtime validator. Pass that artifact to
+`eventRules()` to enable the two schema-specific rules. They are deliberately
+not in the presets: a preset cannot invent the application's event schema.
+
+Keep the definition in one JavaScript module that both the application and
+ESLint can import:
+
+```js
+// src/events.mjs
+import { defineEvents, int, oneOf } from 'react-native-nitro-logger/analytics';
+
+export const events = defineEvents({
+  appointment_booked: {
+    clinic_type: oneOf('gp', 'specialist'),
+    lead_time_days: int({ min: 0, max: 365 }),
+    via: oneOf('search', 'referral'),
+  },
+});
+```
+
+Compose the generated entries with one existing preset:
+
+```js
+// eslint.config.mjs
+import nitroLogger from 'react-native-nitro-logger/eslint-plugin';
+import { events } from './src/events.mjs';
+
+const base = nitroLogger.configs.strictTypeScript;
+
+export default [
+  {
+    ...base,
+    rules: {
+      ...base.rules,
+      ...nitroLogger.eventRules(events.lint),
+    },
+  },
+];
+```
+
+`typed-event-schema` requires a statically known event name, a closed object
+literal, exactly the declared keys, every required key, and statically known
+values inside their declared enum or integer range. `require-event-privacy`
+allows schema-valid literals and constants, but requires every dynamic value
+to be wrapped in a proven one-argument `pub()` or `priv()` import:
+
+```js
+analytics.track('appointment_booked', {
+  clinic_type: 'gp',
+  lead_time_days: priv(patient.waitDays),
+  via: 'search',
+});
+```
+
+Wrapper names alone grant no trust. By default they must be imports from
+`react-native-nitro-logger`; configure `privacyModules` for an owned re-export.
+The other helper options are `analyticsNames` (default `['analytics']`) and
+`analyticsModules` (default `['react-native-nitro-logger/analytics']`). All
+options are snapshotted when `eventRules()` runs, as is the lint artifact.
+
+The event analysis is per-file. It follows direct `.track()` calls, const
+method aliases and destructuring, `.call`/`.apply`/`.bind`, statically named
+container fields, and TypeScript `private` or JavaScript `#private` analytics
+fields. It does not execute builders or follow values installed by arbitrary
+helper calls. A properties object may be a local const used only by that event
+call; a spread, computed key, escaped alias, builder result, or indirect
+argument list is reported as unanalyzable rather than approved.
+
 ## Configure `loggerModules` first
 
 Almost every app re-exports the logger from its own module:

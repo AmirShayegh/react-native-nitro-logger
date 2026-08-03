@@ -12,6 +12,7 @@ import type {
   AnalyticsGrammarEvent,
   AnalyticsGrammarProperty,
   AnalyticsGrammarV1,
+  AnalyticsLintArtifactV1,
   EventName,
   EventProperties,
   ValidationResult,
@@ -43,13 +44,15 @@ const grammarProperty: AnalyticsGrammarProperty = grammarEvent.properties[0]!;
 const grammarConstraint: AnalyticsGrammarConstraint =
   grammarProperty.constraint;
 const grammarJSON: string = events.grammarJSON;
+const lint: AnalyticsLintArtifactV1 = events.lint;
 consume(
   grammar,
   grammarV1,
   grammarEvent,
   grammarProperty,
   grammarConstraint,
-  grammarJSON
+  grammarJSON,
+  lint
 );
 
 // @ts-expect-error the format version is immutable
@@ -68,6 +71,10 @@ if (grammarConstraint.type === 'enum') {
 }
 // @ts-expect-error the authoritative grammar bytes are immutable
 events.grammarJSON = '{}';
+// @ts-expect-error the lint artifact format is immutable
+events.lint.formatVersion = 2;
+// @ts-expect-error the lint artifact grammar is immutable
+events.lint.grammar = grammar;
 
 type Events = typeof events;
 type Names = EventName<Events>;

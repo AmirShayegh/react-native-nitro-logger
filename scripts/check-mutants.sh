@@ -16,7 +16,7 @@
 #
 # ## What this proves, and what it does not
 #
-#   * It proves these SIXTEEN defects stay caught. It is not a coverage
+#   * It proves the manifest-listed defects stay caught. It is not a coverage
 #     measure and not a substitute for one — a line can be executed by every
 #     test in the suite and asserted on by none.
 #   * It cannot notice an invariant added after the manifest was written. New

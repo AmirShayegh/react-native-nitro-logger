@@ -153,7 +153,7 @@
     {
       "id": "E1-factory-binding-silenced",
       "patch": "E1-factory-binding-silenced.patch",
-      "target": "eslint-plugin/shared.js",
+      "target": "eslint-plugin/builtin-callable-provenance.js",
       "claim": "An unresolvable initializer falls through to the name heuristic instead of silencing every rule.",
       "expect_red": {
         "suite": "__tests__/eslintPlugin.test.js",
@@ -168,6 +168,156 @@
       "expect_red": {
         "suite": "__tests__/eslintPlugin.test.js",
         "test": "narrowing loggerClassNames still silences a construction"
+      }
+    },
+    {
+      "id": "E34-scc-one-shot",
+      "patch": "E34-scc-one-shot.patch",
+      "target": "eslint-plugin/shared.js",
+      "claim": "Every member of a cyclic binding component receives the converged Object/Reflect evidence, independent of source order.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "publishes every member of a mixed Object and Reflect namespace SCC"
+      }
+    },
+    {
+      "id": "E34-container-replacement-loss",
+      "patch": "E34-container-replacement-loss.patch",
+      "target": "eslint-plugin/static-container-expression-analysis.js",
+      "claim": "Whole-binding object and array replacements are projected instead of being mistaken for a self-cycle.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "joins whole-binding object and array container replacements"
+      }
+    },
+    {
+      "id": "E34-literal-getter-loss",
+      "patch": "E34-literal-getter-loss.patch",
+      "target": "eslint-plugin/receiver-alias-analysis.js",
+      "claim": "Object-literal getter properties contribute their returned receivers and methods, not the getter function itself.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "resolves object-literal getters that return analytics methods and receivers"
+      }
+    },
+    {
+      "id": "E34-descriptor-getter-loss",
+      "patch": "E34-descriptor-getter-loss.patch",
+      "target": "eslint-plugin/receiver-builtin-write-analysis.js",
+      "claim": "Object.defineProperty and Object.defineProperties getter descriptors contribute their returned receivers and methods.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "resolves descriptor getters that return analytics methods and receivers"
+      }
+    },
+    {
+      "id": "E34-returned-container-loss",
+      "patch": "E34-returned-container-loss.patch",
+      "target": "eslint-plugin/receiver-object-analysis.js",
+      "claim": "Object methods that return their target preserve properties added by assign, descriptor writes, and prototype composition.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "resolves analytics properties on returned containers"
+      }
+    },
+    {
+      "id": "E35-nested-getter-member-opacity",
+      "patch": "E35-nested-getter-member-opacity.patch",
+      "target": "eslint-plugin/event-method.js",
+      "claim": "A nested member returned by a getter is opaque unless its receiver is resolved, so event-callable rules fail closed instead of trusting its property name.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "fails closed for nested member uncertainty in object-literal getters"
+      }
+    },
+    {
+      "id": "E35-whole-binding-wrapper-replacement-loss",
+      "patch": "E35-whole-binding-wrapper-replacement-loss.patch",
+      "target": "eslint-plugin/receiver-binding-replacement-analysis.js",
+      "claim": "A whole-binding replacement through a returned or identity Object wrapper contributes the replacement object's event method at the replacement point.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "preserves Object.assign direct whole-binding replacement for an analytics method"
+      }
+    },
+    {
+      "id": "E35-assign-accessor-getter-loss",
+      "patch": "E35-assign-accessor-getter-loss.patch",
+      "target": "eslint-plugin/receiver-object-analysis.js",
+      "claim": "Object.assign copies an accessor source's returned event callable, not the getter function declaration.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "copies an analytics method from an Object.assign accessor source"
+      }
+    },
+    {
+      "id": "E35-returned-descriptor-getter-loss",
+      "patch": "E35-returned-descriptor-getter-loss.patch",
+      "target": "eslint-plugin/receiver-object-analysis.js",
+      "claim": "A getter descriptor on an Object.defineProperty return target contributes the getter's returned event callable to property projection.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "resolves a returned Object.defineProperty method shorthand getter for an analytics method"
+      }
+    },
+    {
+      "id": "E35-poisoned-returned-container-trust",
+      "patch": "E35-poisoned-returned-container-trust.patch",
+      "target": "eslint-plugin/event-method.js",
+      "claim": "A returned Object container is opaque when its wrapper is poisoned or shadowed and cannot inherit trusted analytics classification from its arguments.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "fails closed for a poisoned Object.assign returned container holding an analytics method"
+      }
+    },
+    {
+      "id": "E36-dynamic-code-guard-loss",
+      "patch": "E36-dynamic-code-guard-loss.patch",
+      "target": "eslint-plugin/builtin-poison-analysis.js",
+      "claim": "Direct or aliased eval and the real Function constructor poison every builtin-derived provenance answer because their generated code can replace globals without a visible AST write.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "fails closed for direct eval before Object.assign provenance"
+      }
+    },
+    {
+      "id": "E36-static-container-source-cache-loss",
+      "patch": "E36-static-container-source-cache-loss.patch",
+      "target": "eslint-plugin/static-container-index-analysis.js",
+      "claim": "Whole-binding static-container sources are summarized once per binding and reused across member queries instead of rescanning every replacement for every use.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "caches whole-binding static-container sources at 600 and 1200 member uses"
+      }
+    },
+    {
+      "id": "E37-eval-alias-traversal-loss",
+      "patch": "E37-eval-alias-traversal-loss.patch",
+      "target": "eslint-plugin/builtin-forwarder-analysis.js",
+      "claim": "Eval aliases held in static objects and arrays are traversed into the real eval reference; direct eval poisoning remains intact when this traversal is removed.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "fails closed for a container-held eval alias before Object.assign provenance"
+      }
+    },
+    {
+      "id": "E37-eval-binding-cache-loss",
+      "patch": "E37-eval-binding-cache-loss.patch",
+      "target": "eslint-plugin/shared.js",
+      "claim": "Eval reachability summaries are cached per binding and reused across repeated calls instead of rebuilding the same alias graph.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "caches eval reachability across 600 and 1200 calls through one alias"
+      }
+    },
+    {
+      "id": "E37-static-container-property-index-cache-loss",
+      "patch": "E37-static-container-property-index-cache-loss.patch",
+      "target": "eslint-plugin/static-container-member-analysis.js",
+      "claim": "One static object property index is reused across exact and wildcard member lookups instead of rescanning every property for every lookup.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "indexes exact and wildcard static-container properties at 600 and 1200 lookups"
       }
     }
   ],

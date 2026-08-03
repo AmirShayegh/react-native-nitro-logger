@@ -9,8 +9,10 @@ module.exports = {
   },
 
   /*
-   * Coverage is measured over `src/` only — the library, not the tests, the
-   * ESLint plugin or the gates.
+   * Coverage is measured over the runtime library and the published ESLint
+   * plugin, not the tests or shell gates. The plugin has its own aggregate
+   * threshold below so its branch-heavy analyzer cannot trade coverage with
+   * runtime modules under `src/`.
    *
    * The two exclusions are cosmetic, and saying so is the point. Both
    * `src/specs/*.nitro.ts` (Nitro spec declarations that nitrogen reads and
@@ -38,6 +40,7 @@ module.exports = {
     'src/**/*.{ts,tsx}',
     '!src/specs/*.nitro.ts',
     '!src/**/types.ts',
+    'eslint-plugin/**/*.js',
   ],
 
   /*
@@ -51,8 +54,8 @@ module.exports = {
    *
    * What this does NOT prove is that any line is TESTED. Coverage records
    * that a line ran, not that anything asserted about what it did. The other
-   * half of that is `check-mutants.sh`, which reintroduces sixteen real
-   * defects and requires the named test to fail for each; the two are not
+   * half of that is `check-mutants.sh`, which reintroduces the defects in its
+   * manifest and requires the named test to fail for each; the two are not
    * substitutes, and neither is a substitute for review.
    *
    * ## Why there are three tiers rather than one number
@@ -63,39 +66,36 @@ module.exports = {
    * be biggest, and a well-covered `destinations/` can pay for an untested
    * `integrations/`. So:
    *
-   *   - `global` is the whole-library aggregate. Least informative, kept
-   *     because it is the only one that notices coverage draining out of the
-   *     library as a whole.
-   *   - the four directory keys are per-directory AGGREGATES. They notice a
-   *     whole area going quiet, which the global number would absorb.
+   *   - `./src/` and `./eslint-plugin/` are independent whole-product
+   *     aggregates. Keeping them separate is load-bearing: a large,
+   *     well-covered runtime module cannot pay for an untested analyzer branch,
+   *     and the analyzer cannot weaken the runtime floor that existed before
+   *     plugin coverage joined this gate.
+   *   - the runtime directory keys are per-directory AGGREGATES. They notice a
+   *     whole area going quiet, which the `./src/` number would absorb.
    *   - `./src/*.{ts,tsx}` is a glob, and jest applies a glob PER FILE rather
    *     than to the group. That asymmetry is not an oversight: a directory key
-   *     matches every file beneath it, so `./src/` would mean "all of src" and
-   *     duplicate `global`, and there is no other way to say "the modules
-   *     directly in src/". Being per-file it has to clear the weakest of them
-   *     (`ScopedLogger.ts`), which makes it a cliff-edge guard rather than a
-   *     standard — it fails when a root module lands with no tests at all.
+   *     matches every file beneath it, while the glob is the only way to say
+   *     "the modules directly in src/". Being per-file it has to clear the
+   *     weakest of them (`ScopedLogger.ts`), which makes it a cliff-edge guard
+   *     rather than a standard — it fails when a root module lands with no
+   *     tests at all.
    *
    * Two pieces of jest behaviour this relies on, both verified against
    * `@jest/reporters` rather than assumed, and both load-bearing:
    *
-   *   - a file matched by any key is removed from `global`'s set, and when
-   *     that empties the set completely jest falls back to ALL covered files.
-   *     Every `src/` file matches one of the keys below, so `global` is
-   *     computed over the whole library, not over nothing. A mutation test
-   *     covers this: raising the global numbers above the measured aggregate
-   *     must fail, and would not if the group were empty. `global` therefore
-   *     depends on every file matching a narrower key, which is a property of
-   *     the tree rather than of this file — add `src/new-area/` and it stops
-   *     holding, silently. `scripts/check-coverage-groups.sh` is what makes
-   *     that fail instead, and `yarn test:coverage` runs it.
+   *   - a directory key is an aggregate over every covered file below that
+   *     path, even when narrower directory or glob thresholds also match it.
+   *     That is what lets `./src/` preserve the old whole-runtime floor while
+   *     its directories and root files keep their sharper local floors.
    *   - a key that matches no file at all is an ERROR ("Coverage data for X
    *     was not found"), not a skip. That is what stops a renamed directory
    *     from turning its threshold into decoration.
    *
-   * Measured 2026-08-02, at 1325 tests in 31 suites:
+   * Measured 2026-08-02, at 2173 tests in 33 suites:
    *
-   *   all files          96.82 stmts  92.47 branch  96.68 funcs  97.43 lines
+   *   src/               98.45 stmts  96.62 branch  98.80 funcs  99.11 lines
+   *   eslint-plugin/     90.04        83.95         95.32        92.86
    *   src/analytics      96.04        92.00        100.00        96.89
    *   src/destinations   97.49        92.55        100.00        98.63
    *   src/formatters    100.00        96.11        100.00       100.00
@@ -109,7 +109,7 @@ module.exports = {
    * mostly delegation to `Logger` and covered through it.
    */
   coverageThreshold: {
-    'global': { statements: 94, branches: 90, functions: 94, lines: 95 },
+    './src/': { statements: 94, branches: 90, functions: 94, lines: 95 },
     './src/analytics/': {
       statements: 94,
       branches: 90,
@@ -133,6 +133,12 @@ module.exports = {
       branches: 85,
       functions: 93,
       lines: 91,
+    },
+    './eslint-plugin/': {
+      statements: 87,
+      branches: 81,
+      functions: 93,
+      lines: 90,
     },
     './src/*.{ts,tsx}': {
       statements: 82,
