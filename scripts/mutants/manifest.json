@@ -369,6 +369,36 @@
         "suite": "__tests__/analyticsGoldenVectors.test.ts",
         "test": "binds the lint artifact to the grammar bytes used by the vectors"
       }
+    },
+    {
+      "id": "E38-receiver-cycle-incomplete",
+      "patch": "E38-receiver-cycle-incomplete.patch",
+      "target": "eslint-plugin/event-receiver.js",
+      "claim": "Every member of a cyclic receiver component receives the conservative analytics result; cache warm order never leaves a neighbour definitively non-analytics.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "pins cyclic receiver cache warm orders for ISS-005"
+      }
+    },
+    {
+      "id": "E38-method-cycle-incomplete",
+      "patch": "E38-method-cycle-incomplete.patch",
+      "target": "eslint-plugin/event-method.js",
+      "claim": "An incomplete cyclic method summary remains analyzable and fail closed instead of being consumed as a proven-clean miss.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "pins cyclic method cache warm orders for ISS-006"
+      }
+    },
+    {
+      "id": "E38-factory-namespace-scc-publication",
+      "patch": "E38-factory-namespace-scc-publication.patch",
+      "target": "eslint-plugin/event-factory.js",
+      "claim": "Every member of a converged cyclic factory or namespace component receives the same trusted result, independent of cache warm order.",
+      "expect_red": {
+        "suite": "__tests__/analyticsEslintPlugin.test.js",
+        "test": "pins factory and namespace cache warm orders for ISS-007"
+      }
     }
   ],
   "accepted_survivors": [

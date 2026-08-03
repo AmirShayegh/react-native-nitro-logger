@@ -886,6 +886,26 @@ describe('event receiver provenance hardening', () => {
     ],
   ];
 
+  const expectCyclicWarmOrdersToFailClosed = (sources) => {
+    for (const source of sources) {
+      for (const [, order] of cyclicWarmOrders) {
+        const diagnosticsByLine = new Map();
+        for (const message of verify(
+          source(order),
+          plugin.eventRules(LINT_ARTIFACT)
+        )) {
+          let diagnostics = diagnosticsByLine.get(message.line);
+          if (!diagnostics) {
+            diagnostics = [];
+            diagnosticsByLine.set(message.line, diagnostics);
+          }
+          diagnostics.push(message.messageId);
+        }
+        expect([...diagnosticsByLine.values()]).toEqual([expected, expected]);
+      }
+    }
+  };
+
   test.each(
     cyclicProvenanceCases.flatMap(([kind, source]) =>
       cyclicWarmOrders.map(([orderName, order]) => [
@@ -909,6 +929,21 @@ describe('event receiver provenance hardening', () => {
       expect([...diagnosticsByLine.values()]).toEqual([expected, expected]);
     }
   );
+
+  test('pins cyclic receiver cache warm orders for ISS-005', () => {
+    expectCyclicWarmOrdersToFailClosed([cyclicProvenanceCases[0][1]]);
+  });
+
+  test('pins cyclic method cache warm orders for ISS-006', () => {
+    expectCyclicWarmOrdersToFailClosed([cyclicProvenanceCases[1][1]]);
+  });
+
+  test('pins factory and namespace cache warm orders for ISS-007', () => {
+    expectCyclicWarmOrdersToFailClosed([
+      cyclicProvenanceCases[2][1],
+      cyclicProvenanceCases[3][1],
+    ]);
+  });
 
   test.each([
     [

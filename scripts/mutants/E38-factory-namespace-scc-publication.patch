@@ -1,0 +1,14 @@
+diff --git a/eslint-plugin/event-factory.js b/eslint-plugin/event-factory.js
+--- a/eslint-plugin/event-factory.js
++++ b/eslint-plugin/event-factory.js
+@@ -846,7 +846,9 @@ function classifyBindingExpression(context, node, seen, kind) {
+     });
+     results.set(componentIndex, result);
+     if (seen.size === 0) {
+-      for (const member of component) cache.set(member, result);
++      for (const [index, member] of component.entries()) {
++        cache.set(member, index === 0 ? result : false);
++      }
+     }
+   }
+   return joinClassificationParts(rootParts, (dependency) => {
