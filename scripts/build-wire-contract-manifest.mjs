@@ -180,11 +180,20 @@ function acquireLock(absolutePath, ownerPid) {
 
 const contractFiles = [
   'docs/WIRE.md',
+  'spec/wire/v1/auth-contract.json',
+  'spec/wire/v1/auth-vectors.json',
   'spec/wire/v1/contract.json',
   'spec/wire/v1/golden-vectors.json',
+  'spec/wire/v1/resolution-table.json',
 ];
 const versionDirectory = path.join(root, 'spec/wire/v1');
-const expectedVersionFiles = new Set(['contract.json', 'golden-vectors.json']);
+const expectedVersionFiles = new Set([
+  'auth-contract.json',
+  'auth-vectors.json',
+  'contract.json',
+  'golden-vectors.json',
+  'resolution-table.json',
+]);
 const unexpected = fs
   .readdirSync(versionDirectory)
   .filter((name) => !expectedVersionFiles.has(name));
@@ -246,7 +255,15 @@ const manifest = {
   sourceCommit,
   contractVersion: descriptor.contractVersion,
   supportedHeaderVersions: [descriptor.header.version],
-  vectorSets: ['spec/wire/v1/golden-vectors.json'],
+  descriptors: [
+    'spec/wire/v1/contract.json',
+    'spec/wire/v1/auth-contract.json',
+    'spec/wire/v1/resolution-table.json',
+  ],
+  vectorSets: [
+    'spec/wire/v1/golden-vectors.json',
+    'spec/wire/v1/auth-vectors.json',
+  ],
   files,
 };
 const encoded = `${JSON.stringify(manifest, null, 2)}\n`;

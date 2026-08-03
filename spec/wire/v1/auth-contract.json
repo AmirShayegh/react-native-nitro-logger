@@ -1,0 +1,313 @@
+{
+  "contractVersion": 1,
+  "scope": {
+    "comparison": "exact",
+    "fields": [
+      "tenantId",
+      "analyticsStream",
+      "installId",
+      "subjectScope",
+      "identityGeneration",
+      "consentGeneration"
+    ]
+  },
+  "deliveryCapability": {
+    "credentialId": {
+      "bits": 128,
+      "encoding": "lowercase-hex",
+      "source": "csprng"
+    },
+    "bearerSecret": {
+      "bits": 256,
+      "encoding": "base64url-no-padding",
+      "source": "csprng"
+    },
+    "presentation": {
+      "header": "Authorization",
+      "scheme": "NitroDelivery",
+      "transport": "tls",
+      "urlsForbidden": true
+    },
+    "serverStorage": {
+      "secret": "verifier-only",
+      "comparison": "constant-time",
+      "recoverableResponses": "encrypted-at-rest"
+    },
+    "deviceStorage": "secure-platform-storage",
+    "rawCredentialLogging": false,
+    "authority": [
+      "exchange-self",
+      "deliver-manifested-segment"
+    ],
+    "forbiddenAuthority": [
+      "collect",
+      "identify-or-bind",
+      "manifest-register",
+      "scope-change",
+      "deadline-extension",
+      "root-rotation"
+    ]
+  },
+  "operations": {
+    "capabilityMint": {
+      "operation": "capability-mint",
+      "request": {
+        "method": "POST",
+        "path": "/v1/delivery-capabilities:mint",
+        "contentType": "application/json",
+        "authorization": "live-session-or-tenant-backend",
+        "idempotencyField": "mintId",
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "mintId",
+          "scope"
+        ],
+        "forbiddenFields": [
+          "credentialId",
+          "bearerSecret",
+          "issuedAt",
+          "expiresAt",
+          "deliveryDeadline"
+        ]
+      },
+      "response": {
+        "status": 201,
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "credentialId",
+          "bearerSecret",
+          "issuedAt",
+          "expiresAt",
+          "deliveryDeadline"
+        ]
+      },
+      "serverDerivedScope": true
+    },
+    "capabilityExchange": {
+      "operation": "capability-exchange",
+      "request": {
+        "method": "POST",
+        "path": "/v1/delivery-capabilities:exchange",
+        "contentType": "application/json",
+        "authorization": "delivery-capability",
+        "idempotencyField": "exchangeId",
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "exchangeId"
+        ],
+        "forbiddenFields": [
+          "scope",
+          "expiresAt",
+          "deliveryDeadline"
+        ]
+      },
+      "response": {
+        "status": 200,
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "credentialId",
+          "bearerSecret",
+          "issuedAt",
+          "expiresAt",
+          "deliveryDeadline"
+        ]
+      }
+    },
+    "manifestRegister": {
+      "operation": "manifest-register",
+      "request": {
+        "method": "POST",
+        "path": "/v1/segment-manifests",
+        "contentType": "application/json",
+        "authorization": "live-session",
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "segmentId",
+          "contentHash",
+          "scope"
+        ],
+        "forbiddenFields": [
+          "payload",
+          "acceptanceEpoch"
+        ]
+      },
+      "response": {
+        "status": 201,
+        "idempotentStatus": 200,
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "segmentId",
+          "contentHash"
+        ]
+      }
+    }
+  },
+  "publicResponses": {
+    "success": {
+      "statusClass": "2xx",
+      "schemaRequired": true
+    },
+    "refused": {
+      "status": 403,
+      "contentType": "application/json",
+      "body": {
+        "requiredFields": [
+          "contractVersion",
+          "operation",
+          "code"
+        ],
+        "additionalFields": false,
+        "contractVersion": 1,
+        "operation": "echo-request-operation",
+        "code": "refused"
+      },
+      "retryable": false,
+      "indistinguishable": true,
+      "terminalOnlyWhenSchemaMatches": true,
+      "malformedClassification": "indeterminate"
+    },
+    "throttled": {
+      "status": 429,
+      "code": "throttled",
+      "retryable": true,
+      "retryAfter": {
+        "encoding": "delta-seconds",
+        "minimum": 1,
+        "maximum": 60,
+        "deadlineCapped": true,
+        "malformedIsIndeterminate": true
+      }
+    },
+    "indeterminate": {
+      "cases": [
+        "transport",
+        "5xx",
+        "proxy-html",
+        "malformed-contract-response"
+      ],
+      "retryable": true,
+      "sameIdempotencyIdRequired": true
+    }
+  },
+  "lifecycle": {
+    "rootMint": {
+      "serverDerivedScope": true,
+      "oneActiveRootPerBindingGeneration": true,
+      "exactMintRetryReplaysResponse": true,
+      "differentMintIdRefused": true,
+      "rotationOperation": "forbidden-in-v1",
+      "replacementRequiresNewBindingGeneration": true
+    },
+    "exchange": {
+      "predecessorUse": "once",
+      "exactRetryReplaysResponse": true,
+      "differentExchangeIdRefused": true,
+      "restoredPredecessorRefused": true,
+      "successorDeadline": "unchanged-binding-delivery-deadline",
+      "expiredCredential": "exchange-only-before-delivery-deadline"
+    },
+    "overrides": [
+      "tenant-disabled",
+      "binding-disabled",
+      "subject-deleted",
+      "consent-revoked",
+      "generation-changed",
+      "delivery-deadline-reached"
+    ],
+    "garbageCollection": "delivery-deadline-plus-bounded-replay-window",
+    "activityMayExtendDeadline": false
+  },
+  "segmentManifest": {
+    "key": [
+      "tenantId",
+      "analyticsStream",
+      "installId",
+      "subjectScope",
+      "identityGeneration",
+      "consentGeneration",
+      "segmentId",
+      "contentHash"
+    ],
+    "payloadStored": false,
+    "acceptanceEpochIndependent": true,
+    "registrationAuthorization": "live-session",
+    "scopeDerivation": "server",
+    "requestScopeIsClaim": true,
+    "deliveryCapabilityMayRegister": false,
+    "uploadSemantics": "exercise-not-spend",
+    "sameIdSameHash": "idempotent",
+    "sameIdDifferentHash": "refused",
+    "deletion": "binding-cascade",
+    "garbageCollection": "delivery-deadline-plus-bounded-replay-window"
+  },
+  "namespaceRefusals": {
+    "publicReason": "refused",
+    "internalReasonsAllowed": true,
+    "includes": [
+      "credential",
+      "tenant",
+      "binding",
+      "subject",
+      "scope",
+      "generation",
+      "manifest",
+      "deadline",
+      "identity-conflict"
+    ]
+  },
+  "resourceControls": {
+    "beforeAuthentication": [
+      "global",
+      "source-address"
+    ],
+    "afterAuthentication": [
+      "credential",
+      "binding",
+      "tenant"
+    ],
+    "operations": [
+      "capability-mint",
+      "capability-exchange",
+      "manifest-registration",
+      "upload-acceptance"
+    ],
+    "boundedConcurrency": true,
+    "publicThrottleIndistinguishable": true
+  },
+  "audit": {
+    "fields": [
+      "timestamp",
+      "operation",
+      "internalResult",
+      "authenticatedNamespaceHash",
+      "credentialHash",
+      "bindingHash",
+      "segmentHash"
+    ],
+    "forbiddenFields": [
+      "bearerSecret",
+      "payload",
+      "rawSubjectId",
+      "rawCredentialId"
+    ],
+    "identifierHash": "keyed",
+    "successAdmission": "same-transaction-outbox",
+    "refusalAdmission": "bounded-durable-wal",
+    "refusalOverflow": "non-droppable-aggregate-loss-signal",
+    "idempotentlyKeyed": true,
+    "publication": "durable-retry",
+    "authorizationOnAuditFailure": "fail-closed"
+  },
+  "compatibility": {
+    "unknownContractVersion": "refused",
+    "unknownOperation": "refused",
+    "unknownRequestField": "refused",
+    "additionalResponseField": "malformed-contract-response"
+  }
+}

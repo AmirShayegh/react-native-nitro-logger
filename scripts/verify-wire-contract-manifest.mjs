@@ -12,8 +12,11 @@ const packStatePath = path.join(root, '.wire-pack-state.json');
 const packLockPath = path.join(root, '.wire-pack-lock');
 const expectedStatePaths = new Set([
   'docs/WIRE.md',
+  'spec/wire/v1/auth-contract.json',
+  'spec/wire/v1/auth-vectors.json',
   'spec/wire/v1/contract.json',
   'spec/wire/v1/golden-vectors.json',
+  'spec/wire/v1/resolution-table.json',
   'spec/wire/manifest.json',
 ]);
 const identityKeys = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'];

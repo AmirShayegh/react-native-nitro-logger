@@ -39,6 +39,31 @@ try {
   if (manifest.sourceCommit !== sourceCommit) {
     throw new Error('manifest did not preserve the explicit source commit');
   }
+  const expectedContractFiles = [
+    'docs/WIRE.md',
+    'spec/wire/v1/auth-contract.json',
+    'spec/wire/v1/auth-vectors.json',
+    'spec/wire/v1/contract.json',
+    'spec/wire/v1/golden-vectors.json',
+    'spec/wire/v1/resolution-table.json',
+  ];
+  if (
+    JSON.stringify(manifest.files.map(({ path: file }) => file)) !==
+    JSON.stringify(expectedContractFiles)
+  ) {
+    throw new Error(
+      'manifest has an incomplete or reordered contract inventory'
+    );
+  }
+  if (
+    JSON.stringify(manifest.vectorSets) !==
+    JSON.stringify([
+      'spec/wire/v1/golden-vectors.json',
+      'spec/wire/v1/auth-vectors.json',
+    ])
+  ) {
+    throw new Error('manifest has an incomplete vector inventory');
+  }
   for (const entry of manifest.files) {
     const bytes = fs.readFileSync(path.join(root, entry.path));
     const actual = crypto.createHash('sha256').update(bytes).digest('hex');
@@ -97,8 +122,11 @@ try {
     'scripts/build-wire-contract-manifest.mjs',
     'scripts/verify-wire-contract-manifest.mjs',
     'docs/WIRE.md',
+    'spec/wire/v1/auth-contract.json',
+    'spec/wire/v1/auth-vectors.json',
     'spec/wire/v1/contract.json',
     'spec/wire/v1/golden-vectors.json',
+    'spec/wire/v1/resolution-table.json',
   ]) {
     const target = path.join(committedTree, relativePath);
     fs.mkdirSync(path.dirname(target), { recursive: true });

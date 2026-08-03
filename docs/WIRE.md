@@ -2,15 +2,19 @@
 
 This is the public byte contract between `react-native-nitro-logger` clients
 and an independently implemented ingest gateway. The machine-readable source
-of truth is [`spec/wire/v1/contract.json`](../spec/wire/v1/contract.json); the
-tables marked as generated below are rendered from it and checked in CI.
+of truth is the versioned descriptor set under [`spec/wire/v1/`](../spec/wire/v1/);
+the tables marked as generated below are rendered from it and checked in CI.
 [`golden-vectors.json`](../spec/wire/v1/golden-vectors.json) pins complete
-bytes and failure classifications.
+bytes and failure classifications. [`auth-contract.json`](../spec/wire/v1/auth-contract.json)
+and [`auth-vectors.json`](../spec/wire/v1/auth-vectors.json) pin A12/A13
+authorization behavior; [`resolution-table.json`](../spec/wire/v1/resolution-table.json)
+pins gateway decision and transaction order.
 
 This document defines syntax and immutable identity. It does not implement a
-segment writer, HTTP endpoint, resource budget, tenant grammar lifecycle,
-acknowledgement envelope, or authorization capability. Those consumers must
-adopt these bytes without reinterpreting them.
+segment writer, HTTP endpoint implementation, resource-budget mechanism,
+tenant grammar lifecycle, or acknowledgement envelope. It does define the
+authorization capability and manifest behavior those consumers must adopt
+without reinterpretation.
 
 ## Version pins
 
@@ -166,17 +170,163 @@ epoch at seal and never changes after a gateway rebuild. The gateway's later
 `acceptanceEpoch` belongs to its ledger and acknowledgement contracts, not this
 header.
 
+## A12 delivery capability
+
+The delivery capability is a custody-transfer credential, not a collection or
+identity credential. The gateway derives every scope value from a validated
+live-session or explicitly authorized tenant-backend principal; request and
+header values are claims that must agree exactly. Credential IDs are independent
+128-bit CSPRNG values and bearer secrets are independent 256-bit CSPRNG values.
+They travel only in the `Authorization` header over TLS, never in URLs. Clients
+use platform secure storage. Servers keep a verifier rather than the raw secret,
+compare in constant time, encrypt recoverable responses, and never log raw
+credentials.
+
+<!-- BEGIN GENERATED:auth-scope -->
+| Order | Scope field | Comparison |
+| --- | --- | --- |
+| 0 | `tenantId` | exact |
+| 1 | `analyticsStream` | exact |
+| 2 | `installId` | exact |
+| 3 | `subjectScope` | exact |
+| 4 | `identityGeneration` | exact |
+| 5 | `consentGeneration` | exact |
+<!-- END GENERATED:auth-scope -->
+
+The capability may exchange itself and deliver an already manifested segment.
+It cannot collect, bind identity, register a manifest entry, alter scope, extend
+the absolute delivery deadline, or rotate a root. V1 permits one root per
+binding generation. An exact `mintId` retry replays the exact encrypted root
+response; a different ID is refused. Root replacement requires a separately
+authenticated new binding generation, which invalidates the old chain before a
+new mint.
+
+Exchange atomically consumes one predecessor, mints one successor, and records
+the exact encrypted result under its `exchangeId`. An exact retry replays that
+result. A different ID, a restored predecessor, or a concurrent loser is
+refused. Expiry permits exchange only while still before the unchanged delivery
+deadline; at the deadline, exchange and delivery both fail. Activity never
+slides the deadline.
+
+<!-- BEGIN GENERATED:auth-operations -->
+| Operation | Method and path | Authority | Idempotency |
+| --- | --- | --- | --- |
+| `capability-mint` | `POST /v1/delivery-capabilities:mint` | `live-session-or-tenant-backend` | `mintId` |
+| `capability-exchange` | `POST /v1/delivery-capabilities:exchange` | `delivery-capability` | `exchangeId` |
+| `manifest-register` | `POST /v1/segment-manifests` | `live-session` | exact manifest key |
+<!-- END GENERATED:auth-operations -->
+
+All policy, credential, namespace, binding, manifest, deadline, and immutable
+identity refusals use the same fixed `403` envelope with
+`Content-Type: application/json` and exactly `contractVersion`, `operation`, and
+`code` fields. The version is `1`, `operation` exactly echoes the request
+operation, and `code` is `refused`; extra or missing fields are invalid. Any 403
+that does not match this complete schema is indeterminate, including HTML or an
+empty response, and mint/exchange retries preserve the same idempotency ID. A
+`429 throttled` response carries an integer `Retry-After` delta of 1–60 seconds. Clients cap it
+to the remaining deadline and never start at or after that deadline. A missing,
+malformed, conflicting, or out-of-range header is indeterminate and uses bounded
+local backoff. Transport errors, `5xx`, proxy HTML, and malformed contract
+responses are also indeterminate; mint and exchange retries reuse the same
+idempotency ID.
+
+## A13 segment manifest
+
+The manifest is an epoch-independent control-plane authorization record with no
+payload. Registration requires a live-session collection credential. The
+gateway derives the full namespace and validates exact agreement before any
+write; a delivery capability cannot register. An exact key retry is idempotent,
+the same segment ID with a different hash is refused, and delivery exercises the
+entry without consuming it.
+
+<!-- BEGIN GENERATED:manifest-contract -->
+| Property | Pinned value |
+| --- | --- |
+| Key | `tenantId`, `analyticsStream`, `installId`, `subjectScope`, `identityGeneration`, `consentGeneration`, `segmentId`, `contentHash` |
+| Payload stored | false |
+| Acceptance-epoch independent | true |
+| Registration authority | `live-session` |
+| Upload semantics | `exercise-not-spend` |
+| Same ID / same hash | `idempotent` |
+| Same ID / different hash | `refused` |
+<!-- END GENERATED:manifest-contract -->
+
+The manifest survives acceptance-epoch loss with its binding. Subject deletion
+cascades immediately. Normal garbage collection occurs at the fixed delivery
+deadline plus the bounded response-replay window. Removing a manifest never
+rewrites an already committed same-epoch acknowledgement outcome.
+
+## Gateway resolution table
+
+Resolution order is normative. After credential and exact-scope validation, the
+gateway consults the current acceptance epoch's ledger before mutable binding or
+manifest state. A same-ID/same-hash outcome replays even after deletion and never
+re-projects. A same-ID/different-hash outcome refuses. Only a missing ledger row
+falls through to live binding and exact manifest authorization. Therefore an
+empty post-rebuild ledger fails closed when deletion removed the binding and
+manifest.
+
+<!-- BEGIN GENERATED:gateway-resolution -->
+| Order | Row | When | Result |
+| --- | --- | --- | --- |
+| 0 | `credential-or-scope-invalid` | `credentialOrScope=invalid` | `refuse` |
+| 1 | `ledger-same-id-same-hash` | `credentialOrScope=valid`, `ledger=same-id-same-hash` | `replay-recorded-outcome` |
+| 2 | `ledger-same-id-different-hash` | `credentialOrScope=valid`, `ledger=same-id-different-hash` | `refuse` |
+| 3 | `no-ledger-binding-inactive` | `credentialOrScope=valid`, `ledger=missing`, `binding=inactive` | `refuse` |
+| 4 | `no-ledger-manifest-missing` | `credentialOrScope=valid`, `ledger=missing`, `binding=live`, `manifest=missing-or-mismatch` | `refuse` |
+| 5 | `no-ledger-live-manifest-match` | `credentialOrScope=valid`, `ledger=missing`, `binding=live`, `manifest=exact-match` | `commit-acceptance` |
+| 6 | `post-rebuild-deleted-binding` | `credentialOrScope=valid`, `acceptanceEpoch=rebuilt-empty`, `binding=deleted`, `manifest=deleted` | `refuse` |
+<!-- END GENERATED:gateway-resolution -->
+
+## Transaction and lifecycle boundaries
+
+<!-- BEGIN GENERATED:transaction-boundaries -->
+| Boundary | Atomic state | Commit rule | Response / outage rule |
+| --- | --- | --- | --- |
+| `manifest-registration` | `exact-manifest-record`, `success-audit-intent` | `atomic-before-or-with-acceptance` | response after `durable-commit` |
+| `acceptance-inbox-ledger-audit` | `inbox-bytes`, `same-epoch-ledger-outcome`, `success-audit-intent` | `single-acceptance-boundary` | response after `durable-commit` |
+| `acknowledgement-emission` | none | `none` | requires `durable-inbox`, `durable-ledger-outcome`, `durable-audit-intent`; lost response: `replay-ledger-outcome` |
+| `audit-publication` | `published-audit-event` | `idempotent-outbox-delivery` | outage: `queue-and-retry` |
+<!-- END GENERATED:transaction-boundaries -->
+
+Successful mutations co-commit an idempotently keyed audit intent with their
+state; responses require that intent to be durable, while publication may queue
+and retry. Refusals remain fail closed and enter a bounded durable WAL. If that
+WAL is full, a non-droppable aggregate loss signal records the gap without
+changing the indistinguishable public response. Audit data contains keyed
+identifier hashes, never secrets, payloads, or raw subject IDs.
+
+<!-- BEGIN GENERATED:lifecycle-boundary -->
+| Item | Pinned values |
+| --- | --- |
+| Linearized mutations | `capability-mint`, `capability-exchange`, `manifest-registration`, `upload-acceptance` |
+| Lifecycle transitions | `subject-deletion`, `consent-revocation`, `tenant-or-binding-disable`, `generation-change`, `delivery-deadline` |
+| Mutation wins | `commit-state-and-audit-intent-then-transition-invalidates-authority` |
+| Transition wins | `commit-no-new-authority-or-success-state` |
+| Ledger replay exception | `pre-existing-same-epoch-outcome-only` |
+<!-- END GENERATED:lifecycle-boundary -->
+
+Deletion, consent revocation, tenant/binding disable, generation change, and the
+absolute deadline serialize with mint, exchange, registration, and acceptance.
+If the lifecycle transition wins, no new authority, response material, manifest,
+inbox bytes, ledger row, or success event commits. If the mutation wins, the
+transition subsequently invalidates its authority and recoverable material. The
+only replay exception is a pre-existing same-epoch ledger outcome, which creates
+no new authority.
+
 ## Golden vectors and adoption
 
 The shared vectors contain source values, exact payload bytes, zero-slot header
 bytes, final header bytes, digest, corruption cases, numeric boundaries,
-identifier failures, and base-versus-strict unknown-field cases. Node, Swift,
-and Kotlin consumers independently reproduce them; a platform may not import
-another platform's codec.
+identifier failures, base-versus-strict unknown-field cases, authorization
+outcomes, lifecycle races, and crash recovery. Node, Swift, and Kotlin consumers
+independently reproduce them; a platform may not import another platform's
+codec.
 
 The npm package generates `spec/wire/manifest.json` after the source commit
 exists. It records that commit and SHA-256 for this document, the descriptor,
-and the vectors. The generated manifest is not tracked and does not hash
+the authorization descriptors, the resolution table, and both vector sets. The
+generated manifest is not tracked and does not hash
 itself, avoiding a circular commit or content reference. Gateway support must
 deploy before a client release emits a new header/contract version.
 
@@ -186,4 +336,5 @@ Downstream ownership remains explicit:
 - T-022 implements gateway parsing and resource budgets;
 - T-023 implements tenant grammar lifecycle and emergency revocation;
 - T-024 defines acknowledgement envelopes and terminal response behavior;
-- T-062 extends the shared contract for A12/A13 capability and manifest rules.
+- T-062 owns the shared A12/A13 capability, manifest, resolution, and transaction contract;
+- T-063 implements these server-side rules without weakening this public surface.
