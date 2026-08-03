@@ -126,7 +126,7 @@ jobs:
         run: yarn check-test-reports js
 
       # A green suite says the tests agree with the code, not that they would
-      # notice if it changed. This reintroduces thirty-seven real defects and
+      # notice if it changed. This reintroduces forty real defects and
       # requires the named test to fail for each. ~30s, and it runs here
       # rather than as its own job because it needs exactly this setup.
       - name: Prove the pinned defects are still caught

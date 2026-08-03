@@ -92,7 +92,7 @@ module.exports = {
    *     was not found"), not a skip. That is what stops a renamed directory
    *     from turning its threshold into decoration.
    *
-   * Measured 2026-08-02, at 2177 tests in 34 suites:
+   * Measured 2026-08-02, at 2181 tests in 35 suites:
    *
    *   src/               98.45 stmts  96.62 branch  98.80 funcs  99.11 lines
    *   eslint-plugin/     90.04        83.95         95.32        92.86
