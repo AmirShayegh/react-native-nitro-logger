@@ -1,0 +1,11 @@
+diff --git a/src/analytics/grammar-mapper.ts b/src/analytics/grammar-mapper.ts
+--- a/src/analytics/grammar-mapper.ts
++++ b/src/analytics/grammar-mapper.ts
+@@ -102,6 +102,6 @@ function integerConstraint(
+     protectedRecord<Writable<AnalyticsGrammarIntegerConstraint>>();
+   constraint.type = 'integer';
+   constraint.minimum = descriptor.min;
+-  constraint.maximum = descriptor.max;
++  constraint.maximum = descriptor.max + 1;
+   return freezeRecord(constraint);
+ }

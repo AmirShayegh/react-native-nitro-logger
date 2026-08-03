@@ -1,4 +1,22 @@
 {
+  "a1ExitEvidence": {
+    "canonicalTests": {
+      "skipped": 0,
+      "suitesPassed": 34,
+      "testsPassed": 2177
+    },
+    "codeReviews": [
+      "lens-mscys7mh",
+      "lens-mscyv1vv"
+    ],
+    "mutationGate": {
+      "acceptedSurvivors": 1,
+      "killed": 37,
+      "manifestRows": 37,
+      "patches": 37
+    },
+    "typecheck": "passed"
+  },
   "blockedBy": [
     "T-054",
     "T-055",

@@ -1,0 +1,15 @@
+diff --git a/src/analytics.ts b/src/analytics.ts
+--- a/src/analytics.ts
++++ b/src/analytics.ts
+@@ -36,7 +36,10 @@ export function defineEvents<const Definition extends EventDefinition>(
+ ): EventArtifact<Definition> {
+   const schema = normalizeDefinition(definition, GRAMMAR_V1_LIMITS);
+   const { grammar, grammarJSON } = emitGrammar(schema);
+-  const lint = Object.freeze({ formatVersion: 1 as const, grammar });
++  const lint = Object.freeze({
++    formatVersion: 1 as const,
++    grammar: Object.freeze({ ...grammar }),
++  });
+   return Object.freeze({
+     schema,
+     grammar,

@@ -319,6 +319,56 @@
         "suite": "__tests__/analyticsEslintPlugin.test.js",
         "test": "indexes exact and wildcard static-container properties at 600 and 1200 lookups"
       }
+    },
+    {
+      "id": "A1-validator-open-extra-property",
+      "patch": "A1-validator-open-extra-property.patch",
+      "target": "src/analytics/validator.ts",
+      "claim": "Runtime validation rejects properties outside the declared event schema instead of silently dropping them from the immutable snapshot.",
+      "expect_red": {
+        "suite": "__tests__/analyticsGoldenVectors.test.ts",
+        "test": "rejects every negative vector identically at runtime and grammar"
+      }
+    },
+    {
+      "id": "A1-grammar-open-events",
+      "patch": "A1-grammar-open-events.patch",
+      "target": "src/analytics/grammar-mapper.ts",
+      "claim": "The emitted grammar closes the event namespace so undeclared event names are never admitted by a consumer.",
+      "expect_red": {
+        "suite": "__tests__/analyticsGoldenVectors.test.ts",
+        "test": "rejects every negative vector identically at runtime and grammar"
+      }
+    },
+    {
+      "id": "A1-grammar-upper-bound-widening",
+      "patch": "A1-grammar-upper-bound-widening.patch",
+      "target": "src/analytics/grammar-mapper.ts",
+      "claim": "An emitted integer constraint preserves the source schema's inclusive upper bound exactly.",
+      "expect_red": {
+        "suite": "__tests__/analyticsGoldenVectors.test.ts",
+        "test": "rejects every negative vector identically at runtime and grammar"
+      }
+    },
+    {
+      "id": "A1-golden-positive-control-missing",
+      "patch": "A1-golden-positive-control-missing.patch",
+      "target": "__tests__/fixtures/analyticsGoldenVectors.ts",
+      "claim": "Every negative golden vector names a same-family positive control that is executed independently.",
+      "expect_red": {
+        "suite": "__tests__/analyticsGoldenVectors.test.ts",
+        "test": "gives every rejection a separately executed positive control"
+      }
+    },
+    {
+      "id": "A1-lint-grammar-copy",
+      "patch": "A1-lint-grammar-copy.patch",
+      "target": "src/analytics.ts",
+      "claim": "The lint artifact shares the exact protected grammar object and bytes emitted for runtime consumers.",
+      "expect_red": {
+        "suite": "__tests__/analyticsGoldenVectors.test.ts",
+        "test": "binds the lint artifact to the grammar bytes used by the vectors"
+      }
     }
   ],
   "accepted_survivors": [

@@ -1,0 +1,12 @@
+diff --git a/__tests__/fixtures/analyticsGoldenVectors.ts b/__tests__/fixtures/analyticsGoldenVectors.ts
+--- a/__tests__/fixtures/analyticsGoldenVectors.ts
++++ b/__tests__/fixtures/analyticsGoldenVectors.ts
+@@ -158,7 +158,7 @@ export const goldenVectors = [
+   {
+     id: 'event-unknown',
+     family: 'event-name',
+-    positiveControl: 'event-known',
++    positiveControl: null,
+     eventName: unknownEvent,
+     properties: screen,
+     expected: { ok: false, code: 'UNKNOWN_EVENT' },
