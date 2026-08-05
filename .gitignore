@@ -109,6 +109,12 @@ android/generated
 # artifact of a gate rather than anything to keep.
 coverage/
 
+# Generated after a commit exists, so it can name the real source commit
+# without creating a self-referential tracked file. Included by npm prepack.
+spec/wire/manifest.json
+.wire-pack-state.json
+.wire-pack-lock/
+
 # private: backlog and scoping documents stay local
 .story/
 docs/internal/

@@ -1,0 +1,10 @@
+diff --git a/eslint-plugin/static-container-index-analysis.js b/eslint-plugin/static-container-index-analysis.js
+--- a/eslint-plugin/static-container-index-analysis.js
++++ b/eslint-plugin/static-container-index-analysis.js
+@@ -182,5 +182,5 @@ function createStaticContainerSourceSummaryIndex({
+   return (variable) => {
+-    const cached = cache.get(variable);
++    const cached = null;
+     if (cached) {
+       const stats = analysisStats(context);
+       if (stats) stats.staticContainerSourceCacheHits += 1;

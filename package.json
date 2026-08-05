@@ -30,13 +30,26 @@
       },
       "default": "./lib/module/unstable.js"
     },
+    "./analytics": {
+      "react-native-nitro-logger-source": "./src/analytics.ts",
+      "require": {
+        "types": "./lib/typescript/commonjs/src/analytics.d.ts",
+        "default": "./lib/commonjs/analytics.js"
+      },
+      "import": {
+        "types": "./lib/typescript/module/src/analytics.d.ts",
+        "default": "./lib/module/analytics.js"
+      },
+      "default": "./lib/module/analytics.js"
+    },
     "./eslint-plugin": "./eslint-plugin/index.js",
     "./package.json": "./package.json"
   },
   "files": [
     "src",
     "lib",
-    "docs",
+    "docs/*.md",
+    "spec/wire",
     "CHANGELOG.md",
     "eslint-plugin",
     "android",
@@ -84,6 +97,7 @@
     "check-android-instrumented": "./scripts/check-android-instrumented.sh",
     "check-test-reports": "./scripts/check-test-reports.sh",
     "check-mutants": "./scripts/check-mutants.sh",
+    "check-analytics-grammar-go": "./scripts/check-analytics-grammar-go.sh",
     "check-package-exports": "./scripts/check-package-exports.sh",
     "check-metro-resolution": "./scripts/check-metro-resolution.sh",
     "check-release-bundle-consumer": "./scripts/check-release-bundle-consumer.sh",
@@ -93,7 +107,11 @@
     "check-podspec-tag": "./scripts/check-podspec-tag.sh",
     "release": "yarn check-doc-links && yarn check-podspec-tag && changeset publish",
     "prepublishOnly": "yarn check-doc-links && yarn check-podspec-tag",
-    "check-coverage-groups": "./scripts/check-coverage-groups.sh"
+    "check-coverage-groups": "./scripts/check-coverage-groups.sh",
+    "check-wire-contract": "node scripts/check-wire-contract.mjs",
+    "wire:manifest": "node scripts/build-wire-contract-manifest.mjs --source-commit $(git rev-parse HEAD) --verify-source-commit --output spec/wire/manifest.json",
+    "prepack": "node scripts/build-wire-contract-manifest.mjs --source-commit $(git rev-parse HEAD) --verify-source-commit --output spec/wire/manifest.json --pack-state-output .wire-pack-state.json --pack-lock .wire-pack-lock --lock-owner-pid $PPID",
+    "postpack": "node scripts/verify-wire-contract-manifest.mjs"
   },
   "keywords": [
     "react-native",

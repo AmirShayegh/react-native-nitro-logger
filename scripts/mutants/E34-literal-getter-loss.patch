@@ -1,0 +1,15 @@
+diff --git a/eslint-plugin/receiver-alias-analysis.js b/eslint-plugin/receiver-alias-analysis.js
+--- a/eslint-plugin/receiver-alias-analysis.js
++++ b/eslint-plugin/receiver-alias-analysis.js
+@@ -162,10 +162,7 @@
+       }
+       const name = propertyKeyName(property);
+       if (name === null) continue;
+-      const selectedValues =
+-        property.kind === 'get'
+-          ? receiverGetterValues(context, property.value, unwrap, property)
+-          : [property.value];
++      const selectedValues = [property.value];
+       values.set(name, {
+         opaqueVersion,
+         value:

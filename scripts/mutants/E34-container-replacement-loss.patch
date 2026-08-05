@@ -1,0 +1,15 @@
+diff --git a/eslint-plugin/static-container-expression-analysis.js b/eslint-plugin/static-container-expression-analysis.js
+--- a/eslint-plugin/static-container-expression-analysis.js
++++ b/eslint-plugin/static-container-expression-analysis.js
+@@ -182,11 +182,6 @@ function createStaticContainerExpressionResolver({
+       chainNamespaceOpaque ||= sources.namespaceOpaque;
+       chainPresent ||= sources.present;
+       if (sources.values.length !== 1) {
+-        // The branching path below owns this variable. Leaving it in the
+-        // linear-chain guard made that path immediately diagnose its own
+-        // entry as a cycle, dropping every whole-binding object/array
+-        // replacement before it could be projected.
+-        chainSeen.delete(variable);
+         break;
+       }
+       current = unwrap(sources.values[0]);

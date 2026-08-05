@@ -24,6 +24,17 @@ export default defineConfig([
     },
   },
   {
+    files: [
+      'src/analytics.ts',
+      'src/analytics/**/*.ts',
+      'src/constraints.ts',
+      'src/privacy.ts',
+    ],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'error',
+    },
+  },
+  {
     // Build output, not source. `android/build` in particular holds Gradle's
     // generated HTML test report, whose bundled JS is a few hundred prettier
     // violations that appear the moment anyone runs the Kotlin suite.

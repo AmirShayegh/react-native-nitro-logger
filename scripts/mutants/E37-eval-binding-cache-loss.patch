@@ -1,0 +1,13 @@
+diff --git a/eslint-plugin/shared.js b/eslint-plugin/shared.js
+--- a/eslint-plugin/shared.js
++++ b/eslint-plugin/shared.js
+@@ -1370,5 +1370,8 @@ function possibleEvalFacts(context, node) {
+ function possibleEvalBinding(context, variable) {
+-  const cache = contextWeakCache(possibleEvalBindingCaches, context);
++  const cache =
++    variable.references.length >= 600
++      ? new WeakMap()
++      : contextWeakCache(possibleEvalBindingCaches, context);
+   if (cache.has(variable)) {
+     const stats = receiverAnalysisStats.get(context);
+     if (stats) stats.evalBindingCacheHits += 1;

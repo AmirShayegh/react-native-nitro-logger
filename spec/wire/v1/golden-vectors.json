@@ -1,0 +1,734 @@
+{
+  "vectorVersion": 1,
+  "validSegments": [
+    {
+      "name": "minimal-operational",
+      "fields": {
+        "segmentIdHex": "000102030405060708090a0b0c0d0e0f",
+        "tenantId": "tenant-a",
+        "streamId": "operational",
+        "sourceEpoch": "epoch-1",
+        "schemaVersion": "1",
+        "consentGeneration": "0",
+        "recordCount": "0",
+        "payloadLength": "19"
+      },
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expectedZeroHeaderHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f0000000000000000000000000000000000000000000000000000000000000000000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "expectedHashHex": "79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32",
+      "expectedHeaderHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013"
+    },
+    {
+      "name": "all-anyvalue-arms",
+      "fields": {
+        "segmentIdHex": "f0e0d0c0b0a090807060504030201000",
+        "tenantId": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+        "streamId": "analytics",
+        "sourceEpoch": "epoch:2026-08-03",
+        "schemaVersion": "4294967295",
+        "consentGeneration": "18446744073709551615",
+        "recordCount": "1",
+        "payloadLength": "662"
+      },
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b227265736f75726365223a7b2261747472696275746573223a5b7b226b6579223a2273222c2276616c7565223a7b22737472696e6756616c7565223a226f6b227d7d2c7b226b6579223a2262222c2276616c7565223a7b22626f6f6c56616c7565223a747275657d7d2c7b226b6579223a2269222c2276616c7565223a7b22696e7456616c7565223a2239303037313939323534373430393933227d7d2c7b226b6579223a2264222c2276616c7565223a7b22646f75626c6556616c7565223a312e357d7d2c7b226b6579223a2278222c2276616c7565223a7b22627974657356616c7565223a224141453d227d7d2c7b226b6579223a2261222c2276616c7565223a7b22617272617956616c7565223a7b2276616c756573223a5b7b22737472696e6756616c7565223a226e6573746564227d5d7d7d7d2c7b226b6579223a226b222c2276616c7565223a7b226b766c69737456616c7565223a7b2276616c756573223a5b7b226b6579223a226e222c2276616c7565223a7b22696e7456616c7565223a222d31227d7d5d7d7d7d5d2c2264726f7070656441747472696275746573436f756e74223a307d2c2273636f70654c6f6773223a5b7b2273636f7065223a7b226e616d65223a226e6974726f222c2276657273696f6e223a2231227d2c226c6f675265636f726473223a5b7b2274696d65556e69784e616e6f223a223138343436373434303733373039353531363135222c2273657665726974794e756d626572223a392c22626f6479223a7b22737472696e6756616c7565223a226576656e74227d2c2261747472696275746573223a5b5d2c2264726f7070656441747472696275746573436f756e74223a302c22666c616773223a307d5d7d5d7d5d7d",
+      "expectedZeroHeaderHex": "4e4c4f47534547000001000000f5f0e0d0c0b0a0908070605040302010000000000000000000000000000000000000000000000000000000000000000000008054545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454540009616e616c7974696373001065706f63683a323032362d30382d3033ffffffffffffffffffffffff000000010000000000000296",
+      "expectedHashHex": "0872e438453a4854c3b6b937a30951d805364a9c8d11b3cafbc276b1fd54dea1",
+      "expectedHeaderHex": "4e4c4f47534547000001000000f5f0e0d0c0b0a0908070605040302010000872e438453a4854c3b6b937a30951d805364a9c8d11b3cafbc276b1fd54dea1008054545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454540009616e616c7974696373001065706f63683a323032362d30382d3033ffffffffffffffffffffffff000000010000000000000296"
+    },
+    {
+      "name": "omitted-resource-logs",
+      "fields": {
+        "segmentIdHex": "00000000000000000000000000000001",
+        "tenantId": "tenant-a",
+        "streamId": "operational",
+        "sourceEpoch": "epoch-1",
+        "schemaVersion": "1",
+        "consentGeneration": "0",
+        "recordCount": "0",
+        "payloadLength": "2"
+      },
+      "payloadHex": "7b7d",
+      "expectedZeroHeaderHex": "4e4c4f4753454700000100000076000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000002",
+      "expectedHashHex": "c8d53e4ec6bf61e95c6b401ff29cfeac311e28977ab1520474f7150695c07040",
+      "expectedHeaderHex": "4e4c4f475345470000010000007600000000000000000000000000000001c8d53e4ec6bf61e95c6b401ff29cfeac311e28977ab1520474f7150695c07040000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000002"
+    },
+    {
+      "name": "omitted-scope-logs",
+      "fields": {
+        "segmentIdHex": "00000000000000000000000000000002",
+        "tenantId": "tenant-a",
+        "streamId": "operational",
+        "sourceEpoch": "epoch-1",
+        "schemaVersion": "1",
+        "consentGeneration": "0",
+        "recordCount": "0",
+        "payloadLength": "21"
+      },
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b7d5d7d",
+      "expectedZeroHeaderHex": "4e4c4f4753454700000100000076000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000015",
+      "expectedHashHex": "4344789242b0af316545796d985a02da63a6fc4da5f21388c3a8b4e21bf441d5",
+      "expectedHeaderHex": "4e4c4f4753454700000100000076000000000000000000000000000000024344789242b0af316545796d985a02da63a6fc4da5f21388c3a8b4e21bf441d5000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000015"
+    },
+    {
+      "name": "omitted-log-records",
+      "fields": {
+        "segmentIdHex": "00000000000000000000000000000003",
+        "tenantId": "tenant-a",
+        "streamId": "operational",
+        "sourceEpoch": "epoch-1",
+        "schemaVersion": "1",
+        "consentGeneration": "0",
+        "recordCount": "0",
+        "payloadLength": "37"
+      },
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b2273636f70654c6f6773223a5b7b7d5d7d5d7d",
+      "expectedZeroHeaderHex": "4e4c4f4753454700000100000076000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000025",
+      "expectedHashHex": "20892c01b54886fc64df8c14527abb370a02eea9a0c96f7ccdbd1ab049985591",
+      "expectedHeaderHex": "4e4c4f47534547000001000000760000000000000000000000000000000320892c01b54886fc64df8c14527abb370a02eea9a0c96f7ccdbd1ab049985591000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000025"
+    }
+  ],
+  "invalidSegments": [
+    {
+      "name": "payload-bit-flip",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7a227265736f757263654c6f6773223a5b5d7d",
+      "expected": "contentHashMismatch"
+    },
+    {
+      "name": "immutable-header-bit-flip",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874646e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "contentHashMismatch"
+    },
+    {
+      "name": "hash-slot-bit-flip",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f78df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "contentHashMismatch"
+    },
+    {
+      "name": "truncated-header",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d310000000100000000000000000000000000000000000000",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "truncated-payload",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d",
+      "expected": "malformed"
+    },
+    {
+      "name": "payload-length-mismatch",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000014",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "unknown-header-version",
+      "headerHex": "4e4c4f4753454700000200000076000102030405060708090a0b0c0d0e0f79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "unsupportedHeaderVersion"
+    },
+    {
+      "name": "empty-tenant-identifier",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f331ba3af785681962a6a923213065b8d9992d17ef97003d20e33500f54111f45000074656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "oversized-tenant-length",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0fcc7ad1c999e7b0a3acc0cb0a77a5f7135df852b90ad24338fc25bf3f7964277c008174656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-ascii-tenant-identifier",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f989961c44d31476c6a81b0c6ba52c17d7bb65b07ced468efb0541b25bf220bf9000880656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "hidden-trailing-header-byte",
+      "headerHex": "4e4c4f4753454700000100000077000102030405060708090a0b0c0d0e0fd01616686e16243566e14eb010a3874787ba7772a40892ba0c128a963e602f8a000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d3100000001000000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "record-count-mismatch",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f6a7ee241d337c58275b94181122435e6b2a46a5d6c7535bdb17770bfd417283d000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000010000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "wrong-magic",
+      "headerHex": "4f4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f6a276accc7fb8ed0e9bc5b8abaad7d13e42e4762270e0722f866edbb652b6a41000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "empty-stream-identifier",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f800a8d868df4d0259159cfccfa4ce22823f54c45165cebcf37d6235092bc2a93000874656e616e742d6100006f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "oversized-stream-length",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f918dd8387b4da55c3acbffb5be20c899f7760177f59a8961bef201b987bad5a3000874656e616e742d6100816f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-ascii-stream-identifier",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f4345a0cb32933c298e1c363c953ba52a0e9a7967e8b11f4007f1856e14902fc7000874656e616e742d61000b807065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "empty-source-epoch",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f1047079f4983882ecfd882f0b8c519fa7fe8c9d8647da4b56b1cd02cf07968da000874656e616e742d61000b6f7065726174696f6e616c000065706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "oversized-source-epoch-length",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0fd0d44f725d360dc4e1a4155445255c24fc0188ffb31cc2c6dfaa8b802473d5be000874656e616e742d61000b6f7065726174696f6e616c008165706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-ascii-source-epoch",
+      "headerHex": "4e4c4f4753454700000100000076000102030405060708090a0b0c0d0e0f5b45b7e568a854ce727dd3103fc8f910b39dad3bbfa63c6fb2151e4120521585000874656e616e742d61000b6f7065726174696f6e616c000780706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-array-resource-logs",
+      "headerHex": "4e4c4f475345470000010000007610000000000000000000000000000000ca93fbf1d2c05f802a28331edde1ec55a41a6d30a33eb17453309adeccbbe96d000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000013",
+      "payloadHex": "7b227265736f757263654c6f6773223a7b7d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-object-resource-logs-entry",
+      "headerHex": "4e4c4f4753454700000100000076100000000000000000000000000000012d30fa551b5c563c1ea803a6932f7d94f7e910fa0ff78f1986cd60d48940428b000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000014",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b315d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-array-scope-logs",
+      "headerHex": "4e4c4f475345470000010000007610000000000000000000000000000002fadc5a9d119dc5970577adff5dbcd863fd91adb6cf90aa3087939bffabf4e857000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000023",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b2273636f70654c6f6773223a7b7d7d5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-object-scope-logs-entry",
+      "headerHex": "4e4c4f4753454700000100000076100000000000000000000000000000031097b372e9d8efaa3a3e7b775caa8f6580ba9f82ed76b658bc0de306f7b77758000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000024",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b2273636f70654c6f6773223a5b315d7d5d7d",
+      "expected": "malformed"
+    },
+    {
+      "name": "non-array-log-records",
+      "headerHex": "4e4c4f4753454700000100000076100000000000000000000000000000040007d6f912e584a7d92e56e6c8ae24c6a199224d89e7e3ca516ea37a3246256a000874656e616e742d61000b6f7065726174696f6e616c000765706f63682d31000000010000000000000000000000000000000000000034",
+      "payloadHex": "7b227265736f757263654c6f6773223a5b7b2273636f70654c6f6773223a5b7b226c6f675265636f726473223a7b7d7d5d7d5d7d",
+      "expected": "malformed"
+    }
+  ],
+  "numericCases": [
+    {
+      "name": "u16-zero",
+      "value": "0",
+      "signed": false,
+      "bits": 16,
+      "valid": true
+    },
+    {
+      "name": "u16-one",
+      "value": "1",
+      "signed": false,
+      "bits": 16,
+      "valid": true
+    },
+    {
+      "name": "u16-max",
+      "value": "65535",
+      "signed": false,
+      "bits": 16,
+      "valid": true
+    },
+    {
+      "name": "u16-over",
+      "value": "65536",
+      "signed": false,
+      "bits": 16,
+      "valid": false
+    },
+    {
+      "name": "u16-negative",
+      "value": "-1",
+      "signed": false,
+      "bits": 16,
+      "valid": false
+    },
+    {
+      "name": "u32-zero",
+      "value": "0",
+      "signed": false,
+      "bits": 32,
+      "valid": true
+    },
+    {
+      "name": "u32-middle",
+      "value": "2147483648",
+      "signed": false,
+      "bits": 32,
+      "valid": true
+    },
+    {
+      "name": "u32-max",
+      "value": "4294967295",
+      "signed": false,
+      "bits": 32,
+      "valid": true
+    },
+    {
+      "name": "u32-over",
+      "value": "4294967296",
+      "signed": false,
+      "bits": 32,
+      "valid": false
+    },
+    {
+      "name": "u32-negative",
+      "value": "-1",
+      "signed": false,
+      "bits": 32,
+      "valid": false
+    },
+    {
+      "name": "u64-zero",
+      "value": "0",
+      "signed": false,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "u64-above-js-safe",
+      "value": "9007199254740993",
+      "signed": false,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "u64-max",
+      "value": "18446744073709551615",
+      "signed": false,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "u64-over",
+      "value": "18446744073709551616",
+      "signed": false,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "u64-negative",
+      "value": "-1",
+      "signed": false,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "i64-min-under",
+      "value": "-9223372036854775809",
+      "signed": true,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "i64-min",
+      "value": "-9223372036854775808",
+      "signed": true,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "i64-negative-one",
+      "value": "-1",
+      "signed": true,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "i64-zero",
+      "value": "0",
+      "signed": true,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "i64-above-js-safe",
+      "value": "9007199254740993",
+      "signed": true,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "i64-max",
+      "value": "9223372036854775807",
+      "signed": true,
+      "bits": 64,
+      "valid": true
+    },
+    {
+      "name": "i64-max-over",
+      "value": "9223372036854775808",
+      "signed": true,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "leading-zero",
+      "value": "01",
+      "signed": false,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "negative-zero",
+      "value": "-0",
+      "signed": true,
+      "bits": 64,
+      "valid": false
+    },
+    {
+      "name": "non-ascii-digit",
+      "value": "١",
+      "signed": false,
+      "bits": 64,
+      "valid": false
+    }
+  ],
+  "identifierCases": [
+    { "name": "one-byte", "rawHex": "41", "valid": true },
+    {
+      "name": "maximum-128-bytes",
+      "rawHex": "5454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454",
+      "valid": true
+    },
+    { "name": "empty", "rawHex": "", "valid": false },
+    { "name": "disallowed-first-byte", "rawHex": "2d616263", "valid": false },
+    { "name": "disallowed-later-byte", "rawHex": "612062", "valid": false },
+    { "name": "non-ascii", "rawHex": "c3a9", "valid": false },
+    { "name": "decomposed-unicode", "rawHex": "65cc81", "valid": false },
+    { "name": "malformed-utf8", "rawHex": "c328", "valid": false },
+    {
+      "name": "over-128-bytes",
+      "rawHex": "545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454",
+      "valid": false
+    }
+  ],
+  "otlpSemanticCases": [
+    {
+      "name": "timestamp-above-js-safe",
+      "kind": "timeUnixNano",
+      "json": "{\"timeUnixNano\":\"9007199254740993\"}",
+      "valid": true
+    },
+    {
+      "name": "timestamp-maximum",
+      "kind": "timeUnixNano",
+      "json": "{\"timeUnixNano\":\"18446744073709551615\"}",
+      "valid": true
+    },
+    {
+      "name": "timestamp-json-number",
+      "kind": "timeUnixNano",
+      "json": "{\"timeUnixNano\":9007199254740993}",
+      "valid": false
+    },
+    {
+      "name": "timestamp-overflow",
+      "kind": "timeUnixNano",
+      "json": "{\"timeUnixNano\":\"18446744073709551616\"}",
+      "valid": false
+    },
+    {
+      "name": "observed-timestamp-maximum",
+      "kind": "observedTimeUnixNano",
+      "json": "{\"observedTimeUnixNano\":\"18446744073709551615\"}",
+      "valid": true
+    },
+    {
+      "name": "observed-timestamp-json-number",
+      "kind": "observedTimeUnixNano",
+      "json": "{\"observedTimeUnixNano\":9007199254740993}",
+      "valid": false
+    },
+    {
+      "name": "flags-u32-maximum",
+      "kind": "u32",
+      "field": "flags",
+      "json": "{\"flags\":4294967295}",
+      "valid": true
+    },
+    {
+      "name": "flags-fractional",
+      "kind": "u32",
+      "field": "flags",
+      "json": "{\"flags\":1.5}",
+      "valid": false
+    },
+    {
+      "name": "flags-negative",
+      "kind": "u32",
+      "field": "flags",
+      "json": "{\"flags\":-1}",
+      "valid": false
+    },
+    {
+      "name": "flags-overflow",
+      "kind": "u32",
+      "field": "flags",
+      "json": "{\"flags\":4294967296}",
+      "valid": false
+    },
+    {
+      "name": "dropped-count-zero",
+      "kind": "u32",
+      "field": "droppedAttributesCount",
+      "json": "{\"droppedAttributesCount\":0}",
+      "valid": true
+    },
+    {
+      "name": "dropped-count-string",
+      "kind": "u32",
+      "field": "droppedAttributesCount",
+      "json": "{\"droppedAttributesCount\":\"1\"}",
+      "valid": false
+    },
+    {
+      "name": "severity-integer",
+      "kind": "severityNumber",
+      "json": "{\"severityNumber\":24}",
+      "valid": true
+    },
+    {
+      "name": "severity-symbolic",
+      "kind": "severityNumber",
+      "json": "{\"severityNumber\":\"SEVERITY_NUMBER_INFO\"}",
+      "valid": false
+    },
+    {
+      "name": "severity-fractional",
+      "kind": "severityNumber",
+      "json": "{\"severityNumber\":9.5}",
+      "valid": false
+    },
+    {
+      "name": "severity-out-of-range",
+      "kind": "severityNumber",
+      "json": "{\"severityNumber\":25}",
+      "valid": false
+    },
+    {
+      "name": "any-string",
+      "kind": "AnyValue",
+      "json": "{\"stringValue\":\"ok\"}",
+      "valid": true
+    },
+    {
+      "name": "any-boolean",
+      "kind": "AnyValue",
+      "json": "{\"boolValue\":true}",
+      "valid": true
+    },
+    {
+      "name": "any-integer",
+      "kind": "AnyValue",
+      "json": "{\"intValue\":\"-9223372036854775808\"}",
+      "valid": true
+    },
+    {
+      "name": "any-double",
+      "kind": "AnyValue",
+      "json": "{\"doubleValue\":1.5}",
+      "valid": true
+    },
+    {
+      "name": "any-bytes",
+      "kind": "AnyValue",
+      "json": "{\"bytesValue\":\"AAE=\"}",
+      "valid": true
+    },
+    {
+      "name": "any-array",
+      "kind": "AnyValue",
+      "json": "{\"arrayValue\":{\"values\":[{\"stringValue\":\"nested\"}]}}",
+      "valid": true
+    },
+    {
+      "name": "any-kvlist",
+      "kind": "AnyValue",
+      "json": "{\"kvlistValue\":{\"values\":[{\"key\":\"k\",\"value\":{\"boolValue\":true}}]}}",
+      "valid": true
+    },
+    {
+      "name": "any-array-non-array-values",
+      "kind": "AnyValue",
+      "json": "{\"arrayValue\":{\"values\":{}}}",
+      "valid": false
+    },
+    {
+      "name": "any-array-extra-container-field",
+      "kind": "AnyValue",
+      "json": "{\"arrayValue\":{\"values\":[],\"extra\":true}}",
+      "valid": false
+    },
+    {
+      "name": "any-kvlist-extra-container-field",
+      "kind": "AnyValue",
+      "json": "{\"kvlistValue\":{\"values\":[],\"extra\":true}}",
+      "valid": false
+    },
+    {
+      "name": "any-kvlist-duplicate-key",
+      "kind": "AnyValue",
+      "json": "{\"kvlistValue\":{\"values\":[{\"key\":\"k\",\"value\":{\"boolValue\":true}},{\"key\":\"k\",\"value\":{\"stringValue\":\"duplicate\"}}]}}",
+      "valid": false
+    },
+    {
+      "name": "any-kvlist-malformed-entry",
+      "kind": "AnyValue",
+      "json": "{\"kvlistValue\":{\"values\":[{\"key\":\"k\"}]}}",
+      "valid": false
+    },
+    {
+      "name": "any-nested-invalid-arm",
+      "kind": "AnyValue",
+      "json": "{\"arrayValue\":{\"values\":[{}]}}",
+      "valid": false
+    },
+    {
+      "name": "any-missing-arm",
+      "kind": "AnyValue",
+      "json": "{}",
+      "valid": false
+    },
+    {
+      "name": "any-multiple-arms",
+      "kind": "AnyValue",
+      "json": "{\"stringValue\":\"x\",\"boolValue\":true}",
+      "valid": false
+    },
+    {
+      "name": "any-integer-overflow",
+      "kind": "AnyValue",
+      "json": "{\"intValue\":\"9223372036854775808\"}",
+      "valid": false
+    },
+    {
+      "name": "any-invalid-base64",
+      "kind": "AnyValue",
+      "json": "{\"bytesValue\":\"AAE\"}",
+      "valid": false
+    },
+    {
+      "name": "any-non-finite-spelling",
+      "kind": "AnyValue",
+      "json": "{\"doubleValue\":\"NaN\"}",
+      "valid": false
+    },
+    {
+      "name": "duplicate-object-key",
+      "kind": "duplicateKey",
+      "json": "{\"severityNumber\":9,\"severityNumber\":10}",
+      "valid": false
+    },
+    {
+      "name": "duplicate-escaped-equivalent-key",
+      "kind": "duplicateKey",
+      "json": "{\"patientName\":\"a\",\"patient\\u004eame\":\"b\"}",
+      "valid": false
+    },
+    {
+      "name": "same-key-in-separate-objects",
+      "kind": "duplicateKey",
+      "json": "[{\"key\":\"a\"},{\"key\":\"b\"}]",
+      "valid": true
+    }
+  ],
+  "unknownFieldCases": [
+    {
+      "message": "ExportLogsServiceRequest",
+      "json": "{\"resourceLogs\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "ResourceLogs",
+      "json": "{\"scopeLogs\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "Resource",
+      "json": "{\"attributes\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "ScopeLogs",
+      "json": "{\"logRecords\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "InstrumentationScope",
+      "json": "{\"name\":\"nitro\",\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "LogRecord",
+      "json": "{\"timeUnixNano\":\"1\",\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "KeyValue",
+      "json": "{\"key\":\"safe\",\"value\":{\"stringValue\":\"ok\"},\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "AnyValue",
+      "json": "{\"stringValue\":\"ok\",\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "ArrayValue",
+      "json": "{\"values\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    },
+    {
+      "message": "KeyValueList",
+      "json": "{\"values\":[],\"patientName\":\"private\"}",
+      "unknownField": "patientName",
+      "baseExpected": "valid",
+      "strictExpected": "unknownField"
+    }
+  ]
+}

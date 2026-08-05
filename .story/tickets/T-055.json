@@ -1,0 +1,15 @@
+{
+  "blockedBy": [
+    "T-054"
+  ],
+  "completedDate": "2026-08-02",
+  "createdDate": "2026-08-02",
+  "description": "defineEvents() emits the tenant grammar artifact for server enforcement. There is no path to an event the schema does not name; free-form properties do not exist in strict tenants. Registration machinery is consumed later by the server track; this ticket is emission + artifact format.",
+  "displayId": "T-055",
+  "id": "T-055",
+  "order": 40,
+  "phase": "analytics",
+  "status": "complete",
+  "title": "A1: grammar artifact emission - event schemas are D10 strict grammars",
+  "type": "feature"
+}

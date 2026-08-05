@@ -1,4 +1,5 @@
 import type { PrivateValue, PublicValue } from './privacy';
+import type { PrimitiveValue } from './constraints';
 
 export type { PrivateValue, PublicValue };
 
@@ -13,7 +14,7 @@ export type LogLevel =
 export type LazyMessage = string | (() => string);
 
 /** The only value shapes the pipeline can render. */
-export type LogPrimitive = string | number | boolean;
+export type LogPrimitive = PrimitiveValue;
 
 /** Metadata values: a bare primitive, whose visibility follows the privacy
  * default, or one explicitly marked with `pub()` / `priv()`. */

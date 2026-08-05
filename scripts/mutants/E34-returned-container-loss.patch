@@ -1,0 +1,13 @@
+diff --git a/eslint-plugin/receiver-object-analysis.js b/eslint-plugin/receiver-object-analysis.js
+--- a/eslint-plugin/receiver-object-analysis.js
++++ b/eslint-plugin/receiver-object-analysis.js
+@@ -229,6 +229,8 @@
+           return finish(null);
+         }
+-        return finish(returnTargetReceiverObject(context, returned, seen));
++        return finish(
++          resolveReceiverObject(context, returned.arguments[0], seen)
++        );
+       }
+       const identity = identityWrappedValue(context, current);
+       if (identity) {

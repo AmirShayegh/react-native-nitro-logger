@@ -6,9 +6,12 @@ README is the guided tour; this is the index.
 Signatures are the real ones. Where behaviour is subtle — and in a logger most
 of the subtlety is in failure paths — this points at the document that explains
 it rather than restating it badly: [PRIVACY.md](PRIVACY.md) for the redaction
-contract, [PARITY.md](PARITY.md) for where the two native writers differ.
+contract, [PARITY.md](PARITY.md) for where the two native writers differ, and
+[WIRE.md](WIRE.md) for the versioned remote-ingest bytes and immutable segment
+identity.
 
 - [Logging](#logging)
+- [Analytics schemas](#analytics-schemas)
 - [Privacy](#privacy)
 - [Destinations](#destinations)
 - [Formatters](#formatters)
@@ -163,6 +166,91 @@ reaches a destination, privacy has already been applied — a destination cannot
 un-redact, and is not trusted to.
 
 <!-- api: LogOptions, LazyMessage, LogLevel, LogEntry -->
+
+---
+
+## Analytics schemas
+
+Import this surface from `react-native-nitro-logger/analytics`. It authors a
+closed event grammar once; later analytics tooling consumes the same frozen
+schema instead of maintaining a second list of names, properties, or bounds.
+
+### `defineEvents(definition)` and its inferred types
+
+`defineEvents` returns an immutable `EventArtifact` containing the normalized
+schema, its runtime validator, an inspectable `grammar`, and the authoritative
+precomputed `grammarJSON` bytes. Its `lint` member is an
+`AnalyticsLintArtifactV1`: `{ formatVersion: 1, grammar }`, frozen over the
+same grammar object for schema-dependent ESLint rules. `EventName<Artifact>`
+extracts the exact event-name union, while `EventProperties<Artifact, Name>`
+extracts one event's required and optional property object.
+`ValidationResult<Artifact>` is a closed discriminated union: success
+correlates `eventName` with validated `properties`; failures carry fixed codes
+and never rejected caller data.
+
+The validator accepts unknown runtime input for JavaScript and decoded-data
+callers. Bare and `pub()` values must satisfy their descriptors. Authentic
+`priv()` markers are checked for authenticity but never compared with a
+caller-selected constraint, because a payload-dependent result would become a
+range or equality oracle; their descriptor compatibility remains a TypeScript
+guarantee and the server grammar remains authoritative for modified clients.
+
+<!-- api: defineEvents, AnalyticsLintArtifactV1, EventArtifact, EventName, EventProperties, ValidationResult -->
+
+### Canonical analytics grammar
+
+`AnalyticsGrammar` currently aliases `AnalyticsGrammarV1`. Its component types
+are `AnalyticsGrammarEvent`, `AnalyticsGrammarProperty`, and
+`AnalyticsGrammarConstraint`, whose concrete branches are
+`AnalyticsGrammarEnumConstraint`, `AnalyticsGrammarIntegerConstraint`, and
+`AnalyticsGrammarNamedStringConstraint`. The exact portable shape is:
+
+```ts
+type AnalyticsGrammarV1 = {
+  artifact: 'react-native-nitro-logger/analytics-grammar';
+  formatVersion: 1;
+  additionalEvents: false;
+  events: readonly {
+    name: string;
+    additionalProperties: false;
+    properties: readonly {
+      name: string;
+      required: boolean;
+      constraint:
+        | { type: 'enum'; values: readonly string[] }
+        | { type: 'integer'; minimum: number; maximum: number }
+        | { type: 'named-string'; registry: string; values: readonly string[] };
+    }[];
+  }[];
+};
+```
+
+Event and property names are sorted; authored constraint-member order is
+preserved. Both levels are closed, every node is recursively frozen, and the
+stored `grammarJSON` is serialized once from a prototype-independent graph.
+Normal `JSON.stringify(artifact.grammar)` produces the same string, but later
+registration must use `grammarJSON` so ambient serializer changes cannot alter
+approved bytes.
+
+V1 accepts only safe integer bounds, Unicode-scalar constraint members no
+larger than 256 UTF-8 bytes, at most 256 events, 2,048 properties, 16,384
+serialized member references, and 1 MiB of JSON. `formatVersion` identifies
+this document format; it is not the gateway-assigned D10 `schemaVersion`.
+Emission proves neither tenant approval nor registration, active/retired/
+revoked lifecycle state, signature validity, or server enforcement.
+
+<!-- api: AnalyticsGrammar, AnalyticsGrammarConstraint, AnalyticsGrammarEnumConstraint, AnalyticsGrammarEvent, AnalyticsGrammarIntegerConstraint, AnalyticsGrammarNamedStringConstraint, AnalyticsGrammarProperty, AnalyticsGrammarV1 -->
+
+### `oneOf`, `int`, `namedString`, `screenName`, and `optional`
+
+`oneOf` defines a non-empty exact string enum. `int` defines an inclusive,
+finite integer range. `namedString` binds a non-empty exact string set to a
+structural registry name, and `screenName` is its screen-registry shorthand.
+`optional` marks one descriptor optional without widening its inferred value.
+Every constructor copies and freezes its input, rejects duplicates or invalid
+bounds at definition time, and exposes no free-form string descriptor.
+
+<!-- api: oneOf, int, namedString, screenName, optional -->
 
 ---
 
@@ -814,7 +902,7 @@ On **React Native 0.78 only**, importing from `/unstable` also needs
 `resolver.unstable_enablePackageExports: true` in `metro.config.js`: Metro 0.81
 ships with subpath exports off, and 0.82 — React Native 0.79 and up — turns
 them on. The root entry point is unaffected at every version. The
-[README](../README.md#unstable-needs-one-line-of-metro-config-on-react-native-078)
+[README](../README.md#package-subpaths-need-one-line-of-metro-config-on-react-native-078)
 has the measurements.
 
 `FileSink` and `NativeConsoleSink` are the Nitro interfaces, and moved to
@@ -1005,6 +1093,15 @@ from here fails the suite, and so does an entry here that no longer exists.
 
 - `AppendResult`
 - `AppStateLike`
+- `AnalyticsGrammar`
+- `AnalyticsGrammarConstraint`
+- `AnalyticsGrammarEnumConstraint`
+- `AnalyticsGrammarEvent`
+- `AnalyticsGrammarIntegerConstraint`
+- `AnalyticsGrammarNamedStringConstraint`
+- `AnalyticsGrammarProperty`
+- `AnalyticsGrammarV1`
+- `AnalyticsLintArtifactV1`
 - `Batcher`
 - `BatcherOptions`
 - `BatchFlushOutcome`
@@ -1032,6 +1129,9 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `ERROR_METADATA_KEYS`
 - `ErrorHandlerOptions`
 - `ErrorUtilsLike`
+- `EventArtifact`
+- `EventName`
+- `EventProperties`
 - `FenceReason`
 - `FileDestination`
 - `FileDestinationOptions`
@@ -1042,6 +1142,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `FlushOutcome`
 - `installErrorHandler`
 - `installRejectionHandler`
+- `int`
 - `JsonLinesFormatter`
 - `JsonLinesFormatterOptions`
 - `JsonTimestampStyle`
@@ -1067,8 +1168,11 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `NativeConsoleDestinationOptions`
 - `NativeConsoleSink`
 - `NativeConsoleSinkLike`
+- `namedString`
 - `NON_ERROR_THROWN`
 - `PlatformConsoleFormatter`
+- `oneOf`
+- `optional`
 - `priv`
 - `PrivacyDefault`
 - `PRIVATE_PLACEHOLDER`
@@ -1091,6 +1195,7 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `SanitizeErrorOptions`
 - `scheduleMaintenance`
 - `ScheduleMaintenanceOptions`
+- `screenName`
 - `ScopedLogger`
 - `ScopedLogOptions`
 - `SinkStatus`
@@ -1099,4 +1204,6 @@ from here fails the suite, and so does an entry here that no longer exists.
 - `Uninstall`
 - `UNKNOWN_ERROR_NAME`
 - `UNREADABLE_VALUE`
+- `ValidationResult`
+- `defineEvents`
 - `utf8Length`
