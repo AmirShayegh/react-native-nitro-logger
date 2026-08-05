@@ -183,6 +183,8 @@ const contractFiles = [
   'spec/wire/v1/auth-contract.json',
   'spec/wire/v1/auth-vectors.json',
   'spec/wire/v1/contract.json',
+  'spec/wire/v1/envelope-contract.json',
+  'spec/wire/v1/envelope-vectors.json',
   'spec/wire/v1/golden-vectors.json',
   'spec/wire/v1/resolution-table.json',
 ];
@@ -191,6 +193,8 @@ const expectedVersionFiles = new Set([
   'auth-contract.json',
   'auth-vectors.json',
   'contract.json',
+  'envelope-contract.json',
+  'envelope-vectors.json',
   'golden-vectors.json',
   'resolution-table.json',
 ]);
@@ -258,11 +262,13 @@ const manifest = {
   descriptors: [
     'spec/wire/v1/contract.json',
     'spec/wire/v1/auth-contract.json',
+    'spec/wire/v1/envelope-contract.json',
     'spec/wire/v1/resolution-table.json',
   ],
   vectorSets: [
     'spec/wire/v1/golden-vectors.json',
     'spec/wire/v1/auth-vectors.json',
+    'spec/wire/v1/envelope-vectors.json',
   ],
   files,
 };

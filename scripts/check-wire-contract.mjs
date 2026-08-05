@@ -19,6 +19,46 @@ const temporary = fs.mkdtempSync(
 try {
   execFileSync(node, [renderer, '--check'], { cwd: root, stdio: 'inherit' });
 
+  const rendererTree = path.join(temporary, 'renderer-tree');
+  for (const relativePath of [
+    'scripts/render-wire-doc.mjs',
+    'docs/WIRE.md',
+    'spec/wire/v1/auth-contract.json',
+    'spec/wire/v1/contract.json',
+    'spec/wire/v1/envelope-contract.json',
+    'spec/wire/v1/envelope-vectors.json',
+    'spec/wire/v1/resolution-table.json',
+  ]) {
+    const target = path.join(rendererTree, relativePath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(root, relativePath), target);
+  }
+  const rendererEnvelopePath = path.join(
+    rendererTree,
+    'spec/wire/v1/envelope-contract.json'
+  );
+  const rendererEnvelope = JSON.parse(
+    fs.readFileSync(rendererEnvelopePath, 'utf8')
+  );
+  rendererEnvelope.response.cacheControl = 'private';
+  fs.writeFileSync(
+    rendererEnvelopePath,
+    `${JSON.stringify(rendererEnvelope, null, 2)}\n`
+  );
+  const staleRenderedDoc = spawnSync(
+    node,
+    [path.join(rendererTree, 'scripts/render-wire-doc.mjs'), '--check'],
+    { cwd: rendererTree, encoding: 'utf8' }
+  );
+  if (
+    staleRenderedDoc.status !== 1 ||
+    !staleRenderedDoc.stderr.includes('generated blocks do not match')
+  ) {
+    throw new Error(
+      'wire renderer positive control did not detect envelope drift'
+    );
+  }
+
   const first = path.join(temporary, 'first.json');
   const second = path.join(temporary, 'second.json');
   for (const output of [first, second]) {
@@ -44,6 +84,8 @@ try {
     'spec/wire/v1/auth-contract.json',
     'spec/wire/v1/auth-vectors.json',
     'spec/wire/v1/contract.json',
+    'spec/wire/v1/envelope-contract.json',
+    'spec/wire/v1/envelope-vectors.json',
     'spec/wire/v1/golden-vectors.json',
     'spec/wire/v1/resolution-table.json',
   ];
@@ -56,10 +98,22 @@ try {
     );
   }
   if (
+    JSON.stringify(manifest.descriptors) !==
+    JSON.stringify([
+      'spec/wire/v1/contract.json',
+      'spec/wire/v1/auth-contract.json',
+      'spec/wire/v1/envelope-contract.json',
+      'spec/wire/v1/resolution-table.json',
+    ])
+  ) {
+    throw new Error('manifest has an incomplete descriptor inventory');
+  }
+  if (
     JSON.stringify(manifest.vectorSets) !==
     JSON.stringify([
       'spec/wire/v1/golden-vectors.json',
       'spec/wire/v1/auth-vectors.json',
+      'spec/wire/v1/envelope-vectors.json',
     ])
   ) {
     throw new Error('manifest has an incomplete vector inventory');
@@ -125,6 +179,8 @@ try {
     'spec/wire/v1/auth-contract.json',
     'spec/wire/v1/auth-vectors.json',
     'spec/wire/v1/contract.json',
+    'spec/wire/v1/envelope-contract.json',
+    'spec/wire/v1/envelope-vectors.json',
     'spec/wire/v1/golden-vectors.json',
     'spec/wire/v1/resolution-table.json',
   ]) {

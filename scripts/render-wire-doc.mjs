@@ -15,6 +15,15 @@ const auth = JSON.parse(
 const resolution = JSON.parse(
   fs.readFileSync(path.join(root, 'spec/wire/v1/resolution-table.json'), 'utf8')
 );
+const envelope = JSON.parse(
+  fs.readFileSync(
+    path.join(root, 'spec/wire/v1/envelope-contract.json'),
+    'utf8'
+  )
+);
+const envelopeVectors = JSON.parse(
+  fs.readFileSync(path.join(root, 'spec/wire/v1/envelope-vectors.json'), 'utf8')
+);
 const documentPath = path.join(root, 'docs/WIRE.md');
 
 function table(headers, rows) {
@@ -173,6 +182,29 @@ const generated = {
         `\`${resolution.linearization.ledgerReplayException}\``,
       ],
     ]
+  ),
+  'ack-envelope': table(
+    ['Property', 'Pinned value'],
+    [
+      ['HTTP status', String(envelope.response.httpStatus)],
+      ['Content-Type', envelope.response.contentType],
+      ['Cache-Control', envelope.response.cacheControl],
+      ['Maximum response body', `${envelope.response.maximumBodyBytes} bytes`],
+      ['Version', envelope.response.version],
+      ['Field order', envelope.response.fields.join(', ')],
+      ['Accepted action', envelope.response.outcomes.accepted.clientAction],
+      ['Rejected action', envelope.response.outcomes.rejected.clientAction],
+      ['Fallback', envelope.nonterminalDefault],
+    ]
+  ),
+  'ack-response-matrix': table(
+    ['Case', 'Terminal', 'Client action', 'Does not prove'],
+    envelopeVectors.cases.map((vector) => [
+      vector.id,
+      String(vector.expected.terminal),
+      vector.expected.action,
+      vector.doesNotProve,
+    ])
   ),
 };
 

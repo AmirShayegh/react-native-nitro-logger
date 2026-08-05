@@ -1,0 +1,511 @@
+{
+  "vectorVersion": 1,
+  "context": {
+    "segmentId": "000102030405060708090a0b0c0d0e0f",
+    "contentHash": "79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32",
+    "latestKnownAcceptanceEpoch": "acceptance-epoch-v1",
+    "alarmThreshold": 5
+  },
+  "cases": [
+    {
+      "id": "gateway-accepted",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": true, "action": "unlink-accepted" },
+      "doesNotProve": "that the inbox survives physical-volume or site loss"
+    },
+    {
+      "id": "gateway-rejected",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"rejected\",\"reasonCode\":\"SEGMENT_REJECTED\",\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": true, "action": "account-and-unlink-rejected" },
+      "doesNotProve": "that every future rejection class is safely terminal"
+    },
+    {
+      "id": "gateway-accepted-at-response-limit",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  \n"
+      },
+      "expected": { "terminal": true, "action": "unlink-accepted" },
+      "doesNotProve": "that a concrete mobile HTTP stack streams the bounded read without copying"
+    },
+    {
+      "id": "response-body-over-limit",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   \n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that every concrete HTTP stack stops reading at the same transport boundary"
+    },
+    {
+      "id": "proxy-404-json",
+      "response": {
+        "status": 404,
+        "headers": { "Content-Type": ["application/json"] },
+        "body": "{\"error\":\"not found\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that every intermediary emits this body"
+    },
+    {
+      "id": "proxy-500-html",
+      "response": {
+        "status": 500,
+        "headers": { "Content-Type": ["text/html"] },
+        "body": "<html>upstream failed</html>"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that TLS or routing reached the gateway"
+    },
+    {
+      "id": "proxy-envelope-less-at-alarm-threshold",
+      "attempt": 5,
+      "response": {
+        "status": 502,
+        "headers": { "Content-Type": ["text/plain"] },
+        "body": "bad gateway"
+      },
+      "expected": {
+        "terminal": false,
+        "action": "alarm-infrastructure-retain"
+      },
+      "doesNotProve": "that an operator receives or acts on the alarm"
+    },
+    {
+      "id": "unauthorized-401-first",
+      "tokenRefreshes": 0,
+      "response": {
+        "status": 401,
+        "headers": { "Content-Type": ["application/json; charset=utf-8"] },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"UNAUTHORIZED\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "refresh-token-once-retain" },
+      "doesNotProve": "that token refresh succeeds"
+    },
+    {
+      "id": "unauthorized-401-after-refresh",
+      "tokenRefreshes": 1,
+      "response": {
+        "status": 401,
+        "headers": { "Content-Type": ["application/json; charset=utf-8"] },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"UNAUTHORIZED\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that persistent authorization failure is repaired"
+    },
+    {
+      "id": "request-too-large-413",
+      "response": {
+        "status": 413,
+        "headers": { "Content-Type": ["application/json; charset=utf-8"] },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"REQUEST_TOO_LARGE\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "alarm-configuration-retain" },
+      "doesNotProve": "which request-size layer rejected the request"
+    },
+    {
+      "id": "resource-exhausted-429-retry-after",
+      "response": {
+        "status": 429,
+        "headers": {
+          "Content-Type": ["application/json; charset=utf-8"],
+          "Retry-After": ["1"]
+        },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"RESOURCE_EXHAUSTED\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "honor-retry-after-retain" },
+      "doesNotProve": "fairness under sustained load"
+    },
+    {
+      "id": "resource-exhausted-429-malformed-retry-after",
+      "response": {
+        "status": 429,
+        "headers": {
+          "Content-Type": ["application/json; charset=utf-8"],
+          "Retry-After": ["tomorrow"]
+        },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"RESOURCE_EXHAUSTED\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "the source of a malformed header"
+    },
+    {
+      "id": "unavailable-503-retry-after",
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": ["application/json; charset=utf-8"],
+          "Retry-After": ["1"]
+        },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"UNAVAILABLE\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "honor-retry-after-retain" },
+      "doesNotProve": "the unavailable dependency or recovery time"
+    },
+    {
+      "id": "network-error",
+      "transportError": "connection-reset",
+      "response": null,
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether bytes reached the gateway"
+    },
+    {
+      "id": "timeout",
+      "transportError": "deadline-exceeded",
+      "response": null,
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether a durable commit happened before timeout"
+    },
+    {
+      "id": "generic-gateway-error-envelope",
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": ["application/json; charset=utf-8"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"error\":{\"code\":\"INVALID_REQUEST\"}}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that the body came from the gateway rather than an intermediary"
+    },
+    {
+      "id": "malformed-json",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\""
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "the origin of truncation"
+    },
+    {
+      "id": "duplicate-key",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "how a non-strict parser would normalize duplicates"
+    },
+    {
+      "id": "extra-field",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\",\"proxy\":true}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "future-version extensibility"
+    },
+    {
+      "id": "missing-field",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which component omitted the field"
+    },
+    {
+      "id": "legacy-epoch-alias",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"epoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "that every future client version rejects every deprecated alias"
+    },
+    {
+      "id": "missing-content-type",
+      "response": {
+        "status": 200,
+        "headers": { "Cache-Control": ["no-store"] },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether an intermediary removed the header"
+    },
+    {
+      "id": "wrong-content-type",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/json"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether a proxy rewrote the header"
+    },
+    {
+      "id": "ambiguous-content-type",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": [
+            "application/vnd.nitro-logger.ack+json; version=1",
+            "application/json"
+          ],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which duplicate header value was injected"
+    },
+    {
+      "id": "duplicate-identical-content-type",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": [
+            "application/vnd.nitro-logger.ack+json; version=1",
+            "application/vnd.nitro-logger.ack+json; version=1"
+          ],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which component duplicated the identical header"
+    },
+    {
+      "id": "mixed-case-duplicate-content-type",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "content-type": ["text/html"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "how a concrete HTTP stack normalizes field names"
+    },
+    {
+      "id": "missing-cache-control",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether an intermediary removed the cache directive"
+    },
+    {
+      "id": "wrong-cache-control",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["public"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether an intermediary cached the body"
+    },
+    {
+      "id": "duplicate-identical-cache-control",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store", "no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which component duplicated the cache directive"
+    },
+    {
+      "id": "mixed-case-duplicate-cache-control",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"],
+          "cache-control": ["public"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "how a concrete HTTP stack joins cache directives"
+    },
+    {
+      "id": "mismatched-segment-id",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"100102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which request the response belongs to"
+    },
+    {
+      "id": "mismatched-content-hash",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"89df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which immutable payload the response covers"
+    },
+    {
+      "id": "stale-epoch",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v0\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "site-loss timing before the newer epoch became known"
+    },
+    {
+      "id": "unsupported-version",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"2\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "future-version semantics"
+    },
+    {
+      "id": "unsupported-status",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"queued\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "future-status semantics"
+    },
+    {
+      "id": "accepted-with-reason",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":\"SEGMENT_REJECTED\",\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "which component produced the contradictory pair"
+    },
+    {
+      "id": "rejected-with-null-reason",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"rejected\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "the intended rejection class"
+    },
+    {
+      "id": "unsupported-rejection-reason",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"rejected\",\"reasonCode\":\"FUTURE_REASON\",\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "future rejection semantics or disposal safety"
+    },
+    {
+      "id": "noncanonical-uppercase-identity",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090A0B0C0D0E0F\",\"contentHash\":\"79DF9DF42A61ABC0460BCA5158D971BDC45BB6C53A4A1DABD7B584656579AC32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether a case-normalizing client would compare equal"
+    },
+    {
+      "id": "valid-body-wrong-http-status",
+      "response": {
+        "status": 502,
+        "headers": {
+          "Content-Type": ["application/vnd.nitro-logger.ack+json; version=1"],
+          "Cache-Control": ["no-store"]
+        },
+        "body": "{\"version\":\"1\",\"segmentId\":\"000102030405060708090a0b0c0d0e0f\",\"contentHash\":\"79df9df42a61abc0460bca5158d971bdc45bb6c53a4a1dabd7b584656579ac32\",\"status\":\"accepted\",\"reasonCode\":null,\"acceptanceEpoch\":\"acceptance-epoch-v1\"}\n"
+      },
+      "expected": { "terminal": false, "action": "retain-and-backoff" },
+      "doesNotProve": "whether an intermediary preserved a stale body"
+    }
+  ]
+}

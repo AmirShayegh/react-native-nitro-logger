@@ -61,8 +61,8 @@ case "$MODE" in
     ;;
   js)
     REPORTS="$(pwd)/.jest-reports"
-    MINIMUM=2196
-    REQUIRED_SUITES="adapterThinness analytics analyticsEslintPlugin analyticsGoldenVectors analyticsGrammar analyticsLintArtifact apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance mutantManifest nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError platformConsoleFormatter scope subsystem timestamp utf8 wireAuthContract wireContract"
+    MINIMUM=2200
+    REQUIRED_SUITES="adapterThinness analytics analyticsEslintPlugin analyticsGoldenVectors analyticsGrammar analyticsLintArtifact apiReference batcher consoleDestination construction correlation deadline defaultFormatter degradation eslintPlugin fileDestination fileSinkLifecycleRows integrations jsonLinesFormatter levels logger maintenance mutantManifest nativeConsoleDestination openFailureParity privacy redaction rejectionHandler revealSentinels sanitizeError platformConsoleFormatter scope subsystem timestamp utf8 wireAuthContract wireContract wireEnvelopeContract"
     rm -rf "$REPORTS"
     mkdir -p "$REPORTS"
     npx jest --ci --json --outputFile="$REPORTS/jest.json"

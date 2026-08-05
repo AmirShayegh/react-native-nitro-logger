@@ -9,12 +9,15 @@ bytes and failure classifications. [`auth-contract.json`](../spec/wire/v1/auth-c
 and [`auth-vectors.json`](../spec/wire/v1/auth-vectors.json) pin A12/A13
 authorization behavior; [`resolution-table.json`](../spec/wire/v1/resolution-table.json)
 pins gateway decision and transaction order.
+[`envelope-contract.json`](../spec/wire/v1/envelope-contract.json) and
+[`envelope-vectors.json`](../spec/wire/v1/envelope-vectors.json) pin terminal
+ingest acknowledgements and the complete client response matrix.
 
 This document defines syntax and immutable identity. It does not implement a
 segment writer, HTTP endpoint implementation, resource-budget mechanism,
-tenant grammar lifecycle, or acknowledgement envelope. It does define the
-authorization capability and manifest behavior those consumers must adopt
-without reinterpretation.
+tenant grammar lifecycle, or mobile retry loop. It does define the
+authorization capability, manifest behavior, and acknowledgement evidence
+those consumers must adopt without reinterpretation.
 
 ## Version pins
 
@@ -314,19 +317,105 @@ transition subsequently invalidates its authority and recoverable material. The
 only replay exception is a pre-existing same-epoch ledger outcome, which creates
 no new authority.
 
+## Ingest acknowledgement envelope v1
+
+The acknowledgement is the only terminal disposal evidence. A client unlinks a
+segment only after receiving one HTTP response whose status and headers match
+the pins below and whose strict JSON object binds the exact segment ID, content
+hash, supported version, valid status/reason pair, and latest acceptance epoch
+known to that client. Duplicate keys, missing or extra fields, stale epochs,
+non-canonical identity spellings, and otherwise valid bodies behind the wrong
+HTTP status remain nonterminal.
+
+<!-- BEGIN GENERATED:ack-envelope -->
+| Property | Pinned value |
+| --- | --- |
+| HTTP status | 200 |
+| Content-Type | application/vnd.nitro-logger.ack+json; version=1 |
+| Cache-Control | no-store |
+| Maximum response body | 4096 bytes |
+| Version | 1 |
+| Field order | version, segmentId, contentHash, status, reasonCode, acceptanceEpoch |
+| Accepted action | unlink-accepted |
+| Rejected action | account-and-unlink-rejected |
+| Fallback | retain-and-backoff |
+<!-- END GENERATED:ack-envelope -->
+
+An accepted envelope has a null reason and permits unlink. A rejected envelope
+has the pinned rejection reason, must be accounted for, and then permits
+unlink. All generic gateway failures, proxy-shaped responses, transport
+failures, timeouts, malformed envelopes, and identity mismatches retain the
+segment and use bounded backoff. A first 401 may refresh authorization and
+retry; a second 401 remains nonterminal. Valid `Retry-After` guidance on 429 or
+503 may bound that backoff, while malformed guidance does not become terminal.
+A 413 remains nonterminal because a proxy and the authoritative gateway are not
+interchangeable sources of disposal evidence.
+
+<!-- BEGIN GENERATED:ack-response-matrix -->
+| Case | Terminal | Client action | Does not prove |
+| --- | --- | --- | --- |
+| gateway-accepted | true | unlink-accepted | that the inbox survives physical-volume or site loss |
+| gateway-rejected | true | account-and-unlink-rejected | that every future rejection class is safely terminal |
+| gateway-accepted-at-response-limit | true | unlink-accepted | that a concrete mobile HTTP stack streams the bounded read without copying |
+| response-body-over-limit | false | retain-and-backoff | that every concrete HTTP stack stops reading at the same transport boundary |
+| proxy-404-json | false | retain-and-backoff | that every intermediary emits this body |
+| proxy-500-html | false | retain-and-backoff | that TLS or routing reached the gateway |
+| proxy-envelope-less-at-alarm-threshold | false | alarm-infrastructure-retain | that an operator receives or acts on the alarm |
+| unauthorized-401-first | false | refresh-token-once-retain | that token refresh succeeds |
+| unauthorized-401-after-refresh | false | retain-and-backoff | that persistent authorization failure is repaired |
+| request-too-large-413 | false | alarm-configuration-retain | which request-size layer rejected the request |
+| resource-exhausted-429-retry-after | false | honor-retry-after-retain | fairness under sustained load |
+| resource-exhausted-429-malformed-retry-after | false | retain-and-backoff | the source of a malformed header |
+| unavailable-503-retry-after | false | honor-retry-after-retain | the unavailable dependency or recovery time |
+| network-error | false | retain-and-backoff | whether bytes reached the gateway |
+| timeout | false | retain-and-backoff | whether a durable commit happened before timeout |
+| generic-gateway-error-envelope | false | retain-and-backoff | that the body came from the gateway rather than an intermediary |
+| malformed-json | false | retain-and-backoff | the origin of truncation |
+| duplicate-key | false | retain-and-backoff | how a non-strict parser would normalize duplicates |
+| extra-field | false | retain-and-backoff | future-version extensibility |
+| missing-field | false | retain-and-backoff | which component omitted the field |
+| legacy-epoch-alias | false | retain-and-backoff | that every future client version rejects every deprecated alias |
+| missing-content-type | false | retain-and-backoff | whether an intermediary removed the header |
+| wrong-content-type | false | retain-and-backoff | whether a proxy rewrote the header |
+| ambiguous-content-type | false | retain-and-backoff | which duplicate header value was injected |
+| duplicate-identical-content-type | false | retain-and-backoff | which component duplicated the identical header |
+| mixed-case-duplicate-content-type | false | retain-and-backoff | how a concrete HTTP stack normalizes field names |
+| missing-cache-control | false | retain-and-backoff | whether an intermediary removed the cache directive |
+| wrong-cache-control | false | retain-and-backoff | whether an intermediary cached the body |
+| duplicate-identical-cache-control | false | retain-and-backoff | which component duplicated the cache directive |
+| mixed-case-duplicate-cache-control | false | retain-and-backoff | how a concrete HTTP stack joins cache directives |
+| mismatched-segment-id | false | retain-and-backoff | which request the response belongs to |
+| mismatched-content-hash | false | retain-and-backoff | which immutable payload the response covers |
+| stale-epoch | false | retain-and-backoff | site-loss timing before the newer epoch became known |
+| unsupported-version | false | retain-and-backoff | future-version semantics |
+| unsupported-status | false | retain-and-backoff | future-status semantics |
+| accepted-with-reason | false | retain-and-backoff | which component produced the contradictory pair |
+| rejected-with-null-reason | false | retain-and-backoff | the intended rejection class |
+| unsupported-rejection-reason | false | retain-and-backoff | future rejection semantics or disposal safety |
+| noncanonical-uppercase-identity | false | retain-and-backoff | whether a case-normalizing client would compare equal |
+| valid-body-wrong-http-status | false | retain-and-backoff | whether an intermediary preserved a stale body |
+<!-- END GENERATED:ack-response-matrix -->
+
+The latest-known epoch comparison prevents an acknowledgement from an older
+gateway generation from disposing a segment after the client observes a newer
+generation. It does not prove a disaster-recovery point objective: epoch state,
+inbox bytes, ledger outcomes, and audit intent still require the separately
+specified durability and recovery controls.
+
 ## Golden vectors and adoption
 
 The shared vectors contain source values, exact payload bytes, zero-slot header
 bytes, final header bytes, digest, corruption cases, numeric boundaries,
 identifier failures, base-versus-strict unknown-field cases, authorization
-outcomes, lifecycle races, and crash recovery. Node, Swift, and Kotlin consumers
+outcomes, lifecycle races, crash recovery, exact acknowledgement bytes, and the
+complete client response matrix. Node, Swift, Kotlin, and Go consumers
 independently reproduce them; a platform may not import another platform's
 codec.
 
 The npm package generates `spec/wire/manifest.json` after the source commit
 exists. It records that commit and SHA-256 for this document, the descriptor,
-the authorization descriptors, the resolution table, and both vector sets. The
-generated manifest is not tracked and does not hash
+the authorization and envelope descriptors, the resolution table, and all
+vector sets. The generated manifest is not tracked and does not hash
 itself, avoiding a circular commit or content reference. Gateway support must
 deploy before a client release emits a new header/contract version.
 
@@ -335,6 +424,7 @@ Downstream ownership remains explicit:
 - T-030 implements native sealing against these vectors;
 - T-022 implements gateway parsing and resource budgets;
 - T-023 implements tenant grammar lifecycle and emergency revocation;
-- T-024 defines acknowledgement envelopes and terminal response behavior;
+- T-024 defines the acknowledgement envelope and gateway adoption;
+- T-034 implements the client response matrix without weakening its terminal predicate;
 - T-062 owns the shared A12/A13 capability, manifest, resolution, and transaction contract;
 - T-063 implements these server-side rules without weakening this public surface.

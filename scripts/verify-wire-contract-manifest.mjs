@@ -15,6 +15,8 @@ const expectedStatePaths = new Set([
   'spec/wire/v1/auth-contract.json',
   'spec/wire/v1/auth-vectors.json',
   'spec/wire/v1/contract.json',
+  'spec/wire/v1/envelope-contract.json',
+  'spec/wire/v1/envelope-vectors.json',
   'spec/wire/v1/golden-vectors.json',
   'spec/wire/v1/resolution-table.json',
   'spec/wire/manifest.json',

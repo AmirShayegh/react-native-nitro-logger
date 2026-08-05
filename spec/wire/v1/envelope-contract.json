@@ -1,0 +1,58 @@
+{
+  "contractVersion": 1,
+  "protocol": "ingest-acknowledgement",
+  "response": {
+    "httpStatus": 200,
+    "contentType": "application/vnd.nitro-logger.ack+json; version=1",
+    "cacheControl": "no-store",
+    "maximumBodyBytes": 4096,
+    "fields": [
+      "version",
+      "segmentId",
+      "contentHash",
+      "status",
+      "reasonCode",
+      "acceptanceEpoch"
+    ],
+    "version": "1",
+    "segmentId": {
+      "encoding": "lowercase-hex",
+      "bytes": 16
+    },
+    "contentHash": {
+      "encoding": "lowercase-hex",
+      "bytes": 32
+    },
+    "acceptanceEpoch": {
+      "encoding": "ascii",
+      "minimumBytes": 1,
+      "maximumBytes": 128
+    },
+    "outcomes": {
+      "accepted": {
+        "reasonCode": null,
+        "clientAction": "unlink-accepted"
+      },
+      "rejected": {
+        "reasonCodes": ["SEGMENT_REJECTED"],
+        "clientAction": "account-and-unlink-rejected"
+      }
+    }
+  },
+  "terminalPredicate": [
+    "single-http-response",
+    "exact-http-status",
+    "single-exact-content-type",
+    "single-exact-cache-control",
+    "response-body-within-limit",
+    "strict-json-object",
+    "exact-field-inventory",
+    "supported-version",
+    "canonical-identities",
+    "segment-id-match",
+    "content-hash-match",
+    "latest-known-epoch-match",
+    "valid-status-reason-pair"
+  ],
+  "nonterminalDefault": "retain-and-backoff"
+}

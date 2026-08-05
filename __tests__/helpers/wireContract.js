@@ -432,6 +432,7 @@ module.exports = {
   baseDecode,
   classifySegment,
   decimalInRange,
+  hasNoDuplicateKeys,
   identifierRawValid,
   otlpSemanticCaseValid,
   serializeHeader,
