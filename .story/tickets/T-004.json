@@ -1,0 +1,13 @@
+{
+  "blockedBy": [],
+  "completedDate": "2026-08-06",
+  "createdDate": "2026-08-02",
+  "description": "On-device probe of os_log/logcat chunking with messages that cross chunk budgets mid-code-point: emoji, CJK, and the Android modified-UTF-8 two-byte NUL. Verify no code point is split and no bytes are lost or duplicated across chunks, reading the actual device log output. Positive control: a deliberately mis-budgeted build must fail the verifier. Runs in the probes2 harness against packaged --dev false bundles.",
+  "displayId": "T-004",
+  "id": "T-004",
+  "order": 10,
+  "phase": "hardening",
+  "status": "complete",
+  "title": "Console-chunking probe at multi-byte boundaries (iOS + Android)",
+  "type": "task"
+}
