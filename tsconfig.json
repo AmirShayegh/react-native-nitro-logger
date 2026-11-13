@@ -3,7 +3,8 @@
     "rootDir": ".",
     "paths": {
       "react-native-nitro-logger": ["./src/index"],
-      "react-native-nitro-logger/unstable": ["./src/unstable"]
+      "react-native-nitro-logger/unstable": ["./src/unstable"],
+      "react-native-nitro-logger/analytics": ["./src/analytics"]
     },
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,

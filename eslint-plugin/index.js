@@ -4,6 +4,10 @@ const noDynamicMessage = require('./rules/no-dynamic-message');
 const noComputedMetadataKey = require('./rules/no-computed-metadata-key');
 const noDerivedCorrelation = require('./rules/no-derived-correlation');
 const literalSubsystem = require('./rules/literal-subsystem');
+const typedEventSchema = require('./rules/typed-event-schema');
+const requireEventPrivacy = require('./rules/require-event-privacy');
+const { snapshotLintArtifact } = require('./event-artifact');
+const { snapshotEventOptions } = require('./event-options');
 
 /**
  * Build-time half of the privacy contract.
@@ -37,6 +41,8 @@ const plugin = {
     'no-computed-metadata-key': noComputedMetadataKey,
     'no-derived-correlation': noDerivedCorrelation,
     'literal-subsystem': literalSubsystem,
+    'typed-event-schema': typedEventSchema,
+    'require-event-privacy': requireEventPrivacy,
   },
 };
 
@@ -171,5 +177,20 @@ plugin.configs = {
   strictTypeScript: typescriptVariant(STRICT_RULES),
 };
 
+/** Build the two schema-specific rule entries from one defineEvents artifact. */
+function eventRules(lintArtifact, options = {}) {
+  const snapshot = snapshotEventOptions(options);
+  const ruleOptions = { lintArtifact: snapshotLintArtifact(lintArtifact) };
+  for (const key of Object.keys(snapshot)) {
+    ruleOptions[key] = snapshot[key];
+  }
+  Object.freeze(ruleOptions);
+  return Object.freeze({
+    'nitro-logger/typed-event-schema': Object.freeze(['error', ruleOptions]),
+    'nitro-logger/require-event-privacy': Object.freeze(['error', ruleOptions]),
+  });
+}
+
 module.exports = plugin;
 module.exports.VERIFIED_PARSER_RANGE = VERIFIED_PARSER_RANGE;
+module.exports.eventRules = eventRules;

@@ -1,0 +1,15 @@
+diff --git a/eslint-plugin/receiver-binding-replacement-analysis.js b/eslint-plugin/receiver-binding-replacement-analysis.js
+--- a/eslint-plugin/receiver-binding-replacement-analysis.js
++++ b/eslint-plugin/receiver-binding-replacement-analysis.js
+@@ -49,7 +49,10 @@
+         parent?.type === 'AssignmentExpression' && parent.left === identifier
+           ? parent
+           : identifier;
+-      const object = resolveReceiverObject(context, source);
++      const object =
++        source?.type === 'CallExpression'
++          ? null
++          : resolveReceiverObject(context, source);
+       if (!object) {
+         index.wildcard.push(receiverWrite(gate, [OPAQUE_GETTER_VALUE]));
+         continue;

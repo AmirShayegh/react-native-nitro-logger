@@ -1,0 +1,206 @@
+{
+  "contractVersion": 1,
+  "evaluationOrder": [
+    "validate-credential-and-scope",
+    "consult-current-epoch-ledger",
+    "resolve-immutable-ledger-outcome",
+    "require-live-binding-and-manifest",
+    "commit-inbox-ledger-audit"
+  ],
+  "resolutionRows": [
+    {
+      "id": "credential-or-scope-invalid",
+      "when": {
+        "credentialOrScope": "invalid"
+      },
+      "expected": {
+        "action": "refuse",
+        "publicStatus": 403,
+        "inboxInsert": false,
+        "projection": false
+      }
+    },
+    {
+      "id": "ledger-same-id-same-hash",
+      "when": {
+        "credentialOrScope": "valid",
+        "ledger": "same-id-same-hash"
+      },
+      "expected": {
+        "action": "replay-recorded-outcome",
+        "inboxInsert": false,
+        "projection": false,
+        "bindingRequired": false,
+        "manifestRequired": false
+      }
+    },
+    {
+      "id": "ledger-same-id-different-hash",
+      "when": {
+        "credentialOrScope": "valid",
+        "ledger": "same-id-different-hash"
+      },
+      "expected": {
+        "action": "refuse",
+        "publicStatus": 403,
+        "inboxInsert": false,
+        "projection": false
+      }
+    },
+    {
+      "id": "no-ledger-binding-inactive",
+      "when": {
+        "credentialOrScope": "valid",
+        "ledger": "missing",
+        "binding": "inactive"
+      },
+      "expected": {
+        "action": "refuse",
+        "publicStatus": 403,
+        "inboxInsert": false,
+        "projection": false
+      }
+    },
+    {
+      "id": "no-ledger-manifest-missing",
+      "when": {
+        "credentialOrScope": "valid",
+        "ledger": "missing",
+        "binding": "live",
+        "manifest": "missing-or-mismatch"
+      },
+      "expected": {
+        "action": "refuse",
+        "publicStatus": 403,
+        "inboxInsert": false,
+        "projection": false
+      }
+    },
+    {
+      "id": "no-ledger-live-manifest-match",
+      "when": {
+        "credentialOrScope": "valid",
+        "ledger": "missing",
+        "binding": "live",
+        "manifest": "exact-match"
+      },
+      "expected": {
+        "action": "commit-acceptance",
+        "publicStatus": 201,
+        "inboxInsert": true,
+        "ledgerInsert": true,
+        "auditIntent": true,
+        "projection": "once"
+      }
+    },
+    {
+      "id": "post-rebuild-deleted-binding",
+      "when": {
+        "credentialOrScope": "valid",
+        "acceptanceEpoch": "rebuilt-empty",
+        "binding": "deleted",
+        "manifest": "deleted"
+      },
+      "expected": {
+        "action": "refuse",
+        "publicStatus": 403,
+        "inboxInsert": false,
+        "projection": false
+      }
+    }
+  ],
+  "transactionRows": [
+    {
+      "id": "manifest-registration",
+      "state": [
+        "exact-manifest-record",
+        "success-audit-intent"
+      ],
+      "commit": "atomic-before-or-with-acceptance",
+      "responseAfter": "durable-commit"
+    },
+    {
+      "id": "acceptance-inbox-ledger-audit",
+      "state": [
+        "inbox-bytes",
+        "same-epoch-ledger-outcome",
+        "success-audit-intent"
+      ],
+      "commit": "single-acceptance-boundary",
+      "responseAfter": "durable-commit"
+    },
+    {
+      "id": "acknowledgement-emission",
+      "state": [],
+      "commit": "none",
+      "requires": [
+        "durable-inbox",
+        "durable-ledger-outcome",
+        "durable-audit-intent"
+      ],
+      "lostResponse": "replay-ledger-outcome"
+    },
+    {
+      "id": "audit-publication",
+      "state": [
+        "published-audit-event"
+      ],
+      "commit": "idempotent-outbox-delivery",
+      "requires": [
+        "durable-audit-intent"
+      ],
+      "outage": "queue-and-retry"
+    }
+  ],
+  "linearizedMutations": [
+    "capability-mint",
+    "capability-exchange",
+    "manifest-registration",
+    "upload-acceptance"
+  ],
+  "lifecycleTransitions": [
+    "subject-deletion",
+    "consent-revocation",
+    "tenant-or-binding-disable",
+    "generation-change",
+    "delivery-deadline"
+  ],
+  "linearization": {
+    "domain": "binding-generation-lifecycle",
+    "mutationWins": "commit-state-and-audit-intent-then-transition-invalidates-authority",
+    "transitionWins": "commit-no-new-authority-or-success-state",
+    "ledgerReplayException": "pre-existing-same-epoch-outcome-only"
+  },
+  "crashRecovery": [
+    {
+      "id": "manifest-committed-before-delivery",
+      "retry": "accept-using-existing-manifest"
+    },
+    {
+      "id": "inbox-ledger-audit-committed-ack-lost",
+      "retry": "replay-recorded-outcome"
+    },
+    {
+      "id": "before-acceptance-commit",
+      "retry": "no-partial-state"
+    },
+    {
+      "id": "audit-intent-committed-publication-pending",
+      "retry": "publish-idempotently"
+    }
+  ],
+  "audit": {
+    "success": {
+      "admission": "same-transaction-outbox",
+      "idempotentlyKeyed": true,
+      "responseRequiresDurableIntent": true,
+      "publication": "retry-until-durable"
+    },
+    "refusal": {
+      "authorization": "fail-closed",
+      "admission": "bounded-durable-wal",
+      "overflow": "non-droppable-aggregate-loss-signal",
+      "publicResponseUnchanged": true
+    }
+  }
+}

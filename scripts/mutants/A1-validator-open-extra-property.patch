@@ -1,0 +1,12 @@
+diff --git a/src/analytics/validator.ts b/src/analytics/validator.ts
+--- a/src/analytics/validator.ts
++++ b/src/analytics/validator.ts
+@@ -60,7 +60,7 @@ function validateProperties<Definition extends EventDefinition>(
+       if (!descriptor || !('value' in descriptor)) {
+         return { ok: false, code: 'INVALID_CONTAINER' };
+       }
+-      if (typeof key !== 'string' || !hasOwn(eventSchema, key)) {
++      if (typeof key !== 'string') {
+         return { ok: false, code: 'EXTRA_PROPERTY' };
+       }
+       values.set(key, descriptor.value);

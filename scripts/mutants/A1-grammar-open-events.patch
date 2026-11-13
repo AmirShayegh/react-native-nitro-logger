@@ -1,0 +1,12 @@
+diff --git a/src/analytics/grammar-mapper.ts b/src/analytics/grammar-mapper.ts
+--- a/src/analytics/grammar-mapper.ts
++++ b/src/analytics/grammar-mapper.ts
+@@ -206,7 +206,7 @@ export function mapGrammarV1<Definition extends EventDefinition>(
+   const grammar = protectedRecord<Writable<AnalyticsGrammarV1>>();
+   grammar.artifact = 'react-native-nitro-logger/analytics-grammar';
+   grammar.formatVersion = 1;
+-  grammar.additionalEvents = false;
++  grammar.additionalEvents = true;
+   grammar.events = protectedArray(mappedEvents);
+   return freezeRecord(grammar);
+ }

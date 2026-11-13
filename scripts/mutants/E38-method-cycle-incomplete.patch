@@ -1,0 +1,11 @@
+diff --git a/eslint-plugin/event-method.js b/eslint-plugin/event-method.js
+--- a/eslint-plugin/event-method.js
++++ b/eslint-plugin/event-method.js
+@@ -1114,6 +1114,7 @@ function identifierMethodReference(context, current, args, callNode, seen) {
+   if (!root || seen.has(root)) return null;
+   const cacheable = seen.size === 0;
+   const summary = methodBindingSummary(context, root);
++  if (summary.incomplete) return null;
+   const key = intervalKey(summary.changePoints, callNode);
+   const results = contextKeyedMap(identifierMethodResultCache, context, root);
+   if (cacheable && results.has(key)) {

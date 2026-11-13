@@ -1,0 +1,36 @@
+{
+  "a1ExitEvidence": {
+    "canonicalTests": {
+      "skipped": 0,
+      "suitesPassed": 34,
+      "testsPassed": 2177
+    },
+    "codeReviews": [
+      "lens-mscys7mh",
+      "lens-mscyv1vv"
+    ],
+    "mutationGate": {
+      "acceptedSurvivors": 1,
+      "killed": 37,
+      "manifestRows": 37,
+      "patches": 37
+    },
+    "typecheck": "passed"
+  },
+  "blockedBy": [
+    "T-054",
+    "T-055",
+    "T-056",
+    "T-057"
+  ],
+  "completedDate": "2026-08-03",
+  "createdDate": "2026-08-02",
+  "description": "Gate A1 exit per ANALYTICS-001 section 11: defineEvents() emits all four artifacts from one source; golden vectors prove type/validator/grammar agreement; lint rules land with fixture discipline.",
+  "displayId": "T-058",
+  "id": "T-058",
+  "order": 70,
+  "phase": "analytics",
+  "status": "complete",
+  "title": "A1-EXIT milestone - schema toolchain locked",
+  "type": "chore"
+}

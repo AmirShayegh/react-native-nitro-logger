@@ -4,6 +4,8 @@ import type {
   LogValue,
   RedactedMetadata,
 } from './types';
+import { isLogPrimitive, matchesPrimitiveConstraint } from './constraints';
+import type { PrimitiveConstraint } from './constraints';
 
 /**
  * The privacy layer, deliberately a single module.
@@ -66,13 +68,13 @@ declare const privateBrand: unique symbol;
 
 /** A value explicitly marked safe to render. Opaque: the payload lives in a
  * module-private WeakMap, never on the object. */
-export interface PublicValue {
-  readonly [publicBrand]: true;
+export interface PublicValue<Payload extends LogPrimitive = LogPrimitive> {
+  readonly [publicBrand]: Payload;
 }
 
 /** A value explicitly marked sensitive. Renders as `<private>` outside dev. */
-export interface PrivateValue {
-  readonly [privateBrand]: true;
+export interface PrivateValue<Payload extends LogPrimitive = LogPrimitive> {
+  readonly [privateBrand]: Payload;
 }
 
 // Membership in these maps is the ONLY proof that an object is a marker.
@@ -89,15 +91,6 @@ const invalidMarkers = new WeakSet<object>();
  * functions, symbols, null/undefined, NaN and the infinities are all
  * rejected — an object payload is the classic way PHI slips into a log.
  */
-function isLogPrimitive(value: unknown): value is LogPrimitive {
-  const kind = typeof value;
-  return (
-    kind === 'string' ||
-    kind === 'boolean' ||
-    (kind === 'number' && Number.isFinite(value))
-  );
-}
-
 function createMarker(): object {
   const marker = {};
   const hide = (key: PropertyKey, value: unknown): void => {
@@ -126,26 +119,30 @@ function createMarker(): object {
  * does not throw — logging never crashes the caller — it produces a marker
  * that is dropped at emit and counted in the fixed diagnostic.
  */
-export function pub(value: LogPrimitive): PublicValue {
+export function pub<const Payload extends LogPrimitive>(
+  value: Payload
+): PublicValue<Payload> {
   const marker = createMarker();
   if (isLogPrimitive(value)) {
     publicPayloads.set(marker, value);
   } else {
     invalidMarkers.add(marker);
   }
-  return marker as PublicValue;
+  return marker as PublicValue<Payload>;
 }
 
 /** Mark a value sensitive: renders as `<private>` outside dev builds, even
  * under a `'public'` privacy default. Same fail-closed validation as `pub`. */
-export function priv(value: LogPrimitive): PrivateValue {
+export function priv<const Payload extends LogPrimitive>(
+  value: Payload
+): PrivateValue<Payload> {
   const marker = createMarker();
   if (isLogPrimitive(value)) {
     privatePayloads.set(marker, value);
   } else {
     invalidMarkers.add(marker);
   }
-  return marker as PrivateValue;
+  return marker as PrivateValue<Payload>;
 }
 
 /**
@@ -201,6 +198,32 @@ function inspectMarker(value: unknown): MarkerInspection | null {
   }
   if (invalidMarkers.has(candidate)) return { kind: 'invalid' };
   return null;
+}
+
+export type ConstraintMarkerResult = 'not-marker' | 'valid' | 'invalid';
+
+/**
+ * Validate a privacy marker without releasing its payload.
+ *
+ * Public payloads may be matched because they are explicitly renderable.
+ * Every authentic private marker returns the same result for every
+ * constraint, so this seam cannot become an equality or range oracle.
+ * Nothing here accepts a callback or returns the marker kind or payload.
+ *
+ * @internal Used by the analytics validator; intentionally absent from the
+ * package barrels.
+ */
+export function validateMarkerForConstraint(
+  value: unknown,
+  constraint: PrimitiveConstraint
+): ConstraintMarkerResult {
+  const inspection = inspectMarker(value);
+  if (inspection === null) return 'not-marker';
+  if (inspection.kind === 'invalid') return 'invalid';
+  if (inspection.kind === 'private') return 'valid';
+  return matchesPrimitiveConstraint(inspection.payload, constraint)
+    ? 'valid'
+    : 'invalid';
 }
 
 // The reveal branch exists only in dev builds. Metro substitutes a literal

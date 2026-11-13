@@ -1,0 +1,13 @@
+diff --git a/eslint-plugin/receiver-object-analysis.js b/eslint-plugin/receiver-object-analysis.js
+--- a/eslint-plugin/receiver-object-analysis.js
++++ b/eslint-plugin/receiver-object-analysis.js
+@@ -101,9 +101,6 @@
+     if (value.property) {
+       return syntheticReceiverProperty(name, value.property.value);
+     }
+-    if (getter.property) {
+-      return syntheticReceiverProperty(name, getter.property.value, 'get');
+-    }
+     return syntheticReceiverProperty(name, {
+       type: 'Identifier',
+       name: 'undefined',

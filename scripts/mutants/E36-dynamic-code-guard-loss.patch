@@ -1,0 +1,11 @@
+diff --git a/eslint-plugin/builtin-poison-analysis.js b/eslint-plugin/builtin-poison-analysis.js
+--- a/eslint-plugin/builtin-poison-analysis.js
++++ b/eslint-plugin/builtin-poison-analysis.js
+@@ -42,7 +42,6 @@ function scanBuiltinPoisoning(sourceCode, handlers) {
+           node.type === 'CallExpression'
+             ? handlers.analyzeReflectiveCall(node)
+             : null;
+-        handlers.poisonDynamicCode(node, reflective);
+         // A namespace handed to a function is a namespace that function can
+         // rewrite, whatever the function is.
+         for (const argument of node.arguments) {

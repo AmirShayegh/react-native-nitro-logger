@@ -1,0 +1,16 @@
+{
+  "blockedBy": [
+    "T-054",
+    "T-055"
+  ],
+  "completedDate": "2026-08-03",
+  "createdDate": "2026-08-02",
+  "description": "Golden vectors prove the four emitted artifacts agree: a vector accepted by the types must pass the runtime validator and the grammar, and every rejection class appears as a vector each layer rejects. The vacuous-gate rule applies: every vector class carries a positive control.",
+  "displayId": "T-057",
+  "id": "T-057",
+  "order": 60,
+  "phase": "analytics",
+  "status": "complete",
+  "title": "A1: golden vectors - type/validator/grammar agreement",
+  "type": "task"
+}

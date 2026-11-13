@@ -1,0 +1,15 @@
+{
+  "blockedBy": [
+    "T-054"
+  ],
+  "completedDate": "2026-08-02",
+  "createdDate": "2026-08-02",
+  "description": "Event-call lint rules land in the existing eslint plugin under the existing discipline: RuleTester fixtures, the 362-fixture differential harness where shared code is touched, plugin gates respected (ES #private, trusted-method lists updated with tests).",
+  "displayId": "T-056",
+  "id": "T-056",
+  "order": 50,
+  "phase": "analytics",
+  "status": "complete",
+  "title": "A1: lint rules for typed events in the existing plugin",
+  "type": "feature"
+}

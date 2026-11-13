@@ -1,30 +1,17 @@
 #!/usr/bin/env bash
 #
-# Every file coverage measures must belong to a threshold group.
+# Every file coverage measures must belong to an explicit threshold group.
 #
-# `jest.config.js` sets a `global` threshold and four narrower ones. That looks
-# like five independent floors and is not: jest removes a file from `global`'s
-# set as soon as any narrower key matches it, and when that empties the set
-# completely it falls back to ALL covered files
-# (`@jest/reporters`: `globalFiles.length > 0 ? globalFiles : coveredFiles`).
-# Every `src/` file matches a narrower key today, so the set IS empty and
-# `global` means "the whole library" — which is the only reading under which it
-# is worth having.
+# `jest.config.js` gives `src/` and `eslint-plugin/` separate aggregate floors.
+# That separation is deliberate: combining them under `global` would let one
+# product pay for coverage lost in the other and would weaken the runtime floor
+# merely because plugin coverage was added.
 #
-# Add `src/new-area/module.ts` and that stops being true, silently. The set is
-# no longer empty, the fallback no longer fires, and `global` starts meaning
-# "the new area only". A well-covered new directory would then hold the global
-# threshold up on its own while the rest of the library rotted underneath it,
-# and nothing would fail. The thresholds would still be there, still green, and
-# no longer measuring what the comment beside them says.
-#
-# So: enumerate what jest actually instrumented and require every file to match
-# a narrower key. A new nested directory then has to declare its own aggregate
-# before the suite can go green, which is the decision someone should be making
-# on purpose.
-#
-# What this proves: the `global` group is empty, so its fallback fires, so its
-# threshold is computed over the whole library.
+# What this proves: both aggregate roots exist, every measured file belongs to
+# a declared threshold group, and every JavaScript module published under the
+# plugin directory appears in Jest's own coverage summary. The last condition
+# makes a stale `collectCoverageFrom` glob fail instead of silently shrinking
+# the plugin denominator.
 #
 # What this does NOT prove: that the thresholds are set anywhere useful, or
 # that a covered line is a tested line. The first is a judgement recorded in
@@ -64,9 +51,18 @@ const summary = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const config = require(path.resolve('jest.config.js'));
 
 const files = Object.keys(summary).filter((key) => key !== 'total');
-const groups = Object.keys(config.coverageThreshold ?? {}).filter(
+const thresholds = config.coverageThreshold ?? {};
+const groups = Object.keys(thresholds).filter(
   (key) => key !== 'global'
 );
+const requiredAggregates = ['./src/', './eslint-plugin/'];
+const measuredFiles = new Set(files.map((file) => path.resolve(file)));
+const expectedPluginFiles = glob
+  .sync(path.resolve('eslint-plugin/**/*.js'), {
+    nodir: true,
+    windowsPathsNoEscape: true,
+  })
+  .map((file) => path.resolve(file));
 
 const problems = [];
 
@@ -77,14 +73,29 @@ if (files.length === 0) {
   problems.push(`${process.argv[2]} lists no files — nothing was measured`);
 }
 if (groups.length === 0) {
-  problems.push('jest.config.js declares no threshold group besides `global`');
+  problems.push('jest.config.js declares no explicit threshold groups');
 }
-if (!('global' in (config.coverageThreshold ?? {}))) {
+for (const aggregate of requiredAggregates) {
+  if (!(aggregate in thresholds)) {
+    problems.push(`jest.config.js has no ${aggregate} aggregate threshold`);
+  }
+}
+if (expectedPluginFiles.length === 0) {
   problems.push(
-    'jest.config.js declares no `global` threshold — this check exists to ' +
-      'keep that one honest, so its absence means the check is measuring ' +
-      'nothing'
+    'eslint-plugin/**/*.js matched no files — plugin coverage is vacuous'
   );
+}
+const unmeasuredPluginFiles = expectedPluginFiles.filter(
+  (file) => !measuredFiles.has(file)
+);
+if (unmeasuredPluginFiles.length > 0) {
+  problems.push(
+    `${unmeasuredPluginFiles.length} ESLint plugin module(s) are absent from ` +
+      'Jest coverage:'
+  );
+  for (const file of unmeasuredPluginFiles) {
+    problems.push(`  - ${path.relative(process.cwd(), file)}`);
+  }
 }
 
 // Mirrors `@jest/reporters`: a key that resolves to an existing path matches by
@@ -98,7 +109,9 @@ for (const group of groups) {
   matchesFor.set(group, {
     absolute,
     globbed: new Set(
-      glob.sync(absolute, { windowsPathsNoEscape: true }).map((p) => path.resolve(p))
+      glob
+        .sync(absolute, { windowsPathsNoEscape: true })
+        .map((p) => path.resolve(p))
     ),
   });
 }
@@ -115,9 +128,7 @@ for (const file of files) {
 
 if (unmatched.length > 0) {
   problems.push(
-    `${unmatched.length} covered file(s) match no threshold group, so jest ` +
-      'will compute `global` from them alone instead of from the whole ' +
-      'library:'
+    `${unmatched.length} covered file(s) match no explicit threshold group:`
   );
   for (const file of unmatched) problems.push(`  - ${file}`);
   problems.push(
@@ -133,6 +144,11 @@ if (problems.length > 0) {
 
 console.log(
   `  ok   all ${files.length} covered files belong to one of ${groups.length} ` +
-    'threshold groups, so `global` covers the whole library'
+    'explicit threshold groups'
+);
+console.log('  ok   src/ and eslint-plugin/ have independent aggregate floors');
+console.log(
+  `  ok   all ${expectedPluginFiles.length} ESLint plugin modules are present ` +
+    'in the coverage report'
 );
 NODE

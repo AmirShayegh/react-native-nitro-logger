@@ -164,6 +164,46 @@ EOF
   sed "s|nitroLogger.configs.strictTypeScript|nitroLogger.configs.$config|" \
     "$WORK/eslint.config.mjs" > eslint.config.mjs
 
+  # Add the documented schema-bound rules to the documented base preset. The
+  # schema is authored once with the packed /analytics entry and the plugin
+  # receives only its immutable lint artifact, exactly as a consumer does.
+  CONFIG_NAME="$config" python3 - <<'PY'
+import os, pathlib, sys
+
+path = pathlib.Path('eslint.config.mjs')
+source = path.read_text()
+name = os.environ['CONFIG_NAME']
+needle = f'export default [nitroLogger.configs.{name}];'
+if needle not in source:
+    sys.exit(f'documented config no longer contains expected selector: {needle}')
+
+source = (
+    "import { defineEvents, int, oneOf } from "
+    "'react-native-nitro-logger/analytics';\n" + source
+)
+source = source.replace(needle, f"""
+const events = defineEvents({{
+  appointment_booked: {{
+    clinic_type: oneOf('gp', 'specialist'),
+    lead_time_days: int({{ min: 0, max: 365 }}),
+    via: oneOf('search', 'referral'),
+  }},
+}});
+const base = nitroLogger.configs.{name};
+
+export default [{{
+  ...base,
+  rules: {{ ...base.rules, ...nitroLogger.eventRules(events.lint) }},
+}}];""")
+path.write_text(source)
+PY
+  if [ $? -ne 0 ]; then
+    note FAIL "could not compose event rules for '$1'"
+    failures=$((failures + 1))
+    cd "$REPO" || return 1
+    return 1
+  fi
+
   # One violating source per rule, in each language.
   #
   # A single source exercising `no-dynamic-message` was enough to catch the
@@ -198,6 +238,14 @@ import { Log } from 'react-native-nitro-logger';
 const request = { path: '/patients/42' };
 Log.info('patient admitted', {}, `net-${request.path}`);
 EOF
+    cat > "event-schema.$ext" <<'EOF'
+/* eslint-disable nitro-logger/require-event-privacy */
+analytics.track('appointment_booked', { clinic_type: 'walk-in', lead_time_days: 3, via: 'search' });
+EOF
+    cat > "event-privacy.$ext" <<'EOF'
+const patient = { waitDays: 3 };
+analytics.track('appointment_booked', { clinic_type: 'gp', lead_time_days: patient.waitDays, via: 'search' });
+EOF
   done
   # Controls: the correct form must produce nothing at all.
   for ext in ts tsx js; do
@@ -205,6 +253,9 @@ EOF
 import { Log } from 'react-native-nitro-logger';
 const patient = { name: 'Jane Doe' };
 Log.info('patient admitted', { patientName: patient.name }, 'network');
+EOF
+    cat > "event-clean.$ext" <<'EOF'
+analytics.track('appointment_booked', { clinic_type: 'gp', lead_time_days: 3, via: 'search' });
 EOF
   done
 
@@ -346,25 +397,29 @@ expect_findings() {
   fi
 }
 
-# The four leaks, in every language, plus the clean controls.
-ALL_FILES="msg.ts msg.tsx msg.js meta.ts meta.tsx meta.js corr.ts corr.tsx corr.js sub.ts sub.tsx sub.js clean.ts clean.tsx clean.js"
-JS_FILES="msg.js meta.js corr.js sub.js clean.js"
+# The four logger leaks and two event violations, in every language, plus the
+# clean controls.
+ALL_FILES="msg.ts msg.tsx msg.js meta.ts meta.tsx meta.js corr.ts corr.tsx corr.js sub.ts sub.tsx sub.js event-schema.ts event-schema.tsx event-schema.js event-privacy.ts event-privacy.tsx event-privacy.js clean.ts clean.tsx clean.js event-clean.ts event-clean.tsx event-clean.js"
+JS_FILES="msg.js meta.js corr.js sub.js event-schema.js event-privacy.js clean.js event-clean.js"
 
 # file=rule, for the strict presets, which carry all four.
 STRICT_EXPECTED="\
 msg.ts=no-dynamic-message msg.tsx=no-dynamic-message msg.js=no-dynamic-message \
 meta.ts=no-computed-metadata-key meta.tsx=no-computed-metadata-key meta.js=no-computed-metadata-key \
 corr.ts=no-derived-correlation corr.tsx=no-derived-correlation corr.js=no-derived-correlation \
-sub.ts=literal-subsystem sub.tsx=literal-subsystem sub.js=literal-subsystem"
+sub.ts=literal-subsystem sub.tsx=literal-subsystem sub.js=literal-subsystem \
+event-schema.ts=typed-event-schema event-schema.tsx=typed-event-schema event-schema.js=typed-event-schema \
+event-privacy.ts=require-event-privacy event-privacy.tsx=require-event-privacy event-privacy.js=require-event-privacy"
 STRICT_EXPECTED_JS="msg.js=no-dynamic-message meta.js=no-computed-metadata-key \
-corr.js=no-derived-correlation sub.js=literal-subsystem"
+corr.js=no-derived-correlation sub.js=literal-subsystem \
+event-schema.js=typed-event-schema event-privacy.js=require-event-privacy"
 
 echo "==> case 1: strictTypeScript, locked parser $PARSER_LOCKED + TypeScript $TS_LOCKED"
 if fixture ts-locked strictTypeScript "$PARSER_LOCKED" "$TS_LOCKED"; then
   if parser_present ts-locked; then
     note ok "parser resolves, as this case requires"
     expect_findings ts-locked "$STRICT_EXPECTED" \
-      "all four rules, all three languages" "$ALL_FILES"
+      "all six rules, all three languages" "$ALL_FILES"
   else
     note FAIL "parser did not install; this case cannot prove anything"
     failures=$((failures + 1))
@@ -378,7 +433,7 @@ echo "==> case 2: strictTypeScript, lowest verified parser $PARSER_LOWEST + Type
 if fixture ts-lowest strictTypeScript "$PARSER_LOWEST" "$TS_FOR_LOWEST"; then
   if parser_present ts-lowest; then
     expect_findings ts-lowest "$STRICT_EXPECTED" \
-      "all four rules, all three languages" "$ALL_FILES"
+      "all six rules, all three languages" "$ALL_FILES"
   else
     note FAIL "parser did not install; this case cannot prove anything"
     failures=$((failures + 1))
@@ -432,7 +487,7 @@ if fixture ts-noparser strictTypeScript; then
   fi
 fi
 
-echo "==> case 5: recommendedTypeScript enables exactly the two OSS rules"
+echo "==> case 5: recommendedTypeScript enables the two OSS rules plus schema-bound event rules"
 # The presets are the package's public promise about which channels are
 # policed, and until now nothing checked that promise from outside. `strict` is
 # documented as `recommended` plus correlation and subsystem; if a rule moved
@@ -447,8 +502,10 @@ if fixture ts-recommended recommendedTypeScript "$PARSER_LOCKED" "$TS_LOCKED"; t
   if parser_present ts-recommended; then
     expect_findings ts-recommended \
       "msg.ts=no-dynamic-message msg.tsx=no-dynamic-message msg.js=no-dynamic-message \
-       meta.ts=no-computed-metadata-key meta.tsx=no-computed-metadata-key meta.js=no-computed-metadata-key" \
-      "message and metadata keys only; correlation and subsystem silent" "$ALL_FILES"
+       meta.ts=no-computed-metadata-key meta.tsx=no-computed-metadata-key meta.js=no-computed-metadata-key \
+       event-schema.ts=typed-event-schema event-schema.tsx=typed-event-schema event-schema.js=typed-event-schema \
+       event-privacy.ts=require-event-privacy event-privacy.tsx=require-event-privacy event-privacy.js=require-event-privacy" \
+      "OSS logger rules plus both schema-bound event rules" "$ALL_FILES"
   else
     note FAIL "parser did not install; this case cannot prove anything"
     failures=$((failures + 1))

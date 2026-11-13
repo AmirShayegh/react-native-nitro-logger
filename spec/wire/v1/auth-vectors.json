@@ -1,0 +1,1221 @@
+{
+  "contractVersion": 1,
+  "scopeFixture": {
+    "tenantId": "tenant-a",
+    "analyticsStream": "logs",
+    "installId": "install-a",
+    "subjectScope": "subject-hash-a",
+    "identityGeneration": "7",
+    "consentGeneration": "11"
+  },
+  "vectorSets": {
+    "scope": [
+      {
+        "id": "scope-exact-match",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "id": "scope-cross-tenant",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-b",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "scope-cross-install",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-b",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "scope-cross-subject",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-b",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "scope-stale-identity-generation",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "6",
+            "consentGeneration": "11"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "scope-stale-consent-generation",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "10"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "scope-extra-field",
+        "input": {
+          "presented": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11",
+            "region": "west"
+          },
+          "derived": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      }
+    ],
+    "mint": [
+      {
+        "id": "mint-live-session",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "live",
+          "mintId": "00000000000000000000000000000001"
+        },
+        "expected": "mint-root"
+      },
+      {
+        "id": "mint-tenant-backend",
+        "input": {
+          "authority": "tenant-backend",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "live",
+          "mintId": "00000000000000000000000000000002"
+        },
+        "expected": "mint-root"
+      },
+      {
+        "id": "mint-unauthorized-caller",
+        "input": {
+          "authority": "delivery-capability",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "live"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "mint-server-derived-scope-mismatch",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-b",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "live"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "mint-consent-revoked",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "consent-revoked"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "mint-first-wins",
+        "input": {
+          "authority": "live-session",
+          "binding": "live",
+          "existingRoot": false,
+          "mintId": "00000000000000000000000000000003"
+        },
+        "expected": "mint-and-record"
+      },
+      {
+        "id": "mint-exact-retry",
+        "input": {
+          "authority": "live-session",
+          "binding": "live",
+          "existingMintId": "00000000000000000000000000000003",
+          "mintId": "00000000000000000000000000000003"
+        },
+        "expected": "replay-exact-response"
+      },
+      {
+        "id": "mint-different-id",
+        "input": {
+          "authority": "live-session",
+          "binding": "live",
+          "existingMintId": "00000000000000000000000000000003",
+          "mintId": "00000000000000000000000000000004"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "mint-ad-hoc-rotation",
+        "input": {
+          "authority": "live-session",
+          "operation": "root-rotation",
+          "binding": "live"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "mint-new-generation",
+        "input": {
+          "authority": "live-session",
+          "oldGeneration": "7",
+          "newGeneration": "8",
+          "oldRoot": "active"
+        },
+        "expected": "invalidate-old-then-mint"
+      },
+      {
+        "id": "mint-extra-scope-field",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11",
+            "region": "west"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "binding": "live"
+        },
+        "expected": "refuse"
+      }
+    ],
+    "exchange": [
+      {
+        "id": "exchange-live-predecessor",
+        "input": {
+          "credential": "live",
+          "exchangeId": "10000000000000000000000000000001",
+          "beforeDeadline": true
+        },
+        "expected": "consume-mint-record"
+      },
+      {
+        "id": "exchange-expired-before-deadline",
+        "input": {
+          "credential": "expired",
+          "exchangeId": "10000000000000000000000000000002",
+          "beforeDeadline": true
+        },
+        "expected": "consume-mint-record"
+      },
+      {
+        "id": "exchange-at-deadline",
+        "input": {
+          "credential": "live",
+          "atDeadline": true
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-after-deadline",
+        "input": {
+          "credential": "live",
+          "afterDeadline": true
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-exact-retry",
+        "input": {
+          "credential": "consumed",
+          "recordedExchangeId": "10000000000000000000000000000003",
+          "exchangeId": "10000000000000000000000000000003"
+        },
+        "expected": "replay-exact-response"
+      },
+      {
+        "id": "exchange-different-id",
+        "input": {
+          "credential": "consumed",
+          "recordedExchangeId": "10000000000000000000000000000003",
+          "exchangeId": "10000000000000000000000000000004"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-restored-predecessor",
+        "input": {
+          "credential": "restored-consumed",
+          "exchangeId": "10000000000000000000000000000005"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-forged-secret",
+        "input": {
+          "credential": "forged"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-disabled-binding",
+        "input": {
+          "credential": "valid",
+          "binding": "disabled"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "exchange-successor-deadline",
+        "input": {
+          "credentialExpiresAt": "2026-08-03T12:00:00Z",
+          "deliveryDeadline": "2026-08-03T11:00:00Z"
+        },
+        "expected": "successor-expires-no-later-than-delivery-deadline"
+      }
+    ],
+    "registration": [
+      {
+        "id": "register-live-exact",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "segmentId": "20000000000000000000000000000001",
+          "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "expected": "create"
+      },
+      {
+        "id": "register-exact-retry",
+        "input": {
+          "authority": "live-session",
+          "record": "same-id-same-hash"
+        },
+        "expected": "idempotent"
+      },
+      {
+        "id": "register-hash-conflict",
+        "input": {
+          "authority": "live-session",
+          "record": "same-id-different-hash"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "register-delivery-capability",
+        "input": {
+          "authority": "delivery-capability"
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "register-cross-namespace",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-b",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "register-stale-generation",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "10"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      },
+      {
+        "id": "manifest-upload-retry",
+        "input": {
+          "manifest": "exact",
+          "uploads": 2
+        },
+        "expected": "exercise-without-consuming"
+      },
+      {
+        "id": "register-extra-scope-field",
+        "input": {
+          "authority": "live-session",
+          "scopeClaim": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11",
+            "region": "west"
+          },
+          "derivedScope": {
+            "tenantId": "tenant-a",
+            "analyticsStream": "logs",
+            "installId": "install-a",
+            "subjectScope": "subject-hash-a",
+            "identityGeneration": "7",
+            "consentGeneration": "11"
+          }
+        },
+        "expected": "refuse"
+      }
+    ],
+    "responses": [
+      {
+        "id": "response-fixed-refusal",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 1,
+            "operation": "capability-mint",
+            "code": "refused"
+          }
+        },
+        "expected": "terminal"
+      },
+      {
+        "id": "response-refusal-proxy-html",
+        "input": {
+          "status": 403,
+          "contentType": "text/html",
+          "requestOperation": "capability-mint",
+          "body": "<html>forbidden</html>"
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-missing-body",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint"
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-wrong-version",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 2,
+            "operation": "capability-mint",
+            "code": "refused"
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-wrong-operation",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 1,
+            "operation": "capability-exchange",
+            "code": "refused"
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-extra-field",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 1,
+            "operation": "capability-mint",
+            "code": "refused",
+            "reason": "credential-missing"
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-version-wrong-type",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": "one",
+            "operation": "capability-mint",
+            "code": "refused"
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-operation-wrong-type",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 1,
+            "operation": 7,
+            "code": "refused"
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-refusal-code-wrong-type",
+        "input": {
+          "status": 403,
+          "contentType": "application/json",
+          "requestOperation": "capability-mint",
+          "body": {
+            "contractVersion": 1,
+            "operation": "capability-mint",
+            "code": false
+          }
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-valid-throttle",
+        "input": {
+          "status": 429,
+          "retryAfter": "10",
+          "remainingDeadlineSeconds": 30
+        },
+        "expected": "retry-after-10"
+      },
+      {
+        "id": "response-throttle-capped",
+        "input": {
+          "status": 429,
+          "retryAfter": "60",
+          "remainingDeadlineSeconds": 5
+        },
+        "expected": "retry-after-5"
+      },
+      {
+        "id": "response-throttle-missing",
+        "input": {
+          "status": 429
+        },
+        "expected": "indeterminate-local-backoff"
+      },
+      {
+        "id": "response-throttle-malformed",
+        "input": {
+          "status": 429,
+          "retryAfter": "1.5"
+        },
+        "expected": "indeterminate-local-backoff"
+      },
+      {
+        "id": "response-proxy-html",
+        "input": {
+          "status": 502,
+          "contentType": "text/html"
+        },
+        "expected": "indeterminate-retry-same-id"
+      },
+      {
+        "id": "response-after-deadline",
+        "input": {
+          "status": 429,
+          "retryAfter": "1",
+          "remainingDeadlineSeconds": 0
+        },
+        "expected": "do-not-attempt"
+      }
+    ],
+    "resourceControls": [
+      {
+        "id": "limit-preauth",
+        "input": {
+          "layer": "source-address",
+          "saturated": true
+        },
+        "expected": "generic-throttle"
+      },
+      {
+        "id": "limit-postauth",
+        "input": {
+          "layer": "binding",
+          "saturated": true
+        },
+        "expected": "generic-throttle"
+      },
+      {
+        "id": "limit-recovers",
+        "input": {
+          "layer": "tenant",
+          "saturated": false,
+          "previouslySaturated": true
+        },
+        "expected": "allow"
+      }
+    ],
+    "audit": [
+      {
+        "id": "audit-success-co-commit",
+        "input": {
+          "operation": "capability-mint",
+          "stateCommit": true,
+          "auditIntentCommit": true
+        },
+        "expected": "acknowledge"
+      },
+      {
+        "id": "audit-success-intent-fails",
+        "input": {
+          "operation": "capability-mint",
+          "stateCommit": false,
+          "auditIntentCommit": false
+        },
+        "expected": "fail-without-success"
+      },
+      {
+        "id": "audit-publication-outage",
+        "input": {
+          "intent": "durable",
+          "publication": "unavailable"
+        },
+        "expected": "queue-and-retry"
+      },
+      {
+        "id": "audit-publication-retry",
+        "input": {
+          "intentId": "audit-1",
+          "deliveryAttempts": 2
+        },
+        "expected": "one-logical-event"
+      },
+      {
+        "id": "audit-refusal-wal",
+        "input": {
+          "operation": "manifest-registration",
+          "result": "refused",
+          "wal": "available"
+        },
+        "expected": "durable-refusal-event"
+      },
+      {
+        "id": "audit-refusal-overflow",
+        "input": {
+          "operation": "capability-exchange",
+          "result": "refused",
+          "wal": "full"
+        },
+        "expected": "non-droppable-aggregate-loss-signal"
+      }
+    ],
+    "lifecycleRaces": [
+      {
+        "id": "capability-mint-vs-subject-deletion-mutation-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "subject-deletion",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-mint-vs-subject-deletion-transition-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "subject-deletion",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-mint-vs-consent-revocation-mutation-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "consent-revocation",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-mint-vs-consent-revocation-transition-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "consent-revocation",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-mint-vs-tenant-or-binding-disable-mutation-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "tenant-or-binding-disable",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-mint-vs-tenant-or-binding-disable-transition-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "tenant-or-binding-disable",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-mint-vs-generation-change-mutation-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "generation-change",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-mint-vs-generation-change-transition-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "generation-change",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-mint-vs-delivery-deadline-mutation-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "delivery-deadline",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-mint-vs-delivery-deadline-transition-wins",
+        "input": {
+          "mutation": "capability-mint",
+          "transition": "delivery-deadline",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-exchange-vs-subject-deletion-mutation-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "subject-deletion",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-exchange-vs-subject-deletion-transition-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "subject-deletion",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-exchange-vs-consent-revocation-mutation-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "consent-revocation",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-exchange-vs-consent-revocation-transition-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "consent-revocation",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-exchange-vs-tenant-or-binding-disable-mutation-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "tenant-or-binding-disable",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-exchange-vs-tenant-or-binding-disable-transition-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "tenant-or-binding-disable",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-exchange-vs-generation-change-mutation-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "generation-change",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-exchange-vs-generation-change-transition-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "generation-change",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "capability-exchange-vs-delivery-deadline-mutation-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "delivery-deadline",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "capability-exchange-vs-delivery-deadline-transition-wins",
+        "input": {
+          "mutation": "capability-exchange",
+          "transition": "delivery-deadline",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "manifest-registration-vs-subject-deletion-mutation-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "subject-deletion",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "manifest-registration-vs-subject-deletion-transition-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "subject-deletion",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "manifest-registration-vs-consent-revocation-mutation-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "consent-revocation",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "manifest-registration-vs-consent-revocation-transition-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "consent-revocation",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "manifest-registration-vs-tenant-or-binding-disable-mutation-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "tenant-or-binding-disable",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "manifest-registration-vs-tenant-or-binding-disable-transition-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "tenant-or-binding-disable",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "manifest-registration-vs-generation-change-mutation-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "generation-change",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "manifest-registration-vs-generation-change-transition-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "generation-change",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "manifest-registration-vs-delivery-deadline-mutation-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "delivery-deadline",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "manifest-registration-vs-delivery-deadline-transition-wins",
+        "input": {
+          "mutation": "manifest-registration",
+          "transition": "delivery-deadline",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "upload-acceptance-vs-subject-deletion-mutation-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "subject-deletion",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "upload-acceptance-vs-subject-deletion-transition-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "subject-deletion",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "upload-acceptance-vs-consent-revocation-mutation-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "consent-revocation",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "upload-acceptance-vs-consent-revocation-transition-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "consent-revocation",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "upload-acceptance-vs-tenant-or-binding-disable-mutation-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "tenant-or-binding-disable",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "upload-acceptance-vs-tenant-or-binding-disable-transition-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "tenant-or-binding-disable",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "upload-acceptance-vs-generation-change-mutation-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "generation-change",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "upload-acceptance-vs-generation-change-transition-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "generation-change",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      },
+      {
+        "id": "upload-acceptance-vs-delivery-deadline-mutation-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "delivery-deadline",
+          "winner": "mutation"
+        },
+        "expected": "commit-then-invalidate"
+      },
+      {
+        "id": "upload-acceptance-vs-delivery-deadline-transition-wins",
+        "input": {
+          "mutation": "upload-acceptance",
+          "transition": "delivery-deadline",
+          "winner": "transition"
+        },
+        "expected": "no-new-authority-or-success-state"
+      }
+    ],
+    "crashRecovery": [
+      {
+        "id": "crash-before-mint-commit",
+        "input": {
+          "crashAt": "before-state-and-audit-commit"
+        },
+        "expected": "no-root-no-success-event"
+      },
+      {
+        "id": "crash-after-mint-commit-before-response",
+        "input": {
+          "crashAt": "after-state-and-audit-commit",
+          "sameMintIdRetry": true
+        },
+        "expected": "replay-exact-root"
+      },
+      {
+        "id": "crash-before-exchange-commit",
+        "input": {
+          "crashAt": "before-predecessor-consume"
+        },
+        "expected": "predecessor-remains-live"
+      },
+      {
+        "id": "crash-after-exchange-commit-before-response",
+        "input": {
+          "crashAt": "after-successor-and-audit-commit",
+          "sameExchangeIdRetry": true
+        },
+        "expected": "replay-exact-successor"
+      },
+      {
+        "id": "crash-after-acceptance-before-ack",
+        "input": {
+          "crashAt": "after-inbox-ledger-audit-commit"
+        },
+        "expected": "replay-recorded-ack"
+      },
+      {
+        "id": "crash-before-audit-publication",
+        "input": {
+          "crashAt": "after-audit-intent-commit"
+        },
+        "expected": "publish-idempotently-after-restart"
+      }
+    ]
+  },
+  "resolutionRowRefs": [
+    "credential-or-scope-invalid",
+    "ledger-same-id-same-hash",
+    "ledger-same-id-different-hash",
+    "no-ledger-binding-inactive",
+    "no-ledger-manifest-missing",
+    "no-ledger-live-manifest-match",
+    "post-rebuild-deleted-binding"
+  ],
+  "notes": {
+    "segmentBytesRemainIn": "golden-vectors.json",
+    "resolutionRowsRemainIn": "resolution-table.json"
+  }
+}

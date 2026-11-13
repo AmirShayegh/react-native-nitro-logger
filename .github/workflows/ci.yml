@@ -51,6 +51,18 @@ jobs:
       - name: Verify every consumer entry point resolves
         run: yarn check-package-exports
 
+      # Decode the exact bytes emitted by TypeScript with Go's standard JSON
+      # implementation. This pins Unicode-scalar and integer-bound behavior at
+      # the language boundary before the gateway registration work lands.
+      - name: Decode the analytics grammar in Go
+        run: yarn check-analytics-grammar-go
+
+      # The machine descriptor is the structural authority for the public
+      # wire document. Hand-edited tables would otherwise look plausible while
+      # disagreeing with the independently consumed bytes.
+      - name: Check the wire contract document
+        run: yarn check-wire-contract
+
       # Every ```ts block in the shipped docs, compiled against this tree.
       # A sample is the first thing a reader copies, so a renamed export should
       # break the documentation at the same moment it breaks the code rather
@@ -82,7 +94,7 @@ jobs:
         run: |
           count=0
           for f in scripts/*.sh; do bash -n "$f"; count=$((count + 1)); done
-          if [ "$count" -lt 22 ]; then
+          if [ "$count" -lt 23 ]; then
             echo "FAIL: parsed only $count scripts; the glob is not matching"
             exit 1
           fi
@@ -120,7 +132,7 @@ jobs:
         run: yarn check-test-reports js
 
       # A green suite says the tests agree with the code, not that they would
-      # notice if it changed. This reintroduces sixteen real defects and
+      # notice if it changed. This reintroduces forty real defects and
       # requires the named test to fail for each. ~30s, and it runs here
       # rather than as its own job because it needs exactly this setup.
       - name: Prove the pinned defects are still caught
@@ -638,4 +650,3 @@ jobs:
       - name: Build example for iOS
         run: |
           yarn turbo run build:ios --cache-dir="${{ env.TURBO_CACHE_DIR }}"
-

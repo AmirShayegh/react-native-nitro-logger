@@ -1,0 +1,67 @@
+diff --git a/eslint-plugin/shared.js b/eslint-plugin/shared.js
+--- a/eslint-plugin/shared.js
++++ b/eslint-plugin/shared.js
+@@ -1086,50 +1086,21 @@ function resolveBindingSetComponents({
+       if (analysisStats) {
+         analysisStats.bindingSetSccVariables += component.length;
+       }
+-      // Keep every SCC member eligible after its first evidence. The old
+-      // one-shot worklist removed it permanently, so evidence reaching a
+-      // neighbour later never flowed back and the result depended on source
+-      // order. Cache entries here are component-private provisional values;
+-      // final publication still occurs only after the worklist converges.
+-      const worklist = [...component];
+-      const queued = new Set(component);
+-      while (worklist.length > 0) {
+-        const variable = worklist.pop();
+-        queued.delete(variable);
+-        if (analysisStats) analysisStats.bindingSetSccSolveVisits += 1;
+-        const resolution = solve(variable);
+-        if (!hasEvidence(resolution) && !resolution.anchored) continue;
+-        const previous = cache.get(variable);
+-        if (
+-          !placeholders.has(previous) &&
+-          sameSetValues(previous, resolution.values)
+-        ) {
+-          continue;
+-        }
+-        cache.set(variable, resolution.values);
+-        for (const dependent of reverse.get(variable)) {
+-          if (componentOf.get(dependent) !== componentIndex) continue;
+-          if (analysisStats) analysisStats.bindingSetSccEdgeVisits += 1;
+-          if (!queued.has(dependent)) {
+-            queued.add(dependent);
+-            worklist.push(dependent);
+-          }
++      const unresolved = new Set(component);
++      let madeProgress = true;
++      while (unresolved.size > 0 && madeProgress) {
++        madeProgress = false;
++        for (const variable of unresolved) {
++          const resolution = solve(variable);
++          if (!hasEvidence(resolution)) continue;
++          publish(variable, resolution);
++          unresolved.delete(variable);
++          madeProgress = true;
+         }
+       }
+-
+-      // One last read sees the converged component. Evidence-free cycles stay
+-      // ephemeral and incomplete; evidence-bearing members publish together.
+-      const converged = component.map((variable) => {
+-        if (analysisStats) analysisStats.bindingSetSccSolveVisits += 1;
+-        return [variable, solve(variable)];
+-      });
+-      for (const [variable, resolution] of converged) {
+-        publish(
+-          variable,
+-          hasEvidence(resolution) || resolution.anchored
+-            ? resolution
+-            : { ...resolution, cache: false, incomplete: true }
+-        );
++      for (const variable of unresolved) {
++        const resolution = solve(variable);
++        publish(variable, { ...resolution, cache: false, incomplete: true });
+       }
+     }
+   }

@@ -1,0 +1,15 @@
+diff --git a/eslint-plugin/event-receiver.js b/eslint-plugin/event-receiver.js
+--- a/eslint-plugin/event-receiver.js
++++ b/eslint-plugin/event-receiver.js
+@@ -1018,7 +1018,10 @@ function uniformAnalyticsAliasSummary(context, root) {
+       dynamicValues: Object.freeze(dynamicEntries.map((entry) => entry.value)),
+       fallback: receiverFallback(context, variable, assigned, false),
+       incomplete: false,
+-      result: RECEIVER_CLASSIFICATION.ANALYTICS,
++      result:
++        variable === root
++          ? RECEIVER_CLASSIFICATION.ANALYTICS
++          : RECEIVER_CLASSIFICATION.NON_ANALYTICS,
+     });
+     if (knownConstruction === undefined) {
+       incrementAnalysisStat(context, 'constructionBindingComputations');

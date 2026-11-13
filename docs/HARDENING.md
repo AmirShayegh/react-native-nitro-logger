@@ -21,6 +21,7 @@ this document records when each probe last ran and what it found.
 | --- | --- |
 | Collect probe (`scripts/probe-collect-ios.sh`, `scripts/probe-collect-android.sh`) | Any release candidate; any change to rotation, compression, collect, or the writer's file layout |
 | OTA pairing probe (recipe below) | Any change to a `.nitro.ts` spec signature — the wire itself |
+| Native console chunking probe (external until T-007 imports it) | Any change to `NativeConsoleWriter`, platform console formatting, or native-console bridge encoding |
 
 ## The collect probe
 
@@ -84,6 +85,50 @@ The recipe, per direction:
   packed tarball. Assert acceptance, durability, and read the written bytes
   back off the device — content compared, not just size.
 
+## The native console chunking probe
+
+T-004's probe lives at `~/.cache/nitro-logger-probes2` until T-007 imports
+the reusable harness. It requires an explicit device target and builds a
+packaged `--dev false` Release app; it never selects a device implicitly and
+never starts Metro:
+
+```sh
+PROBE_UDID=<simulator-udid> ~/.cache/nitro-logger-probes2/run-ios.sh chunking
+PROBE_SERIAL=<adb-serial> ~/.cache/nitro-logger-probes2/run-android.sh chunking
+```
+
+Each platform is built twice from independent clones of the published 0.4.0
+consumer. The positive control first changes only the native limit (900 →
+904 on iOS, 3800 → 3804 on Android) and must fail the unchanged host verifier
+with `CHUNK_COUNT_MISMATCH`. The pristine artifact must then pass exact-fit,
+one-byte-over, emoji, and CJK boundaries; Android also calls the published
+Kotlin writer directly for an embedded-NUL vector because the JavaScript
+string bridge truncates that value before the writer sees it. That fifth case
+proves JNI modified-UTF-8 accounting (`C0 80`) independently of the bridge.
+
+The verdict channel is an authenticated, loopback-only, kernel-assigned port.
+All simulator/adb operations go through a durable per-device command journal,
+and the verifier binds records to the launched PID (plus Android UID/package
+or iOS bundle identity). Each run first seals a read-only consumer-and-harness
+snapshot, builds only from that snapshot, then hashes the final packaged and
+installed artifact: the iOS `main.jsbundle` digest and Android APK digest must
+remain identical through installation. The cached consumer is accepted only
+when its lockfile still names the registry's published 0.4.0 integrity value
+and the complete logger inputs used by this probe match pinned source digests.
+Raw captures and manifests are
+owner-only under `~/.cache/nitro-logger-probes2-evidence`; stamped source,
+bundles, build products, bearer tokens, installed probe apps, and adb reverse
+mappings are removed on both success and failure.
+
+This is characterization evidence for these exact packaged artifacts,
+simulator/emulator targets, OS images, and `os_log`/logcat capture paths. It
+does not establish behavior on physical devices, untested OS versions or
+Android vendors, future package builds, or arbitrary console consumers and
+retention settings. The exclusive device journal, PID/UID checks, and
+pre-launch/post-capture hashes detect accidental or cooperative drift; they
+are not a security boundary against a privileged host or rooted target that
+can swap and restore installed bytes between observations.
+
 ## Traps this discipline has already caught
 
 Recorded so the next probe author does not rediscover them:
@@ -118,3 +163,5 @@ Recorded so the next probe author does not rediscover them:
 | 2026-08-01 | OTA positive control, iOS + Android | packed 0.4.0 over itself | Bytes intact on device, `queuedBytes` exact |
 | 2026-08-01 | Collect probe, iOS + Android | published `react-native-nitro-logger@0.4.0` | PASS both platforms: 60/60 records, chronological, byteCount exact (710 iOS / 771 Android), delete verified gone. One anomaly traced: `getLogFilePaths` reported 4 while `sourceFileCount` was 3 — the final flush's rotation leaves a fresh empty active file, which collect deliberately skips (`bytes == 0` sources are not packed as empty members; documented in the writer). Not a defect. |
 | 2026-08-01 | Collect bundles re-verified under the member walk | the same two captured bundles | Both hold exactly 3 gzip members, equal to the reported `sourceFileCount`, and the member walk agrees byte for byte with system gzip. The original run asserted multi-member framing without counting members; the property held, but the check had not earned it. |
+| 2026-08-05 | Native console chunking, iOS | published `react-native-nitro-logger@0.4.0`; simulator `78067738-4CC9-4A59-AF14-9C15EEF69E9C` | PASS after crash-recoverable lock reclamation and abort-and-join cancellation hardening, concurrently with the Android run on a disjoint target. The 904-byte positive control failed closed with `CHUNK_COUNT_MISMATCH`; pristine 900-byte native code passed exact-fit 900/1 and all 901/2 ASCII, emoji, and CJK cases with byte-exact reconstruction. Packaged and installed bundle digests matched in both phases, and result evidence was published only after app removal, capture closure, gate closure, supervisor join, and lease cleanup succeeded. Evidence: `~/.cache/nitro-logger-probes2-evidence/t004-ios-2026-08-06T04-25-30-769Z-99539`. |
+| 2026-08-05 | Native console chunking, Android | published `react-native-nitro-logger@0.4.0`; `emulator-5554` | PASS after crash-recoverable lock reclamation and abort-and-join cancellation hardening, concurrently with the iOS run on a disjoint target. The 3804-byte positive control failed closed with `CHUNK_COUNT_MISMATCH`; pristine 3800-byte native code passed exact-fit 3800/1 and all five 3801/2 ASCII, emoji, CJK, and modified-UTF-8 NUL cases with byte-exact reconstruction. Packaged and installed APK digests matched in both phases, and result evidence was published only after app/reverse removal, capture closure, gate closure, supervisor join, and lease cleanup succeeded. Evidence: `~/.cache/nitro-logger-probes2-evidence/t004-android-2026-08-06T04-25-27-208Z-99554`. |

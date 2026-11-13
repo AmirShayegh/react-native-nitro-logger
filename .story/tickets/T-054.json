@@ -1,0 +1,13 @@
+{
+  "blockedBy": [],
+  "completedDate": "2026-08-02",
+  "createdDate": "2026-08-02",
+  "description": "One defineEvents() definition emits compile-time TypeScript types and the client runtime validator. No 'any' anywhere; priv() tiers work inside event properties. This is the single source the other A1 artifacts derive from (ANALYTICS-001 A2 decision: event schemas ARE grammars).",
+  "displayId": "T-054",
+  "id": "T-054",
+  "order": 30,
+  "phase": "analytics",
+  "status": "complete",
+  "title": "A1: defineEvents() - TS types + runtime validator from one source",
+  "type": "feature"
+}

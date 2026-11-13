@@ -1672,6 +1672,18 @@ describe('plugin configs', () => {
     const configured = new Set(
       Object.values(plugin.configs).flatMap((c) => Object.keys(c.rules))
     );
+    const eventEntries = plugin.eventRules({
+      formatVersion: 1,
+      grammar: {
+        artifact: 'react-native-nitro-logger/analytics-grammar',
+        formatVersion: 1,
+        additionalEvents: false,
+        events: [
+          { name: 'event', additionalProperties: false, properties: [] },
+        ],
+      },
+    });
+    for (const name of Object.keys(eventEntries)) configured.add(name);
     for (const name of Object.keys(plugin.rules)) {
       expect(configured.has(`nitro-logger/${name}`)).toBe(true);
     }
@@ -2057,17 +2069,23 @@ describe('plugin configs', () => {
 
   test('every rule declares the options it reads', () => {
     const { RECEIVER_OPTION_PROPERTIES } = require('../eslint-plugin/shared');
+    const {
+      EVENT_OPTION_PROPERTIES,
+    } = require('../eslint-plugin/event-analysis');
+    const eventRules = new Set(['typed-event-schema', 'require-event-privacy']);
 
     for (const [name, rule] of Object.entries(plugin.rules)) {
       const schema = rule.meta.schema[0];
       expect(schema.additionalProperties).toBe(false);
 
-      // Every rule resolves receivers, so every rule must accept every
-      // receiver option. `additionalProperties: false` turns a rule that
-      // missed one into a hard config error for anyone who sets it — the
-      // rules would disagree about what a valid config is. These were
-      // hand-copied into four files before, which is exactly how that drifts.
-      for (const option of Object.keys(RECEIVER_OPTION_PROPERTIES)) {
+      // Rules in each analysis family must accept the complete shared option
+      // set for that family. `additionalProperties: false` turns a missed
+      // option into a hard config error for consumers, so derive these lists
+      // from the analyzers rather than hand-copying them into every rule.
+      const expected = eventRules.has(name)
+        ? EVENT_OPTION_PROPERTIES
+        : RECEIVER_OPTION_PROPERTIES;
+      for (const option of Object.keys(expected)) {
         expect(Object.keys(schema.properties)).toContain(option);
       }
 

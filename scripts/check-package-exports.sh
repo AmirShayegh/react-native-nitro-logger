@@ -75,12 +75,29 @@ test('jest resolves the unstable subpath to a CommonJS entry', () => {
   const resolved = require.resolve('react-native-nitro-logger/unstable');
   console.log('JEST_RESOLVED_UNSTABLE=' + resolved.split('node_modules/').pop());
 });
+test('jest resolves the analytics subpath to a CommonJS entry', () => {
+  const resolved = require.resolve('react-native-nitro-logger/analytics');
+  console.log('JEST_RESOLVED_ANALYTICS=' + resolved.split('node_modules/').pop());
+});
+test('the packed CommonJS analytics artifact executes', () => {
+  const {defineEvents, oneOf} = require('react-native-nitro-logger/analytics');
+  const events = defineEvents({probe: {value: oneOf('ok')}});
+  expect(events.validate('probe', {value: 'ok'}).ok).toBe(true);
+  expect(events.validate('probe', {value: 'no'}).ok).toBe(false);
+  expect(events.grammar.additionalEvents).toBe(false);
+  expect(events.grammar.events[0].additionalProperties).toBe(false);
+  expect(JSON.stringify(events.grammar)).toBe(events.grammarJSON);
+  expect(events.lint).toEqual({formatVersion: 1, grammar: events.grammar});
+  expect(events.lint.grammar).toBe(events.grammar);
+});
 EOF
 
 echo "==> installing the tarball into a consumer project"
 if ! npm install --silent --no-audit --no-fund --no-package-lock \
   "$TARBALL" react-native react-native-nitro-modules \
+  @react-native/metro-config \
   jest@29 babel-jest@29 @babel/core @babel/runtime \
+  typescript \
   @react-native/babel-preset @react-native/jest-preset \
   >"$WORK/install.log" 2>&1; then
   echo "consumer install failed:"
@@ -102,33 +119,105 @@ resolves() {
   fi
 }
 
-echo "==> which entry each condition selects"
-CJS="$(node -e "console.log(require.resolve('react-native-nitro-logger').split('node_modules/').pop())" 2>/dev/null)"
-resolves "node require" "react-native-nitro-logger/lib/commonjs/index.js" "$CJS"
+if JEST_OUT="$(npx jest __tests__/resolution.test.js 2>&1)"; then
+  :
+else
+  note FAIL "packed Jest runtime suite failed"
+  sed -n '1,12p' <<< "$JEST_OUT"
+  failures=$((failures + 1))
+fi
+# Each public entry is declared once so every resolution condition stays in
+# lockstep as subpaths are added.
+ENTRIES=(
+  "|react-native-nitro-logger/lib/commonjs/index.js|react-native-nitro-logger/lib/module/index.js|JEST_RESOLVED"
+  "/unstable|react-native-nitro-logger/lib/commonjs/unstable.js|react-native-nitro-logger/lib/module/unstable.js|JEST_RESOLVED_UNSTABLE"
+  "/analytics|react-native-nitro-logger/lib/commonjs/analytics.js|react-native-nitro-logger/lib/module/analytics.js|JEST_RESOLVED_ANALYTICS"
+)
+RESOLVED_PATHS=""
+for entry in "${ENTRIES[@]}"; do
+  IFS='|' read -r subpath expected_cjs expected_esm jest_marker <<< "$entry"
+  specifier="react-native-nitro-logger${subpath}"
+  heading="${subpath:-root entry}"
+  echo "==> which entry each condition selects for $heading"
 
-ESM="$(node --input-type=module -e "console.log((await import.meta.resolve('react-native-nitro-logger')).split('node_modules/').pop())" 2>/dev/null)"
-resolves "node import " "react-native-nitro-logger/lib/module/index.js" "$ESM"
+  cjs="$(node -e "console.log(require.resolve(process.argv[1]).split('node_modules/').pop())" "$specifier" 2>/dev/null)"
+  esm="$(node --input-type=module -e "console.log((await import.meta.resolve(process.argv[1])).split('node_modules/').pop())" "$specifier" 2>/dev/null)"
+  jest="$(grep -o "${jest_marker}=.*" <<< "$JEST_OUT" | head -1 | cut -d= -f2-)"
 
-JEST_OUT="$(npx jest __tests__/resolution.test.js 2>&1)"
-JEST="$(grep -o 'JEST_RESOLVED=.*' <<< "$JEST_OUT" | head -1 | cut -d= -f2-)"
-resolves "jest        " "react-native-nitro-logger/lib/commonjs/index.js" "$JEST"
+  resolves "node require ${subpath}" "$expected_cjs" "$cjs"
+  resolves "node import  ${subpath}" "$expected_esm" "$esm"
+  resolves "jest         ${subpath}" "$expected_cjs" "$jest"
+  RESOLVED_PATHS+="$cjs$esm$jest"
+done
 
-# ---------------------------------------------------------------------------
-# ./unstable — the second entry point, held to the same standard
-# ---------------------------------------------------------------------------
-# The raw Nitro sinks moved here in 0.3.0. A subpath that resolves for `import`
-# and not for `require` is a package that works until someone's Jest touches it,
-# which is the exact failure the root entry was fixed for in 0.1.3 — so it is
-# checked the same three ways rather than assumed to inherit anything.
-echo "==> which entry each condition selects for ./unstable"
-CJS_U="$(node -e "console.log(require.resolve('react-native-nitro-logger/unstable').split('node_modules/').pop())" 2>/dev/null)"
-resolves "node require /unstable" "react-native-nitro-logger/lib/commonjs/unstable.js" "$CJS_U"
+ESM_ANALYTICS="$(node --input-type=module -e "
+  const {defineEvents, oneOf} = await import('react-native-nitro-logger/analytics');
+  const events = defineEvents({probe: {value: oneOf('ok')}});
+  if (!events.validate('probe', {value: 'ok'}).ok) process.exit(1);
+  if (events.validate('probe', {value: 'no'}).ok) process.exit(1);
+  if (events.grammar.additionalEvents !== false) process.exit(1);
+  if (events.grammar.events[0].additionalProperties !== false) process.exit(1);
+  if (JSON.stringify(events.grammar) !== events.grammarJSON) process.exit(1);
+  if (events.lint.formatVersion !== 1) process.exit(1);
+  if (events.lint.grammar !== events.grammar) process.exit(1);
+  console.log('PASS');
+" 2>&1)"
+if [ "$ESM_ANALYTICS" = "PASS" ]; then
+  note ok "packed ESM /analytics executes its validator"
+else
+  note FAIL "packed ESM /analytics failed: $ESM_ANALYTICS"
+  failures=$((failures + 1))
+fi
 
-ESM_U="$(node --input-type=module -e "console.log((await import.meta.resolve('react-native-nitro-logger/unstable')).split('node_modules/').pop())" 2>/dev/null)"
-resolves "node import  /unstable" "react-native-nitro-logger/lib/module/unstable.js" "$ESM_U"
+cat > analytics-consumer.ts <<'EOF'
+import {
+  defineEvents,
+  oneOf,
+  type AnalyticsGrammar,
+  type AnalyticsGrammarConstraint,
+  type AnalyticsGrammarEvent,
+  type AnalyticsLintArtifactV1,
+  type AnalyticsGrammarProperty,
+  type AnalyticsGrammarV1,
+  type EventProperties,
+} from 'react-native-nitro-logger/analytics';
 
-JEST_U="$(grep -o 'JEST_RESOLVED_UNSTABLE=.*' <<< "$JEST_OUT" | head -1 | cut -d= -f2-)"
-resolves "jest         /unstable" "react-native-nitro-logger/lib/commonjs/unstable.js" "$JEST_U"
+const events = defineEvents({probe: {value: oneOf('ok', 'ready')}});
+const properties: EventProperties<typeof events, 'probe'> = {value: 'ok'};
+const result = events.validate('probe', properties);
+const grammar: AnalyticsGrammar = events.grammar;
+const grammarV1: AnalyticsGrammarV1 = grammar;
+const grammarEvent: AnalyticsGrammarEvent = grammar.events[0]!;
+const grammarProperty: AnalyticsGrammarProperty = grammarEvent.properties[0]!;
+const grammarConstraint: AnalyticsGrammarConstraint = grammarProperty.constraint;
+const grammarJSON: string = events.grammarJSON;
+const lint: AnalyticsLintArtifactV1 = events.lint;
+console.log(grammarV1, grammarEvent, grammarProperty, grammarConstraint, grammarJSON, lint);
+if (result.ok && result.eventName === 'probe') {
+  const value: 'ok' | 'ready' | object = result.properties.value;
+  console.log(value);
+}
+EOF
+cat > tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": []
+  },
+  "files": ["analytics-consumer.ts"]
+}
+EOF
+if npx tsc -p tsconfig.json >"$WORK/analytics-types.log" 2>&1; then
+  note ok "packed /analytics declarations type-check in a consumer"
+else
+  note FAIL "packed /analytics declarations do not type-check"
+  sed -n '1,8p' "$WORK/analytics-types.log"
+  failures=$((failures + 1))
+fi
 
 echo "==> ./unstable carries the names it promises"
 # Resolution is not the whole claim: bob compiles the whole src tree, so a
@@ -168,6 +257,51 @@ else
   failures=$((failures + 1))
 fi
 
+echo "==> ./analytics carries the names it promises"
+ANALYTICS_NAMES="$(node -e '
+  const fs = require("fs"), path = require("path");
+  const pkg = process.argv[1];
+  const functions = ["defineEvents", "int", "namedString", "oneOf", "optional", "screenName"];
+  const types = ["AnalyticsGrammar", "AnalyticsGrammarConstraint", "AnalyticsGrammarEnumConstraint", "AnalyticsGrammarEvent", "AnalyticsGrammarIntegerConstraint", "AnalyticsGrammarNamedStringConstraint", "AnalyticsGrammarProperty", "AnalyticsGrammarV1", "AnalyticsLintArtifactV1", "EventArtifact", "EventName", "EventProperties", "ValidationResult"];
+  const jsTargets = [
+    ["lib/commonjs/analytics.js", (src, n) =>
+      new RegExp("exports\\." + n + "\\s*=").test(src) ||
+      new RegExp("Object\\.defineProperty\\(exports,\\s*\\\"" + n + "\\\"").test(src)],
+    ["lib/module/analytics.js", (src, n) => new RegExp("export\\b[^;]*\\b" + n + "\\b").test(src)],
+  ];
+  const declarationTargets = [
+    "lib/typescript/commonjs/src/analytics.d.ts",
+    "lib/typescript/module/src/analytics.d.ts",
+  ];
+  const problems = [];
+  for (const [rel, has] of jsTargets) {
+    const file = path.join(pkg, rel);
+    if (!fs.existsSync(file)) { problems.push(rel + ": missing"); continue; }
+    const src = fs.readFileSync(file, "utf8");
+    const missing = functions.filter((name) => !has(src, name));
+    if (missing.length) problems.push(rel + ": no export of " + missing.join(", "));
+  }
+  for (const rel of declarationTargets) {
+    const file = path.join(pkg, rel);
+    if (!fs.existsSync(file)) { problems.push(rel + ": missing"); continue; }
+    const src = fs.readFileSync(file, "utf8");
+    const names = [...functions, ...types];
+    const missing = names.filter((name) => {
+      const direct = new RegExp("export (declare )?(function|interface|type) " + name + "\\b").test(src);
+      const reexport = new RegExp("export(?:\\s+type)?\\s*\\{[\\s\\S]*?\\b" + name + "\\b[\\s\\S]*?\\}\\s*from").test(src);
+      return !direct && !reexport;
+    });
+    if (missing.length) problems.push(rel + ": no export of " + missing.join(", "));
+  }
+  console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS");
+' "$PKG" 2>&1)"
+if [[ "$ANALYTICS_NAMES" == PASS* ]]; then
+  note ok "every built /analytics artifact exports its schema API"
+else
+  note FAIL "${ANALYTICS_NAMES#FAIL|}"
+  failures=$((failures + 1))
+fi
+
 echo "==> each entry is the dialect its condition promises"
 # A file is only CommonJS if BOTH the syntax and the nearest `type` marker say
 # so. bob writes lib/<target>/package.json, and getting that marker wrong is
@@ -204,7 +338,7 @@ TYPES="$(node -e '
   const pkg = process.argv[1];
   const exp = JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf8")).exports;
   const problems = [];
-  for (const entry of [".", "./unstable"]) {
+  for (const entry of [".", "./unstable", "./analytics"]) {
     const map = exp[entry];
     if (!map) { problems.push(entry + ": no export map entry"); continue; }
     for (const cond of ["require", "import"]) {
@@ -216,7 +350,7 @@ TYPES="$(node -e '
   console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS");
 ' "$PKG" 2>&1)"
 if [[ "$TYPES" == PASS* ]]; then
-  note ok "both entries ship declarations for require and import"
+  note ok "all entries ship declarations for require and import"
 else
   note FAIL "${TYPES#FAIL|}"
   failures=$((failures + 1))
@@ -235,21 +369,58 @@ echo "==> what Metro selects"
 # from the installed Metro rather than written down here, so this stops being
 # true the moment Metro changes it.
 METRO="$(node -e '
+  (async () => {
   const fs = require("fs"), path = require("path");
   const [pkgDir, fixture] = process.argv.slice(1);
   const all = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).exports;
 
-  // The condition sets Metro actually uses, read from Metro itself.
+  // Load both real defaults. Omitting a source, substituting a documented
+  // fallback, or accepting a malformed result makes the checks below vacuous:
+  // they would prove only the condition set this script invented.
+  const sources = [
+    ["metro-config default", "metro-config"],
+    ["@react-native/metro-config default", "@react-native/metro-config"],
+  ];
   const sets = {};
-  try {
-    const mc = require(require.resolve("metro-config", { paths: [fixture] }));
-    sets["metro default"] = [];   // getDefaultConfig is async; [] is its documented default
-  } catch {}
-  try {
-    const rn = require(require.resolve("@react-native/metro-config", { paths: [fixture] }));
-    const d = rn.getDefaultConfig(fixture);
-    sets["react native"] = d.resolver.unstable_conditionNames ?? [];
-  } catch { sets["react native"] = ["react-native"]; }
+  const loadProblems = [];
+  for (const [label, moduleName] of sources) {
+    try {
+      const loaded = require(require.resolve(moduleName, { paths: [fixture] }));
+      if (!loaded || typeof loaded.getDefaultConfig !== "function") {
+        throw new TypeError("getDefaultConfig is not a function");
+      }
+      const config = await loaded.getDefaultConfig(fixture);
+      const resolver = config && config.resolver;
+      if (!resolver || !("unstable_conditionNames" in resolver)) {
+        throw new TypeError("resolver.unstable_conditionNames is missing");
+      }
+      const conditions = resolver.unstable_conditionNames;
+      if (!Array.isArray(conditions)) {
+        throw new TypeError("resolver.unstable_conditionNames is not an array");
+      }
+      if (
+        conditions.some(
+          (condition) => typeof condition !== "string" || condition.length === 0
+        )
+      ) {
+        throw new TypeError(
+          "resolver.unstable_conditionNames contains a non-string or empty condition"
+        );
+      }
+      sets[label] = [...conditions];
+    } catch (error) {
+      loadProblems.push(`${label}: ${String(error)}`);
+    }
+  }
+  for (const [label] of sources) {
+    if (!(label in sets) && !loadProblems.some((problem) => problem.startsWith(`${label}:`))) {
+      loadProblems.push(`${label}: condition set was not loaded`);
+    }
+  }
+  if (loadProblems.length > 0 || Object.keys(sets).length !== sources.length) {
+    console.log("FAIL|" + loadProblems.join("; "));
+    return;
+  }
 
   // The spec walk: first key whose condition is active wins; `default` always is.
   const pick = (node, active) => {
@@ -265,7 +436,11 @@ METRO="$(node -e '
 
   // Both entries, because `default` is load-bearing for each of them and a
   // subpath that falls through to the wrong artifact is invisible to Node.
-  const wanted = { ".": "./lib/module/index.js", "./unstable": "./lib/module/unstable.js" };
+  const wanted = {
+    ".": "./lib/module/index.js",
+    "./unstable": "./lib/module/unstable.js",
+    "./analytics": "./lib/module/analytics.js",
+  };
   const problems = [];
   for (const [entry, want] of Object.entries(wanted)) {
     for (const [label, conditions] of Object.entries(sets)) {
@@ -276,9 +451,12 @@ METRO="$(node -e '
     }
   }
   console.log(problems.length ? "FAIL|" + problems.join("; ") : "PASS|" + Object.keys(sets).join(", "));
+  })().catch((error) => {
+    console.log("FAIL|Metro condition-set loader: " + String(error));
+  });
 ' "$PKG" "$FIXTURE" 2>&1)"
 if [[ "$METRO" == PASS* ]]; then
-  note ok "both entries fall through to default -> lib/module (${METRO#PASS|})"
+  note ok "all entries fall through to default -> lib/module (${METRO#PASS|})"
 else
   note FAIL "${METRO#FAIL|}"
   failures=$((failures + 1))
@@ -288,7 +466,7 @@ echo "==> the source condition stays out of a consumer's way"
 # `react-native-nitro-logger-source` exists for the in-repo example app. If a
 # consumer ever resolved through it they would get TypeScript, which their
 # bundler is under no obligation to compile.
-if grep -qE "src/(index\.tsx|unstable\.ts)" <<< "$CJS$ESM$JEST$CJS_U$ESM_U$JEST_U"; then
+if grep -qE "src/(index\.tsx|unstable\.ts|analytics\.ts)" <<< "$RESOLVED_PATHS"; then
   note FAIL "a consumer resolved to src/ — the source condition leaked"
   failures=$((failures + 1))
 else

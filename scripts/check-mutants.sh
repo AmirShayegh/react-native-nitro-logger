@@ -16,7 +16,7 @@
 #
 # ## What this proves, and what it does not
 #
-#   * It proves these SIXTEEN defects stay caught. It is not a coverage
+#   * It proves the manifest-listed defects stay caught. It is not a coverage
 #     measure and not a substitute for one — a line can be executed by every
 #     test in the suite and asserted on by none.
 #   * It cannot notice an invariant added after the manifest was written. New
@@ -24,12 +24,14 @@
 #   * It is JavaScript only. A native mutant costs a full Swift or Gradle
 #     rebuild per row — minutes each — so the Swift and Kotlin suites keep the
 #     manual discipline instead. Deliberate, not an oversight.
-#   * It patches `src/` and `eslint-plugin/` only. A defect whose shape
-#     requires a *new export* — a payload-recovery function, say — cannot be
-#     expressed here, because adding one also trips the privacy sweep's
-#     fail-closed inventory assertion and the kill would be attributed to the
-#     wrong check. Those shapes are covered by that inventory assertion
-#     instead, which is what it is for.
+#   * It patches production code under `src/` and `eslint-plugin/`, plus
+#     immutable golden fixture data when the fixture's own integrity check is
+#     the contract under test. Test assertions themselves stay outside mutant
+#     scope. A defect whose shape requires a *new export* — a payload-recovery
+#     function, say — cannot be expressed here, because adding one also trips
+#     the privacy sweep's fail-closed inventory assertion and the kill would be
+#     attributed to the wrong check. Those shapes are covered by that inventory
+#     assertion instead, which is what it is for.
 #
 # The harness checks its own vacuity before trusting itself: the control run
 # below requires the UNMUTATED copy to pass every suite a mutant expects to

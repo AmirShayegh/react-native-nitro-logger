@@ -1,0 +1,14 @@
+diff --git a/eslint-plugin/receiver-object-analysis.js b/eslint-plugin/receiver-object-analysis.js
+--- a/eslint-plugin/receiver-object-analysis.js
++++ b/eslint-plugin/receiver-object-analysis.js
+@@ -48,9 +48,8 @@
+     }
+     if (property.kind === 'get') {
+       // Object.assign invokes a source accessor and stores the value it
+       // returns. Getter form is only an internal carrier for the possible
+       // returns and opacity marker; it is never emitted as JavaScript.
+-      receiverGetterValues(context, property.value);
+-      return syntheticReceiverProperty(name, property.value, 'get');
++      return syntheticReceiverProperty(name, property.value);
+     }
+     if (property.kind === 'set') {

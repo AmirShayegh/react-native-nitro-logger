@@ -1,0 +1,17 @@
+diff --git a/eslint-plugin/event-method.js b/eslint-plugin/event-method.js
+--- a/eslint-plugin/event-method.js
++++ b/eslint-plugin/event-method.js
+@@ -977,13 +977,7 @@
+   for (const candidate of candidates) {
+     if (eventReference(context, candidate) === opaqueNode) continue;
+     const method = methodReference(context, candidate, [], callNode, seen);
+     if (method) methods.push(method);
+-    if (
+-      isGetterReturnValue(candidate) &&
+-      getterMethodValueIsOpaque(context, candidate, callNode, seen, method)
+-    ) {
+-      methods.push(normalizedMethod([], current, true));
+-    }
+   }
+   if (unresolved) {
+     const owner = methodReference(context, current.object, [], callNode, seen);

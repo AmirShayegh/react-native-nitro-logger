@@ -1,0 +1,11 @@
+diff --git a/eslint-plugin/static-container-member-analysis.js b/eslint-plugin/static-container-member-analysis.js
+--- a/eslint-plugin/static-container-member-analysis.js
++++ b/eslint-plugin/static-container-member-analysis.js
+@@ -77,6 +77,6 @@ function createStaticContainerMemberResolver({
+   const staticObjectPropertyCandidates = (object, key) => {
+     const stats = receiverAnalysisStats.get(context);
+-    let indexed = staticObjectPropertyIndexCache.get(object);
++    let indexed = null;
+     if (indexed) {
+       if (stats) stats.staticContainerPropertyIndexCacheHits += 1;
+     } else {
